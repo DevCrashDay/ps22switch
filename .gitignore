@@ -1,0 +1,68 @@
+/games/
+*.iso
+*.chd
+*.cso
+*.zip
+*.7z
+*.rar
+
+/generated/
+/tools/
+/build/
+
+*.ppm
+*.wav
+__pycache__/
+
+/third_party/wgpu-native/
+/third_party/sdl2/
+/third_party/dxc/
+
+# Disc images and anything taken from a game never go into this repo.
+/isos/
+*.bin
+*.cue
+*.img
+*.elf
+
+# PCSX2 patch files (downloaded by scripts/pnach.py fetch into isos/patches/) are never committed.
+*.pnach
+
+# Memory cards (they hold game saves), save states and memory dumps of a running game. The README's example
+# `--memcard mygame.ps2` writes the card into the folder it is started from.
+*.ps2
+*.mcd
+*.mc2
+*.sav
+*.state
+*.sstate
+*.dmp
+
+# Built programs and libraries: a built game is the game's code. Only sources go into the repo.
+*.exe
+*.dll
+*.wasm
+*.o
+*.obj
+*.a
+
+# Screenshots and recordings of a game (the runner writes them with --frames-dir, the report tool as PNG).
+# A picture that is not from a game can still be added with `git add -f`.
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.bmp
+*.webp
+*.mp4
+*.webm
+*.avi
+*.mkv
+
+# Per-lane git worktrees, and the old fork clone until it is removed.
+/wt/
+/ps2-web-recomp/
+
+# Per-PC Claude Code settings and private notes.
+/.claude/settings.local.json
+/CLAUDE.local.md

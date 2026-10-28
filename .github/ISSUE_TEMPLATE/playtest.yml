@@ -1,0 +1,73 @@
+name: Playtest report
+description: Tell me how a game ran for you, good or bad.
+title: "[Playtest] "
+labels: ["playtest"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for testing! Every report helps, "it just worked" too.
+        Please do not attach disc images, save states or other files from the game: text is enough, and I ask if I need more.
+  - type: input
+    id: game
+    attributes:
+      label: Game
+      description: The name and the region, and the boot file if you know it (`port.sh` and the app's log print it, for example SCUS_974.81).
+      placeholder: God of War II (USA), SCUS_974.81
+    validations:
+      required: true
+  - type: dropdown
+    id: system
+    attributes:
+      label: System
+      options:
+        - Windows 11
+        - Windows 10
+        - Linux
+        - macOS
+    validations:
+      required: true
+  - type: input
+    id: pc
+    attributes:
+      label: PC
+      description: The processor and the graphics card, or for example "laptop with Intel graphics".
+      placeholder: Ryzen 5 5600, GeForce RTX 3060
+  - type: dropdown
+    id: build
+    attributes:
+      label: How did you build it?
+      options:
+        - The app (Start.cmd)
+        - port.sh from the command line
+  - type: dropdown
+    id: controls
+    attributes:
+      label: How did you play?
+      options:
+        - Keyboard and mouse
+        - Game controller
+        - Both
+  - type: textarea
+    id: far
+    attributes:
+      label: How far did you get?
+      description: For example "the title menu", "the first boss", "played it through".
+    validations:
+      required: true
+  - type: input
+    id: speed
+    attributes:
+      label: Speed
+      description: Roughly how many frames per second, if you know. "Smooth" or "slow in fights" is fine too.
+  - type: textarea
+    id: problems
+    attributes:
+      label: What went wrong, if anything
+      description: What you saw or heard, and where in the game. Say so if you pressed F9 there.
+  - type: textarea
+    id: log
+    attributes:
+      label: Log
+      description: Paste `log.txt` and `info.txt` from the newest folder in `reports\` (F9 makes one), or the end of the text the game printed.
+      render: text

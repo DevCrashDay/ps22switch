@@ -1,0 +1,201 @@
+#include "eerecomp_gen.hpp"
+
+#include "ps2/os.hpp"
+
+#include <algorithm>
+#include <array>
+#include <cstdio>
+#include <cstring>
+#include <fstream>
+#include <stdexcept>
+
+namespace recomp {
+
+Entries read_entries(const std::string &path) {
+    Entries entries;
+    std::ifstream file(ps2::os::path(path));
+    std::string token;
+    while (file >> token) {
+        if (token[0] == '#') { std::getline(file, token); continue; }
+        const auto colon = token.find(':');
+        if (colon == std::string::npos)
+            entries.main.push_back(static_cast<std::uint32_t>(std::stoul(token, nullptr, 16)));
+        else
+            entries.modules[token.substr(0, colon)].push_back(static_cast<std::uint32_t>(std::stoul(token.substr(colon + 1), nullptr, 16)));
+    }
+    return entries;
+}
+
+std::set<std::uint32_t> dynamic_sites(const Links &links) {
+    std::set<std::uint32_t> sites;
+    for (const auto &[at, link] : links)
+        if (link.kind == Fix::Jump && link.external) sites.insert(at);
+    return sites;
+}
+
+std::vector<std::uint32_t> window_entries(const Image &image, const Program &program, std::uint32_t base, std::uint32_t size) {
+    std::vector<std::uint32_t> seeds;
+    for (std::uint32_t pc = program.base; pc < program.end; pc += 4) {
+        if (!program.is_code(pc)) continue;
+        const Insn i = decode(*image.word(pc), pc);
+        const Flow f = flow(i.op);
+        if (f != Flow::Jump && f != Flow::Call) continue;
+        const std::uint32_t t = i.jump_target();
+        if (t - base < size) seeds.push_back(t);
+    }
+    return seeds;
+}
+
+std::vector<std::pair<std::uint32_t, std::uint32_t>> checks_for_window(const Snr2Module &o, const Program &program) {
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> checks;
+    for (std::uint32_t at = 0; at + 4 <= o.size; at += 4) {
+        if (!program.is_code(o.base + at)) continue;
+        std::uint32_t word = 0;
+        std::memcpy(&word, o.bytes.data() + at, 4);
+        checks.emplace_back(at, word);
+    }
+    return checks;
+}
+
+// ---------------------------------------------------------------------------------------------------------------- capturing
+
+std::vector<std::uint32_t> code_windows(const std::vector<std::uint8_t> &elf) {
+    std::vector<std::uint32_t> out;
+    if (elf.size() < 52) return out;
+    const auto u32 = [&](std::size_t at) {
+        std::uint32_t v = 0;
+        if (at + 4 <= elf.size()) std::memcpy(&v, elf.data() + at, 4);
+        return v;
+    };
+    const auto u16 = [&](std::size_t at) {
+        std::uint16_t v = 0;
+        if (at + 2 <= elf.size()) std::memcpy(&v, elf.data() + at, 2);
+        return v;
+    };
+    const std::uint32_t phoff = u32(28);
+    const std::uint16_t phentsize = u16(42), phnum = u16(44);
+    for (std::uint32_t i = 0; i < phnum; ++i) {
+        const std::size_t at = static_cast<std::size_t>(phoff) + static_cast<std::size_t>(i) * phentsize;
+        if (at + 32 > elf.size()) break;
+        const std::uint32_t type = u32(at), vaddr = u32(at + 8), filesz = u32(at + 16), flags = u32(at + 24);
+        if (type != 1 || filesz || !(flags & 1)) continue;  // no PT_LOAD, has contents, not executable
+        std::uint32_t base = vaddr & ~(kWindowUnit - 1);
+        while (std::find(out.begin(), out.end(), base) != out.end()) base += kWindowUnit;
+        out.push_back(base);
+    }
+    return out;
+}
+
+std::vector<std::pair<std::uint32_t, std::uint32_t>> code_segments(const std::vector<std::uint8_t> &elf) {
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> out;
+    if (elf.size() < 52) return out;
+    const auto u32 = [&](std::size_t at) {
+        std::uint32_t v = 0;
+        if (at + 4 <= elf.size()) std::memcpy(&v, elf.data() + at, 4);
+        return v;
+    };
+    const auto u16 = [&](std::size_t at) {
+        std::uint16_t v = 0;
+        if (at + 2 <= elf.size()) std::memcpy(&v, elf.data() + at, 2);
+        return v;
+    };
+    const std::uint32_t phoff = u32(28);
+    const std::uint16_t phentsize = u16(42), phnum = u16(44);
+    for (std::uint32_t i = 0; i < phnum; ++i) {
+        const std::size_t at = static_cast<std::size_t>(phoff) + static_cast<std::size_t>(i) * phentsize;
+        if (at + 32 > elf.size()) break;
+        const std::uint32_t type = u32(at), vaddr = u32(at + 8), filesz = u32(at + 16), memsz = u32(at + 20), flags = u32(at + 24);
+        if (type == 1 && filesz && (flags & 1)) out.emplace_back(vaddr, memsz);
+    }
+    return out;
+}
+
+std::uint32_t window_extent(const std::uint8_t *ram, std::uint32_t ram_size, std::uint32_t base) {
+    // The ELF only says the window begins here; what the game unpacks decides how far it reaches, so the image covers the units it
+    // wrote, stopping at the first entirely empty one.
+    std::uint32_t size = 0;
+    while (size < kWindowCap && base <= ram_size && size + kWindowUnit <= ram_size - base) {
+        const std::uint8_t *unit = ram + base + size;
+        bool empty = true;
+        for (std::uint32_t i = 0; i < kWindowUnit; i += 8) {
+            std::uint64_t word;
+            std::memcpy(&word, unit + i, 8);
+            if (word) { empty = false; break; }
+        }
+        if (empty) break;
+        size += kWindowUnit;
+    }
+    return size ? size : kWindowUnit;
+}
+
+std::string window_name(std::uint32_t base, const std::uint8_t *image, std::size_t size) {
+    static const std::array<std::uint32_t, 256> table = [] {
+        std::array<std::uint32_t, 256> t{};
+        for (std::uint32_t n = 0; n < 256; ++n) {
+            std::uint32_t c = n;
+            for (int k = 0; k < 8; ++k) c = c & 1 ? 0xEDB88320u ^ (c >> 1) : c >> 1;
+            t[n] = c;
+        }
+        return t;
+    }();
+    std::uint32_t crc = 0xFFFFFFFFu;
+    for (std::size_t i = 0; i < size; ++i) crc = table[(crc ^ image[i]) & 0xFFu] ^ (crc >> 8);
+    crc ^= 0xFFFFFFFFu;
+    char text[32];
+    std::snprintf(text, sizeof text, "%08X_%08X", base, crc);
+    return text;
+}
+
+// ---------------------------------------------------------------------------------------------------------------- live
+
+StaticProgram::StaticProgram(const std::string &elf_path, const std::vector<std::uint32_t> &entries) : image_(Image::load(elf_path)) {
+    const Links imports = snr2_imports(image_);
+    program_ = analyse(image_, entries, dynamic_sites(imports));
+}
+
+std::vector<std::uint32_t> StaticProgram::calls_into(std::uint32_t base, std::uint32_t size) const {
+    return window_entries(image_, program_, base, size);
+}
+
+LiveResult generate_live(const LiveRequest &request, const std::filesystem::path &out_dir) {
+    LiveResult result;
+    try {
+        const std::uint32_t size = static_cast<std::uint32_t>(request.image.size());
+        if (size < 0x400u || (size & 3u)) {
+            result.error = "the window image is too small or not a whole number of words";
+            return result;
+        }
+        // The same steps as eerecomp takes for an image of overlays/: analyse it from its entry points, check every word of it that is
+        // code, translate it as a module that sits at a fixed base.
+        const Image image = Image::raw(request.base, request.image, {0, size});
+        Program program = analyse(image, request.entries, {});
+        for (const std::uint32_t entry : request.entries) {
+            if (program.entries.count(entry) && program.is_code(entry)) result.accepted.insert(entry);
+            else result.rejected.insert(entry);
+        }
+        if (result.accepted.empty()) {
+            result.error = "none of the entry points is code in the captured image";
+            return result;
+        }
+        Snr2Module o;
+        o.bytes = request.image;
+        o.size = size;
+        o.base = request.base;
+        o.name = request.name;
+        const std::vector<Translation> translations{{&image, &program, nullptr, request.prefix, false, request.name, size, checks_for_window(o, program), true, request.base}};
+        for (std::uint32_t pc = program.base; pc < program.end; pc += 4) result.code += program.is_code(pc);
+        CodegenOptions options;
+        options.output = ps2::os::utf8(out_dir);
+        options.live_stamp = request.stamp;
+        options.quiet = true;
+        generate(translations, options);
+        for (const auto &entry : std::filesystem::directory_iterator(out_dir))
+            if (entry.path().extension() == ".cpp" && entry.path().filename() != "table.cpp") ++result.units;
+        result.ok = true;
+    } catch (const std::exception &error) {
+        result.error = error.what();
+    }
+    return result;
+}
+
+}  // namespace recomp
