@@ -52,6 +52,12 @@ Tried with real discs (mine are US releases), as far as each was played (no know
 | Armored Trooper VOTOMS (Japan) | plays well, not played through yet: the tutorial and the first mission at about 60 fps, and saves work; it slowed down once, the first time a new part loaded (Windows 11, a laptop with Intel graphics, a game controller; [#5](https://github.com/exoteric33/ps2-native-recomp/issues/5)) | omegakatana92 |
 | Ben 10: Alien Force | plays well, not played through yet: works very well, no problems so far | InsomniacSpider-Man |
 
+Known not to work yet (reported by playtesters, on my list to fix):
+
+| Game | What happens |
+|---|---|
+| Ben 10: Alien Force - Vilgax Attacks | stops at "Checking memory card" right after the start and goes no further |
+
 54 of the 55 programs of the free [ps2autotests](https://github.com/unknownbrackets/ps2autotests) suite print exactly
 what the console prints (`python scripts/autotests.py`).
 
