@@ -440,7 +440,9 @@ void machine_state(state::Stream &s) {
     s.pod(g_given);
     s.pod(g_frames);
     s.pod(g_iop_synced);
+    const bool forced_rate = g_options.rate_forced, forced_pal = g_options.pal;
     s.pod(g_options.pal);
+    if (forced_rate) g_options.pal = forced_pal;  // --pal / --ntsc win over the state (a 50 Hz disc can be run at 60 Hz to see what a 60 Hz one asks)
     s.vec(g_events, [&s](Event &e) {
         s.pod(e.id);
         s.pod(e.at);
@@ -693,6 +695,7 @@ void core_sample(Who who) {
 int run() {
     thread_tune(Who::Emulation);
     Cpu &c = g_cpu;
+    const std::uint64_t started_at = now();  // for the share of waiting loops skipped (hw.cpp)
     if (!g_resumed) set_budget(c, kMaxSlice);
     while (!g_halted) {
         core_sample(Who::Emulation);
@@ -755,6 +758,9 @@ int run() {
     dmac::stats();
     gif::stats();
     vif::stats();
+    if (const std::uint64_t skipped = hw::spin_skipped_cycles())
+        std::fprintf(stderr, "[spin] %llu cycles of waiting loops skipped (%.1f %% of the time since this run started)\n", static_cast<unsigned long long>(skipped),
+                     100.0 * static_cast<double>(skipped) / static_cast<double>(std::max<std::uint64_t>(now() - started_at, 1)));
     std::fprintf(stderr, "[ee] stopped after %llu frames, %llu cycles: %s\n",
                  static_cast<unsigned long long>(g_frames), static_cast<unsigned long long>(now()), g_halt_reason.c_str());
     return 0;

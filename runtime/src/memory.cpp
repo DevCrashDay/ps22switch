@@ -88,6 +88,7 @@ std::uint8_t *vu_memory(std::uint32_t p) {
 }
 
 Target resolve(std::uint32_t a) {
+    ++hw::g_slow_seq;
     if ((a >> 14) == (kScratchpadBase >> 14)) return {Region::Scratchpad, g_spr + (a & (kScratchpadSize - 1)), a};
     const std::uint32_t p = physical(a);
     if (p < 0x10000000u) return {Region::Ram, g_ram + (p & (kRamSize - 1)), p};
@@ -188,7 +189,11 @@ std::uint32_t physical(std::uint32_t a) {
 
 std::uint8_t slow_ld8(std::uint32_t a) { return read_slow<std::uint8_t>(a); }
 std::uint16_t slow_ld16(std::uint32_t a) { return read_slow<std::uint16_t>(a); }
-std::uint32_t slow_ld32(std::uint32_t a) { return read_slow<std::uint32_t>(a); }
+std::uint32_t slow_ld32(std::uint32_t a) {
+    // INTC_STAT is read in a tight loop by every game that waits for the next picture (sceGsSyncV): a short way for it, same value
+    if (a == 0x1000F000u || a == 0xB000F000u) return hw::read_intc_stat();
+    return read_slow<std::uint32_t>(a);
+}
 std::uint64_t slow_ld64(std::uint32_t a) { return read_slow<std::uint64_t>(a); }
 
 void slow_ld128(std::uint32_t a, Reg128 &out) {
