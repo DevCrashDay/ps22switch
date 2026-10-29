@@ -41,4 +41,10 @@ namespace ps2 {
 // the game does.
 bool window_covered(std::uint32_t base, std::uint32_t size);
 
+struct ModuleInfo;
+
+// add_modules (generated.hpp) with a rank: of two modules of the same content that are both in place and both have the function, the
+// one of the higher rank runs. A quick library (rank 0) is followed by one made with the normal flags (rank 1) for the same window.
+void add_modules_ranked(const ModuleInfo *modules, std::uint32_t count, int rank);
+
 }  // namespace ps2

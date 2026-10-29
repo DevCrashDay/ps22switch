@@ -87,6 +87,7 @@ struct LiveResult {
     std::size_t code = 0;                // translated instructions
     std::set<std::uint32_t> accepted;    // the entries that are code in this image
     std::set<std::uint32_t> rejected;
+    double analyse_s = 0, codegen_s = 0;   // where the time went: the analysis of the image, writing the C++
 };
 
 // Translates one captured window image into C++ files in out_dir, as eerecomp does for an image it reads from overlays/ (the same

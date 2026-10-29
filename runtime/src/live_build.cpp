@@ -433,6 +433,13 @@ bool compile_and_link(const Job &job, Timing &timing) {
                     break;
                 }
         }
+#ifdef _WIN32
+        if (FILETIME created, exited, kernel, user; process.handle && GetProcessTimes(process.handle, &created, &exited, &kernel, &user)) {
+            const auto ticks = [](const FILETIME &f) { return static_cast<double>((static_cast<std::uint64_t>(f.dwHighDateTime) << 32) | f.dwLowDateTime) * 1e-7; };
+            timing.cpu += ticks(kernel) + ticks(user);
+            timing.longest = std::max(timing.longest, ticks(exited) - ticks(created));
+        }
+#endif
         release(process);
         if (code != 0) {
             ok = false;
@@ -442,7 +449,8 @@ bool compile_and_link(const Job &job, Timing &timing) {
     };
     while ((next < job.sources.size() && ok) || !running.empty()) {
         if (job.cancel && job.cancel->load()) ok = false;
-        while (ok && next < job.sources.size() && running.size() < ((job.urgent && job.urgent->load()) ? std::max(job.jobs, job.jobs_urgent) : job.jobs)) {
+        while (ok && next < job.sources.size() && running.size() < ((job.urgent && job.urgent->load()) ? std::max(job.jobs, job.jobs_urgent) : job.jobs) &&
+               !(job.hold && job.hold->load() > 0 && !(job.urgent && job.urgent->load()))) {
             std::vector<std::string> args = {compiler};
             args.insert(args.end(), job.flags.begin(), job.flags.end());
             args.push_back(include);
@@ -468,6 +476,7 @@ bool compile_and_link(const Job &job, Timing &timing) {
             ++next;
         }
         if (!running.empty()) reap();
+        else if (ok && next < job.sources.size()) std::this_thread::sleep_for(std::chrono::milliseconds(20));   // held back: the game waits for another build
     }
     timing.compile = seconds_since(t);
     if (!ok) return false;

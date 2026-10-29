@@ -29,11 +29,16 @@ constexpr std::uint32_t kXffMagic = 0x32666678u;
 struct Instance {
     std::uint32_t base;
     const ModuleInfo *module;
+    int rank;
 };
 
 // Every module there is: the ones the build was translated with and the ones translated while the game ran (ee_live.cpp, added by
 // add_modules). A deque, so that an Instance can point at a module while more are added.
 std::deque<ModuleInfo> g_modules;
+// How good each module's code is, in step with g_modules: of two modules of the same content that both have an entry, the higher rank
+// runs (ee_live.cpp translates a window quickly first, with little optimisation, and again with more in the background).
+std::deque<int> g_ranks;
+int g_max_rank = 0;
 std::uint32_t g_module_span = 0;
 std::vector<Instance> g_instances;
 
@@ -61,8 +66,12 @@ const Instance *in_place(const Instance &i) {
     return ld32(i.base + i.module->checks[2 * c]) == i.module->checks[2 * c + 1] ? &i : nullptr;
 }
 
-Instance make_instance(std::uint32_t base, const ModuleInfo *m) {
-    return {base, m};
+// Adds an instance, keeping g_instances in order of rank (higher first, the earlier one first among equals): the first one in place that
+// has an entry is the one that runs.
+Instance *add_instance(std::uint32_t base, const ModuleInfo *m, int rank) {
+    auto at = g_instances.begin();
+    while (at != g_instances.end() && at->rank >= rank) ++at;
+    return &*g_instances.insert(at, Instance{base, m, rank});
 }
 
 const UnitInfo *module_unit(const ModuleInfo &m, std::uint32_t offset) {
@@ -96,13 +105,18 @@ const Instance *instance_for(std::uint32_t pc, bool needs_entry = false) {
     }
     if (g_modules.empty() || pc >= kRamSize) return nullptr;
     // A code window rewritten by the game holds fixed base modules, each an
-    // image of one content. The ones whose check words are in place serve it.
-    for (const ModuleInfo &m : g_modules) {
-        if (m.fixed_base && pc - m.fixed_base < m.size && loaded_at(m, m.fixed_base)) {
-            if (std::any_of(g_instances.begin(), g_instances.end(), [&](const Instance &i) { return i.module == &m; })) continue;
-            g_instances.push_back(make_instance(m.fixed_base, &m));
-            if (!needs_entry || module_entry(g_instances.back(), pc, unit)) return &g_instances.back();
-            serving = true;
+    // image of one content. The ones whose check words are in place serve it,
+    // the best ones first.
+    for (int rank = g_max_rank; rank >= 0; --rank) {
+        for (std::size_t k = 0; k < g_modules.size(); ++k) {
+            const ModuleInfo &m = g_modules[k];
+            if (g_ranks[k] != rank) continue;
+            if (m.fixed_base && pc - m.fixed_base < m.size && loaded_at(m, m.fixed_base)) {
+                if (std::any_of(g_instances.begin(), g_instances.end(), [&](const Instance &i) { return i.module == &m; })) continue;
+                const Instance *added = add_instance(m.fixed_base, &m, rank);
+                if (!needs_entry || module_entry(*added, pc, unit)) return added;
+                serving = true;
+            }
         }
     }
     if (serving) return nullptr;
@@ -110,8 +124,7 @@ const Instance *instance_for(std::uint32_t pc, bool needs_entry = false) {
         if (const std::uint32_t magic = ld32(at); magic == kModuleMagic || magic == kXffMagic) {
             for (const ModuleInfo &m : g_modules)
                 if (pc - at < m.size && loaded_at(m, at)) {
-                    g_instances.push_back(make_instance(at, &m));
-                    return &g_instances.back();
+                    return add_instance(at, &m, 0);
                 }
             // A stray "xff2" word (a string, data) is not a header: look further back
             if (magic == kModuleMagic) return nullptr;
@@ -154,16 +167,25 @@ void register_units(const UnitInfo *units, std::uint32_t count) {
 
 void register_modules(const ModuleInfo *modules, std::uint32_t count) {
     g_modules.assign(modules, modules + count);
+    g_ranks.assign(count, 0);
+    g_max_rank = 0;
     g_instances.clear();
     g_module_span = 0;
     for (std::uint32_t k = 0; k < count; ++k) g_module_span = std::max(g_module_span, modules[k].size);
 }
 
-void add_modules(const ModuleInfo *modules, std::uint32_t count) {
+void add_modules(const ModuleInfo *modules, std::uint32_t count) { add_modules_ranked(modules, count, 0); }
+
+void add_modules_ranked(const ModuleInfo *modules, std::uint32_t count, int rank) {
     for (std::uint32_t k = 0; k < count; ++k) {
         g_modules.push_back(modules[k]);
+        g_ranks.push_back(rank);
         g_module_span = std::max(g_module_span, modules[k].size);
     }
+    // A module of a better rank than the ones in use must be looked at first: the instances made so far are made again when they are
+    // needed (they are only a cache of which modules are in place; a function that is running goes on in the code it started in).
+    if (rank > g_max_rank) g_max_rank = rank;
+    if (rank > 0) g_instances.clear();
 }
 
 bool window_module_in_place(std::uint32_t pc) { return instance_for(pc) != nullptr; }

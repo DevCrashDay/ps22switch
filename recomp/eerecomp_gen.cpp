@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdio>
+#include <chrono>
 #include <cstring>
 #include <fstream>
 #include <stdexcept>
@@ -176,7 +177,9 @@ LiveResult generate_live(const LiveRequest &request, const std::filesystem::path
         Search search;
         search.whole_image = !request.focused;
         search.after_return = !request.focused;
+        const auto began = std::chrono::steady_clock::now();
         Program program = analyse(image, request.entries, {}, search);
+        result.analyse_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - began).count();
         if (request.entries.empty()) {
             // No entry point given: a window translated before the game has called into it (runtime/src/ee_live.cpp, background
             // translation). What the search for function starts found is what there is.
@@ -202,7 +205,9 @@ LiveResult generate_live(const LiveRequest &request, const std::filesystem::path
         options.output = ps2::os::utf8(out_dir);
         options.live_stamp = request.stamp;
         options.quiet = true;
+        const auto coding = std::chrono::steady_clock::now();
         generate(translations, options);
+        result.codegen_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - coding).count();
         for (const auto &entry : std::filesystem::directory_iterator(out_dir))
             if (entry.path().extension() == ".cpp" && entry.path().filename() != "table.cpp") ++result.units;
         result.ok = true;

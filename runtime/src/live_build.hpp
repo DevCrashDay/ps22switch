@@ -78,11 +78,14 @@ struct Job {
     bool below_normal = true;        // the game comes first; a paused game (ee_live.cpp) compiles at normal priority
     bool starve = true;              // false: a compile that gets no processor time does not switch the toolchain to normal priority by itself
     const std::atomic<bool> *cancel = nullptr;  // set: stop at once (the compilers are ended, nothing more is said); the caller no longer wants the result
+    const std::atomic<int> *hold = nullptr;     // above 0: start no more compilers for now (the game waits for another build, which should have the processors); running ones go on
     const std::atomic<bool> *urgent = nullptr;  // set while the game waits for this job (ee_live.cpp, background translation): normal priority from then on
     std::function<void(const std::string &)> say;  // one line of the log
 };
 struct Timing {
     double generate = 0, compile = 0, link = 0;
+    double cpu = 0;       // processor seconds the compilers used (Windows only; 0 elsewhere)
+    double longest = 0;   // the longest life of one compiler process (Windows only)
 };
 bool compile_and_link(const Job &job, Timing &timing);
 

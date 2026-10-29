@@ -68,6 +68,8 @@ struct BgJob {
     std::atomic<int> state{kQueued};
     std::atomic<bool> urgent{false};      // the game waits for it: the compilers go to normal priority
     std::atomic<bool> cancel{false};      // the window changed under it: end the build, nobody wants the result
+    bool quick = false;                   // built with little optimisation (State::quick_flags): the game may be about to wait for it
+    bool upgrade = false;                 // the window has a quick library already: this one is the same code with the normal flags
     // Filled in by the worker before the state turns kBuilt or kFailed.
     fs::path library;
     std::string error;
@@ -95,6 +97,10 @@ struct State {
     std::vector<std::pair<std::uint32_t, std::uint32_t>> segments;   // the code the program itself has: {address, size}
     std::uint64_t stamp = 0;
     std::vector<std::string> flags;
+    std::vector<std::string> quick_flags; // for the first translation of a window, which the game waits for: fast to compile, slower code
+    bool two_step = false;                // quick_flags differ from flags: such a library is followed by one made with flags, in the background
+    std::set<std::string> fast;           // window images whose whole library is a quick one, still to be made again (marker files)
+    std::atomic<int> priority_work{0};    // stops and background builds the game may wait for: the builds that only improve code hold back meanwhile
     std::size_t jobs = 4;                 // compiler processes at a time for a background build
     std::size_t jobs_now = 4;             // for a build the game waits for: every processor thread there is
     bool keep_work = false;
@@ -133,6 +139,8 @@ struct State {
     std::atomic<bool> quitting{false};
     std::mutex prep_mutex;                // the headers in the cache and the program analysis: made once, by whoever needs them first
     std::mutex generate_mutex;            // the translator is used by one thread at a time
+    std::thread prepare;                  // reads the program ahead of the first window translation (prepare_in_background)
+    bool prepare_started = false;         // emulation thread only
 };
 
 State *g = nullptr;  // never freed: a compile may still be running while the process ends
@@ -167,7 +175,7 @@ EeLiveHost &host() {
 }
 
 // Loads one library of the cache and adds its modules to the ones the game has. False when it is not usable.
-bool load_library(const fs::path &path, std::size_t &modules) {
+bool load_library(const fs::path &path, std::size_t &modules, int rank) {
     void *library = lb::open_library(path);
     if (!library) return false;
     using StampFn = std::uint64_t (*)();
@@ -178,7 +186,7 @@ bool load_library(const fs::path &path, std::size_t &modules) {
     std::uint32_t n = 0;
     const ModuleInfo *table = init(&host(), &n);
     if (!table || !n) return false;
-    ps2::add_modules(table, n);
+    ps2::add_modules_ranked(table, n, rank);
     modules += n;
     ++g->libraries;
     return true;
@@ -253,23 +261,27 @@ struct Built {
     std::string why;
 };
 
+// The analysis of the program itself (about half a second for a big game), made once: by whoever needs it first, or ahead of time by
+// the thread prepare_in_background() starts. Everything that needs it waits for the lock.
+void ensure_analysis() {
+    std::error_code error;
+    std::lock_guard lock(g->prep_mutex);
+    if (g->analysed) return;
+    g->analysed = true;
+    if (!g->game_dir.empty() && fs::is_regular_file(g->game_dir / "entries.txt", error))
+        g->main_entries = recomp::read_entries(ps2::os::utf8(g->game_dir / "entries.txt")).main;
+    try {
+        g->program_analysis = std::make_unique<recomp::StaticProgram>(ps2::os::utf8(g->program), g->main_entries);
+    } catch (const std::exception &e) {
+        say("cannot read the program for its calls into the window: %s", e.what());
+    }
+}
+
 // The part of the work that needs the program analysis: the calls the program itself makes into the window and what entries.txt knows
 // of this image from before, as entry points of the first translation of the window.
 void add_window_entries(recomp::LiveRequest &request, std::size_t &static_calls, std::size_t &known_entries) {
     std::error_code error;
-    {
-        std::lock_guard lock(g->prep_mutex);
-        if (!g->analysed) {
-            g->analysed = true;
-            if (!g->game_dir.empty() && fs::is_regular_file(g->game_dir / "entries.txt", error))
-                g->main_entries = recomp::read_entries(ps2::os::utf8(g->game_dir / "entries.txt")).main;
-            try {
-                g->program_analysis = std::make_unique<recomp::StaticProgram>(ps2::os::utf8(g->program), g->main_entries);
-            } catch (const std::exception &e) {
-                say("cannot read the program for its calls into the window: %s", e.what());
-            }
-        }
-    }
+    ensure_analysis();
     if (g->program_analysis)
         for (const std::uint32_t t : g->program_analysis->calls_into(request.base, static_cast<std::uint32_t>(request.image.size()))) {
             request.entries.push_back(t);
@@ -289,10 +301,10 @@ void add_window_entries(recomp::LiveRequest &request, std::size_t &static_calls,
 
 // Translates, compiles and links one request into a library file of the cache (not loaded yet). `what` names it in messages. A
 // background build compiles below normal priority, never starves into normal on its own, and goes to normal when `urgent` is set.
-Built build_library(recomp::LiveRequest request, const std::string &what, bool background, const std::atomic<bool> *urgent, const std::atomic<bool> *cancel) {
+Built build_library(recomp::LiveRequest request, const std::string &what, bool background, const std::atomic<bool> *urgent, const std::atomic<bool> *cancel, bool quick = false, bool upgrade = false) {
     Built b;
     const std::string id = lb::hex(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count()), 11) +
-                           (background ? "b" : "");
+                           (background ? "b" : "") + (quick ? "q" : "");
     request.prefix = "m_" + request.name + "_" + id + "_";
     request.stamp = g->stamp;
     b.work = g->cache / ("work-" + id);
@@ -320,18 +332,24 @@ Built build_library(recomp::LiveRequest request, const std::string &what, bool b
     lb::Job job;
     for (const auto &e : fs::directory_iterator(src, error))
         if (e.path().extension() == ".cpp") job.sources.push_back(e.path());
-    std::sort(job.sources.begin(), job.sources.end());
+    // The biggest first: the compile ends when the last file does, so the long ones should not start last.
+    std::sort(job.sources.begin(), job.sources.end(), [&](const fs::path &a, const fs::path &b) {
+        std::error_code e1, e2;
+        const auto sa = fs::file_size(a, e1), sb = fs::file_size(b, e2);
+        return sa != sb ? sa > sb : a < b;
+    });
     job.include_dir = g->cache / "include";
     job.work = b.work;
     job.library = b.work / ("library" + std::string(lb::kLibraryExtension));
     job.compiler = g->compiler;
-    job.flags = g->flags;
+    job.flags = quick ? g->quick_flags : g->flags;
     job.jobs = std::min(background ? g->jobs : g->jobs_now, job.sources.size());
     job.jobs_urgent = std::min(g->jobs_now, job.sources.size());
     job.below_normal = background;   // a waiting game needs this now; a background build leaves the game its processors
     job.starve = !background;
     job.urgent = urgent;
     job.cancel = cancel;
+    job.hold = upgrade ? &g->priority_work : nullptr;   // a build that only improves code waits while a stop or a build the game may need is under way
     job.say = [](const std::string &text) { say("%s", text.c_str()); };
     b.files = job.sources.size();
     if (!lb::compile_and_link(job, b.timing)) return b;   // the compiler's messages were said
@@ -369,7 +387,7 @@ void worker_main() {
         request.name = job->name;
         request.focused = false;   // a first translation: all of the window
         add_window_entries(request, job->static_calls, job->known_entries);
-        const Built built = g->quitting.load() || job->cancel.load() ? Built{} : build_library(request, "the window " + job->name, true, &job->urgent, &job->cancel);
+        const Built built = g->quitting.load() || job->cancel.load() ? Built{} : build_library(request, "the window " + job->name, true, &job->urgent, &job->cancel, job->quick, job->upgrade);
         job->timing = built.timing;
         job->files = built.files;
         job->code = built.generated.code;
@@ -378,6 +396,7 @@ void worker_main() {
         job->error = built.why;
         job->no_code = !built.ok && built.generated.error.rfind("none of the entry points is code", 0) == 0;
         job->seconds = lb::seconds_since(began);
+        if (!job->upgrade) --g->priority_work;
         {
             std::lock_guard lock(g->mutex);
             job->state = built.ok ? kBuilt : kFailed;
@@ -391,11 +410,54 @@ void worker_main() {
 void quit_worker() {
     if (g->looks) std::fprintf(stderr, "[ee-live] background watch: %llu looks at %zu windows, %.0f us each on average, %.0f us at most; %zu windows translated in the background\n", static_cast<unsigned long long>(g->looks), g->windows.size(),
                                static_cast<double>(g->look_us) / static_cast<double>(g->looks), static_cast<double>(g->look_max_us), g->started.size());
+    if (g->prepare.joinable()) g->prepare.join();
     if (!g->worker_started) return;
     g->quitting = true;
     g->wake.notify_all();
     lb::stop_all();   // a compile in progress ends, so that the worker does too
     for (int i = 0; i < 300 && g->worker_busy.load(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+}
+
+// The text of a marker file in the cache: which windows were translated as a whole, and whether by a quick build that is still to be
+// followed by one with the normal flags.
+void write_marker(const std::string &name, bool fast) {
+    std::ofstream(g->cache / (lb::hex(g->stamp >> 32, 8) + "-whole-" + name + ".mark")) << (fast ? "fast\n" : "whole image translated\n");
+}
+
+void enqueue(const std::shared_ptr<BgJob> &job) {
+    {
+        std::lock_guard lock(g->mutex);
+        // A build the game may wait for goes in front of the ones that only improve code.
+        if (job->upgrade) g->queue.push_back(job);
+        else {
+            auto at = g->queue.begin();
+            while (at != g->queue.end() && !(*at)->upgrade) ++at;
+            g->queue.insert(at, job);
+        }
+        if (!g->worker_started) {
+            g->worker_started = true;
+            std::thread(worker_main).detach();
+        }
+    }
+    if (!job->upgrade) ++g->priority_work;
+    g->active.push_back(job);
+    g->wake.notify_one();
+}
+
+// A window with a quick library: the same code again with the normal flags, in the background. The game goes on meanwhile; at a frame
+// boundary the better library is switched in, and it runs from then on (dispatch.cpp, ranks).
+void queue_upgrade(std::uint32_t base, const std::string &name, std::vector<std::uint8_t> image) {
+    if (!g->two_step || !g->background || !g->fast.count(name) || g->bg_failures >= 2) return;
+    for (const std::shared_ptr<BgJob> &j : g->active)
+        if (j->upgrade && j->name == name) return;
+    auto job = std::make_shared<BgJob>();
+    job->base = base;
+    job->image = std::move(image);
+    job->name = name;
+    job->frame = ps2::frame_count();
+    job->upgrade = true;
+    if (g->verbose) say("window 0x%08X (image %s): the quick library is in use, making it again with the normal flags in the background", base, name.c_str());
+    enqueue(job);
 }
 
 // The emulation thread: takes one finished build into use, if the window still holds what it was made from.
@@ -418,6 +480,21 @@ void finish_background(const std::shared_ptr<BgJob> &job) {
         }
         return;
     }
+    if (job->upgrade) {
+        // The window need not be the same any more: the library is of this content, serves it whenever it is in place (the check words say)
+        // and is taken in like the others. It runs instead of the quick one from now on.
+        std::size_t modules = 0;
+        if (!load_library(job->library, modules, 1)) {
+            say("the library made in the background does not load (%s)", ps2::os::utf8(job->library.filename()).c_str());
+            if (++g->bg_failures >= 2) g->background = false;
+            return;
+        }
+        g->fast.erase(job->name);
+        write_marker(job->name, false);
+        say("switched in the library of window 0x%08X (image %s, %u KiB) made with the normal flags: %.1f s after the quick one (translate %.1f, compile %.1f, link %.1f), %zu instructions, %zu files", job->base, job->name.c_str(), size / 1024,
+            lb::seconds_since(job->queued), job->timing.generate, job->timing.compile, job->timing.link, job->code, job->files);
+        return;
+    }
     // A result of a guess that went stale is dropped, never used: the window has to hold exactly the image that was translated, in size
     // and in every byte. (A library also checks every translated word of the code against the window each time it is entered, so a
     // wrong one could not run anyway; this keeps it from being loaded at all.)
@@ -432,17 +509,19 @@ void finish_background(const std::shared_ptr<BgJob> &job) {
         return;
     }
     std::size_t modules = 0;
-    if (!load_library(job->library, modules)) {
+    if (!load_library(job->library, modules, job->quick ? 0 : 1)) {
         say("the library made in the background does not load (%s)", ps2::os::utf8(job->library.filename()).c_str());
         if (++g->bg_failures >= 2) g->background = false;
         return;
     }
     g->whole.insert(job->name);
-    std::ofstream(g->cache / (lb::hex(g->stamp >> 32, 8) + "-whole-" + job->name + ".mark")) << "whole image translated\n";
+    if (job->quick) g->fast.insert(job->name);
+    write_marker(job->name, job->quick);
     remember(job->name, job->base, job->image, {}, false);
-    say("switched in the background translation of window 0x%08X (image %s, %u KiB): settled at frame %llu, ready %.1f s later (translate %.1f, compile %.1f, link %.1f), %zu entry points%s%s, %zu instructions, %zu files",
-        job->base, job->name.c_str(), size / 1024, static_cast<unsigned long long>(job->frame), lb::seconds_since(job->queued), job->timing.generate, job->timing.compile, job->timing.link, job->entry_points,
+    say("switched in the background translation of window 0x%08X (image %s, %u KiB%s): settled at frame %llu, ready %.1f s later (translate %.1f, compile %.1f, link %.1f), %zu entry points%s%s, %zu instructions, %zu files",
+        job->base, job->name.c_str(), size / 1024, job->quick ? ", quick" : "", static_cast<unsigned long long>(job->frame), lb::seconds_since(job->queued), job->timing.generate, job->timing.compile, job->timing.link, job->entry_points,
         job->static_calls ? " (calls of the program included)" : "", job->known_entries ? " (entries.txt included)" : "", job->code, job->files);
+    if (job->quick) queue_upgrade(job->base, job->name, job->image);
 }
 
 // The emulation thread: every finished background build, in the order they finished.
@@ -465,7 +544,7 @@ void take_finished() {
 bool use_background(std::uint32_t pc, std::uint32_t base, const std::string &name) {
     std::shared_ptr<BgJob> job;
     for (const std::shared_ptr<BgJob> &candidate : g->active)
-        if (candidate->base == base && candidate->name == name) job = candidate;
+        if (candidate->base == base && candidate->name == name && !candidate->upgrade) job = candidate;   // an upgrade is not waited for: the window has a library
     if (!job) return false;
     if (job->state == kQueued) {
         std::lock_guard lock(g->mutex);
@@ -473,6 +552,7 @@ bool use_background(std::uint32_t pc, std::uint32_t base, const std::string &nam
         if (at != g->queue.end()) {   // not started: the translation the game would wait for is the one it can start itself
             g->queue.erase(at);
             job->state = kCancelled;
+            --g->priority_work;
             g->active.erase(std::remove(g->active.begin(), g->active.end(), job), g->active.end());
             return false;
         }
@@ -542,7 +622,16 @@ bool inside_started(std::uint32_t base, std::uint32_t extent, const std::vector<
 // False when it has to wait for the worker (the window is looked at again at the next look).
 bool start_background(Watch &w, std::uint32_t base, std::uint32_t extent) {
     if (all_zero(g_ram + base, extent) || !has_return(g_ram + base, extent)) return true;   // empty, or data
-    if (ps2::window_covered(base, extent)) return true;   // the build or an earlier library has this code
+    if (ps2::window_covered(base, extent)) {   // the build or an earlier library has this code
+        // A quick library from an earlier run, or one made while the window was loading: the better one is made now that it is back.
+        if (g->fast.empty() || w.jobs >= kJobsPerWindow) return true;
+        const std::string name = recomp::window_name(base, g_ram + base, extent);
+        if (!g->fast.count(name)) return true;
+        if (g->active.size() >= kMaxActive) return false;
+        ++w.jobs;
+        queue_upgrade(base, name, std::vector<std::uint8_t>(g_ram + base, g_ram + base + extent));
+        return true;
+    }
     if (w.jobs >= kJobsPerWindow) return true;
     const std::vector<std::uint64_t> units = unit_hashes(g_ram + base, extent);
     if (inside_started(base, extent, units)) return true;
@@ -553,19 +642,11 @@ bool start_background(Watch &w, std::uint32_t base, std::uint32_t extent) {
     job->name = recomp::window_name(base, job->image.data(), job->image.size());
     if (g->whole.count(job->name) || !g->bg_seen.insert(job->name).second) return true;   // done before (a library of the cache, or an earlier job)
     job->frame = ps2::frame_count();
+    job->quick = g->two_step;
     ++w.jobs;
     g->started.push_back({base, extent, units});
     if (g->verbose) say("window 0x%08X settled (%u KiB, image %s): translating it in the background while the game goes on", base, extent / 1024, job->name.c_str());
-    {
-        std::lock_guard lock(g->mutex);
-        g->queue.push_back(job);
-        if (!g->worker_started) {
-            g->worker_started = true;
-            std::thread(worker_main).detach();
-        }
-    }
-    g->active.push_back(job);
-    g->wake.notify_one();
+    enqueue(job);
     return true;
 }
 
@@ -584,6 +665,7 @@ void drop_stale_jobs() {
                 if (at != g->queue.end()) {
                     g->queue.erase(at);
                     job->state = kCancelled;
+                    if (!job->upgrade) --g->priority_work;
                     g->active.erase(g->active.begin() + static_cast<std::ptrdiff_t>(i));
                     continue;
                 }
@@ -591,6 +673,14 @@ void drop_stale_jobs() {
         }
         ++i;
     }
+}
+
+// A window with code nobody serves has appeared: the stop that may follow it needs the analysis of the program, so it is made now, on a
+// thread of its own, while the game still streams the window in or plays on.
+void prepare_in_background() {
+    if (g->prepare_started) return;
+    g->prepare_started = true;
+    g->prepare = std::thread([] { ensure_analysis(); });
 }
 
 void watch_windows() {
@@ -610,6 +700,7 @@ void watch_windows() {
             w.extent = extent;
             w.stable = 0;
             w.handled = false;
+            if (!g->prepare_started && !all_zero(g_ram + base, extent) && has_return(g_ram + base, extent) && !ps2::window_covered(base, extent)) prepare_in_background();
             continue;
         }
         if (w.handled || ++w.stable < kSettledChecks) continue;
@@ -654,6 +745,13 @@ void start(const std::string &program, const std::string &cache, const std::stri
     std::string opt = "-O1";
     if (const std::string v = ps2::os::env("PS2_EE_LIVE_OPT"); !v.empty()) opt = v;
     g->flags = lb::compile_flags(opt);
+    // PS2_EE_LIVE_QUICK=<level> is the level of the first translation of a window, the one the game waits for (default -O0: about half the
+    // compile time, code a few percent slower); it is followed by the same translation at the PS2_EE_LIVE_OPT level in the background.
+    // PS2_EE_LIVE_QUICK=off waits for a build at the normal level.
+    std::string quick = "-O0";
+    if (const std::string v = ps2::os::env("PS2_EE_LIVE_QUICK"); !v.empty()) quick = v;
+    g->quick_flags = lb::compile_flags(quick == "off" ? opt : quick);
+    g->two_step = quick != "off" && g->quick_flags != g->flags;
     g->keep_work = !ps2::os::env("PS2_EE_LIVE_KEEP").empty();
     g->jobs = std::clamp<std::size_t>(std::thread::hardware_concurrency() * 3 / 4, 2, 9);   // a build in the background: most of the machine, below normal priority
     g->jobs_now = std::clamp<std::size_t>(std::thread::hardware_concurrency(), 2, 16);   // the game is paused while this runs: all of it
@@ -664,7 +762,8 @@ void start(const std::string &program, const std::string &cache, const std::stri
     h = lb::fnv(h, kGeneratorVersion, std::strlen(kGeneratorVersion));
     for (const char *text : {kLiveHdrCpu, kLiveHdrFpu, kLiveHdrVu, kLiveHdrMemory, kLiveHdrMmi, kLiveHdrGenerated, kLiveHdrEeLiveAbi})
         h = lb::fnv(h, text, std::strlen(text));
-    for (const std::string &f : g->flags) h = lb::fnv(h, f.data(), f.size() + 1);
+    for (const std::string &f : g->flags)
+        if (f.rfind("-O", 0) != 0) h = lb::fnv(h, f.data(), f.size() + 1);   // the level of optimisation does not change what a library computes
     h = lb::fnv(h, elf.data(), elf.size());
     const std::size_t layout = sizeof(Cpu);
     h = lb::fnv(h, &layout, sizeof layout);
@@ -680,8 +779,13 @@ void start(const std::string &program, const std::string &cache, const std::stri
             std::string prefix;
             const std::string file = ps2::os::utf8(e.path().filename());
             if (e.is_regular_file() && file.size() > 18 && file.ends_with(".mark") && file.compare(8, 7, "-whole-") == 0) {
-                if (file.compare(0, 8, mine) == 0) g->whole.insert(file.substr(15, file.size() - 20));
-                else fs::remove(e.path(), error);
+                if (file.compare(0, 8, mine) == 0) {
+                    const std::string name = file.substr(15, file.size() - 20);
+                    g->whole.insert(name);
+                    if (std::ifstream in(e.path()); in && in.get() == 'f') g->fast.insert(name);   // "fast": only a quick library so far
+                } else {
+                    fs::remove(e.path(), error);
+                }
             } else if (e.is_regular_file() && is_cache_library(e.path(), prefix)) {
                 if (prefix == mine) libraries.push_back(e.path());
                 else fs::remove(e.path(), error);
@@ -691,7 +795,9 @@ void start(const std::string &program, const std::string &cache, const std::stri
         }
         std::sort(libraries.begin(), libraries.end());
         for (const fs::path &p : libraries) {
-            if (load_library(p, modules)) ++files;
+            // A quick library has a q after the dash; it runs only where no better one of the same content has the function.
+            const std::string name = ps2::os::utf8(p.filename());
+            if (load_library(p, modules, name.find('q', 9) == std::string::npos ? 1 : 0)) ++files;
             else fs::remove(p, error);
         }
     }
@@ -719,6 +825,11 @@ bool translate_missing(std::uint32_t pc) {
     if (!g || !g->ready || g->failed.count(pc)) return false;
     const auto began = Clock::now();
     std::error_code error;
+    // The game waits from here on: builds that only improve code start no more compilers until it goes on.
+    struct Waiting {
+        Waiting() { ++g->priority_work; }
+        ~Waiting() { --g->priority_work; }
+    } waiting;
 
     // A window that settled earlier may have been built in the background by now: take it in, and the game goes on without a pause.
     if (g->done_count.load()) {
@@ -775,12 +886,18 @@ bool translate_missing(std::uint32_t pc) {
     request.base = base;
     request.image = image;
     request.name = name;
-    request.focused = region || whole_done;
+    static const bool force_focus = !ps2::os::env("PS2_EE_LIVE_FOCUS").empty();   // debugging: every miss translates only what it reaches
+    request.focused = region || whole_done || force_focus;
+    // The first translation of a whole window is the long one: it is compiled with little optimisation (the game waits for it), and the
+    // same code is made again with the normal flags in the background afterwards. Single functions (the focused ones) are small: normal flags.
+    const bool quick = !request.focused && g->two_step;
     request.entries.push_back(pc);
     std::size_t static_calls = 0, known_entries = 0;
     // An image that is translated as a whole now: the calls the program itself makes into the window, and what entries.txt knows of this
     // image from before, are translated together with the entry point that was missed, so that this is not repeated for each of them.
+    const auto entries_began = Clock::now();
     if (!request.focused) add_window_entries(request, static_calls, known_entries);
+    const double entries_s = lb::seconds_since(entries_began);
 
     const auto fail = [&](const char *why) {
         g->failed.insert(pc);
@@ -793,24 +910,31 @@ bool translate_missing(std::uint32_t pc) {
         return false;
     };
 
-    const Built built = build_library(request, "0x" + lb::hex(pc, 8), false, nullptr, nullptr);
+    const Built built = build_library(request, "0x" + lb::hex(pc, 8), false, nullptr, nullptr, quick);
     if (!built.ok) {
         if (!built.why.empty()) say("%s", built.why.c_str());
         return fail("the game stops");
     }
     std::size_t modules = 0;
-    if (!load_library(built.library, modules)) {
+    const auto load_began = Clock::now();
+    if (!load_library(built.library, modules, quick ? 0 : 1)) {
         say("the library made just now does not load (%s)", ps2::os::utf8(built.library.filename()).c_str());
         return fail("the game stops");
     }
     g->failures = 0;
-    say("switched in after %.1f s (translate %.1f, compile %.1f, link %.1f): %zu entry points%s%s, %zu instructions, %zu files", lb::seconds_since(began), built.timing.generate, built.timing.compile, built.timing.link,
+    if (g->verbose)
+        say("the stop in parts: program analysis %.2f s, analysis of the window %.2f s, writing C++ %.2f s, compile %.2f s (processor time %.1f s, the longest compiler %.2f s, %zu files), link %.2f s, load %.2f s, the rest %.2f s",
+            entries_s, built.generated.analyse_s, built.generated.codegen_s, built.timing.compile, built.timing.cpu, built.timing.longest, built.files, built.timing.link, lb::seconds_since(load_began),
+            lb::seconds_since(began) - entries_s - built.timing.generate - built.timing.compile - built.timing.link - lb::seconds_since(load_began));
+    say("switched in after %.1f s%s (translate %.1f, compile %.1f, link %.1f): %zu entry points%s%s, %zu instructions, %zu files", lb::seconds_since(began), quick ? " (quick)" : "", built.timing.generate, built.timing.compile, built.timing.link,
         built.generated.accepted.size(), static_calls ? " (calls of the program included)" : "", known_entries ? " (entries.txt included)" : "", built.generated.code, built.files);
     if (!request.focused) {
         g->whole.insert(name);
-        std::ofstream(g->cache / (lb::hex(g->stamp >> 32, 8) + "-whole-" + name + ".mark")) << "whole image translated\n";
+        if (quick) g->fast.insert(name);
+        write_marker(name, quick);
     }
     remember(name, base, image, {pc}, region);
+    if (quick) queue_upgrade(base, name, std::move(image));
     return true;
 }
 
