@@ -83,7 +83,12 @@ std::map<std::uint32_t, CmdHandler> g_cmd_handlers;
 std::uint32_t g_sreg[32] = {};
 std::map<std::uint32_t, int> g_iop_clients;
 std::uint32_t g_iop_rpc_id = 1;
-std::uint32_t g_loop_stub = 0, g_finish_stub = 0;
+std::uint32_t g_loop_stub = 0, g_finish_stub = 0, g_exec_stub = 0;
+// A server thread that runs its own loop (sceSifGetNextRequest, then sceSifExecRequest, then SleepThread) instead of sceSifRpcLoop: the
+// requests it has taken but not run yet (by handle), and where each thread goes on after the request it runs.
+std::map<std::uint32_t, Request> g_taken;
+std::map<int, std::uint32_t> g_exec_return;
+std::uint32_t g_next_handle = 0;
 std::uint32_t g_iop_dma_id = 1, g_ee_dma_id = 1;
 std::uint64_t g_ee_dma_done = 0;
 
@@ -122,9 +127,19 @@ void deliver_request(std::uint32_t queue) {
     auto t = g_queue_threads.find(queue);
     if (t == g_queue_threads.end()) return;
     iop::kernel::Thread *th = iop::kernel::thread(t->second);
-    if (th && th->status == iop::kernel::kWait && th->wait == iop::kernel::kWaitRpc) {
+    if (!th) return;
+    if (th->status == iop::kernel::kWait && th->wait == iop::kernel::kWaitRpc) {
         iop::kernel::wake(*th, 0);
         iop::kernel::reschedule();
+    } else if (th->rpc_queue != queue) {
+        // The thread does not run sceSifRpcLoop: the library wakes it the way WakeupThread would (a thread that is not asleep yet
+        // finds the wake-up when it goes to sleep), and it fetches the request with sceSifGetNextRequest.
+        if (th->status == iop::kernel::kWait && th->wait == iop::kernel::kWaitSleep) {
+            iop::kernel::wake(*th, 0);
+            iop::kernel::reschedule();
+        } else {
+            ++th->wakeups;
+        }
     }
 }
 
@@ -307,6 +322,45 @@ void def(const char *library, std::uint32_t index, const char *name, std::functi
     });
 }
 
+// Hands a request to its server: the data into the server's buffer, then the server's function is called with `ret` as its return address.
+void start_request(iop::Cpu &c, iop::kernel::Thread &t, const Request &request, std::uint32_t ret) {
+    const std::uint32_t server = request.call.server_data ^ kServerXor;
+    const Server &s = g_servers[server];
+    if (s.buf && !request.data.empty()) {
+        iop::watch_copy("RPC data", s.buf, 0, static_cast<std::uint32_t>(request.data.size()), 0);
+        std::memcpy(iop::ram_ptr(s.buf), request.data.data(), request.data.size());
+    }
+    t.rpc_server = server;
+    g_held_calls[server] = request.call;
+    c.r[4] = request.call.rpc_number;
+    c.r[5] = s.buf;
+    c.r[6] = request.size;
+    c.r[31] = ret;
+    c.pc = s.func;
+    c.npc = c.pc + 4;
+}
+
+// The server's function returned (v0 points at its answer): the answer goes to the EE, and the call is finished.
+void finish_request(iop::Cpu &c, iop::kernel::Thread &t) {
+    auto it = g_held_calls.find(t.rpc_server);
+    if (it == g_held_calls.end()) return;
+    const Call call = it->second;
+    g_held_calls.erase(it);
+    const std::uint32_t result = c.r[2];
+    if (iop::kernel::g_trace_modules && result && call.recv_size >= 4) {
+        // --trace-iop: the first words the server answers with (the memory card's results are what a save is judged by)
+        std::fprintf(stderr, "[sif] reply server 0x%08X fn %u:", call.server_data ^ kServerXor, call.rpc_number);
+        for (std::uint32_t i = 0; i < std::min<std::uint32_t>(4, call.recv_size / 4); ++i)
+            std::fprintf(stderr, " %08X", iop::read32(result + 4 * i));
+        std::fprintf(stderr, "\n");
+    }
+    if (call.recv && result && call.recv_size) {
+        std::memcpy(g_ram + (call.recv & (kRamSize - 1)), iop::ram_ptr(result), (call.recv_size + 3u) & ~3u);
+        watch_span(call.recv, (call.recv_size + 3u) & ~3u, "sif:rpc_finish");
+    }
+    reply_call(call);
+}
+
 void rpc_loop(iop::Cpu &c) {
     iop::kernel::Thread *t = iop::kernel::current();
     if (!t) return;
@@ -319,44 +373,24 @@ void rpc_loop(iop::Cpu &c) {
     }
     const Request request = queue.front();
     queue.pop_front();
-    const std::uint32_t server = request.call.server_data ^ kServerXor;
-    const Server &s = g_servers[server];
-    if (s.buf && !request.data.empty()) {
-        iop::watch_copy("RPC data", s.buf, 0, static_cast<std::uint32_t>(request.data.size()), 0);
-        std::memcpy(iop::ram_ptr(s.buf), request.data.data(), request.data.size());
-    }
-    t->rpc_server = server;
-    g_held_calls[server] = request.call;
-    c.r[4] = request.call.rpc_number;
-    c.r[5] = s.buf;
-    c.r[6] = request.size;
-    c.r[31] = g_finish_stub;
-    c.pc = s.func;
-    c.npc = c.pc + 4;
+    start_request(c, *t, request, g_finish_stub);
 }
 
 void rpc_finish(iop::Cpu &c) {
     iop::kernel::Thread *t = iop::kernel::current();
     if (!t) return;
-    auto it = g_held_calls.find(t->rpc_server);
-    if (it != g_held_calls.end()) {
-        const Call call = it->second;
-        g_held_calls.erase(it);
-        const std::uint32_t result = c.r[2];
-        if (iop::kernel::g_trace_modules && result && call.recv_size >= 4) {
-            // --trace-iop: the first words the server answers with (the memory card's results are what a save is judged by)
-            std::fprintf(stderr, "[sif] reply server 0x%08X fn %u:", call.server_data ^ kServerXor, call.rpc_number);
-            for (std::uint32_t i = 0; i < std::min<std::uint32_t>(4, call.recv_size / 4); ++i)
-                std::fprintf(stderr, " %08X", iop::read32(result + 4 * i));
-            std::fprintf(stderr, "\n");
-        }
-        if (call.recv && result && call.recv_size) {
-            std::memcpy(g_ram + (call.recv & (kRamSize - 1)), iop::ram_ptr(result), (call.recv_size + 3u) & ~3u);
-            watch_span(call.recv, (call.recv_size + 3u) & ~3u, "sif:rpc_finish");
-        }
-        reply_call(call);
-    }
+    finish_request(c, *t);
     c.pc = g_loop_stub;
+    c.npc = c.pc + 4;
+}
+
+// sceSifExecRequest: the server's function runs on the calling thread, and its return goes back to the caller of sceSifExecRequest.
+void exec_finish(iop::Cpu &c) {
+    iop::kernel::Thread *t = iop::kernel::current();
+    if (!t) return;
+    finish_request(c, *t);
+    c.r[2] = 0;
+    c.pc = g_exec_return[t->id];
     c.npc = c.pc + 4;
 }
 
@@ -370,6 +404,7 @@ void install_iop_side() {
     });
     g_loop_stub = iop::kernel::hle_stub(rpc_loop);
     g_finish_stub = iop::kernel::hle_stub(rpc_finish);
+    g_exec_stub = iop::kernel::hle_stub(exec_finish);
 
     iop::kernel::register_hle_library("sifman", 0x0101);
     def("sifman", 4, "sceSifDma2Init", [](iop::Cpu &c) { c.r[2] = 0; });
@@ -478,6 +513,26 @@ void install_iop_side() {
     def("sifcmd", 19, "sceSifSetRpcQueue", [](iop::Cpu &c) {
         g_queue_threads[arg(c, 0)] = static_cast<int>(arg(c, 1));
         c.r[2] = 0;
+    });
+    // A server thread that runs its own loop: sceSifGetNextRequest takes the next request of the queue (0 when there is none), a handle
+    // that only sceSifExecRequest looks at, and sceSifExecRequest runs the server's function for it. Tekken 5's file server does this,
+    // sleeping in between; deliver_request wakes it.
+    def("sifcmd", 20, "sceSifGetNextRequest", [](iop::Cpu &c) {
+        auto &queue = g_requests[arg(c, 0)];
+        if (queue.empty()) { c.r[2] = 0; return; }
+        const std::uint32_t handle = 0x00100000u + 0x40u * ++g_next_handle;
+        g_taken[handle] = std::move(queue.front());
+        queue.pop_front();
+        c.r[2] = handle;
+    });
+    def("sifcmd", 21, "sceSifExecRequest", [](iop::Cpu &c) {
+        iop::kernel::Thread *t = iop::kernel::current();
+        const auto it = g_taken.find(arg(c, 0));
+        if (!t || it == g_taken.end()) { c.r[2] = 0; return; }
+        const Request request = std::move(it->second);
+        g_taken.erase(it);
+        g_exec_return[t->id] = c.r[31];
+        start_request(c, *t, request, g_exec_stub);
     });
     def("sifcmd", 22, "sceSifRpcLoop", [](iop::Cpu &c) {
         iop::kernel::Thread *t = iop::kernel::current();
@@ -635,8 +690,18 @@ void install_servers() {
             }
             return false;
         }
+        // SearchModuleByName: the id of a module that is loaded (the name sits after two words), else "unknown module".
         if (method == 0x09) {
-            store<std::int32_t>(g_ram + ret, -202);
+            const std::string name(reinterpret_cast<const char *>(g_ram + args + 8), strnlen(reinterpret_cast<const char *>(g_ram + args + 8), 252));
+            std::int32_t found = -202;
+            for (const auto &[id, m] : iop::kernel::modules()) {
+                if (m.name.size() != name.size()) continue;
+                bool same = true;
+                for (std::size_t i = 0; i < name.size() && same; ++i)
+                    same = std::tolower(static_cast<unsigned char>(m.name[i])) == std::tolower(static_cast<unsigned char>(name[i]));
+                if (same) { found = id; break; }
+            }
+            store<std::int32_t>(g_ram + ret, found);
             return true;
         }
         if (method == 0xFF) {
@@ -740,6 +805,8 @@ void reset() {
     g_held_calls.clear();
     g_hle_replies.clear();
     g_requests.clear();
+    g_taken.clear();
+    g_exec_return.clear();
     g_queue_threads.clear();
     g_cmd_handlers.clear();
     g_iop_clients.clear();

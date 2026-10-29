@@ -148,6 +148,8 @@ if windows=$("${py[@]}" -I "$here/windows.py" list "$elf") && [ -n "$windows" ];
   mkdir -p "$game/overlays"
   overlays=(--overlays "$game/overlays")
   echo "code windows the game rewrites: $(echo "$windows" | tr '\n' ' ')"
+  # a folder from before the limits (or from a long run) may hold hundreds of images: keep the newest few (windows.py)
+  "${py[@]}" -I "$here/windows.py" trim "$game/overlays" "$game/entries.txt" || true
 fi
 
 translate() { "$tools/eerecomp" "$elf" --entries "$game/entries.txt" "${modules[@]}" "${overlays[@]}" "${toggles[@]}" --out "$generated" | tail -1; }

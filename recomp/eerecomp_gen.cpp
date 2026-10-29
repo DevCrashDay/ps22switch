@@ -58,6 +58,31 @@ std::vector<std::pair<std::uint32_t, std::uint32_t>> checks_for_window(const Snr
     return checks;
 }
 
+std::vector<std::pair<std::uint32_t, std::uint32_t>> entry_head_checks(const Snr2Module &o, const Program &program) {
+    std::set<std::uint32_t> offsets;
+    for (const std::uint32_t entry : program.entries) {
+        if (!program.is_code(entry) || entry < o.base || entry - o.base >= o.size) continue;
+        bool after_return = false;
+        for (std::uint32_t k = 0; k < 16; ++k) {
+            const std::uint32_t at = entry - o.base + 4 * k;
+            if (at + 4 > o.size || !program.is_code(o.base + at)) break;
+            offsets.insert(at);
+            std::uint32_t word = 0;
+            std::memcpy(&word, o.bytes.data() + at, 4);
+            if (after_return) break;                  // the delay slot of the return
+            after_return = word == 0x03E00008u;       // jr ra
+        }
+    }
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> checks;
+    checks.reserve(offsets.size());
+    for (const std::uint32_t at : offsets) {
+        std::uint32_t word = 0;
+        std::memcpy(&word, o.bytes.data() + at, 4);
+        checks.emplace_back(at, word);
+    }
+    return checks;
+}
+
 // ---------------------------------------------------------------------------------------------------------------- capturing
 
 std::vector<std::uint32_t> code_windows(const std::vector<std::uint8_t> &elf) {
@@ -83,6 +108,29 @@ std::vector<std::uint32_t> code_windows(const std::vector<std::uint8_t> &elf) {
         std::uint32_t base = vaddr & ~(kWindowUnit - 1);
         while (std::find(out.begin(), out.end(), base) != out.end()) base += kWindowUnit;
         out.push_back(base);
+    }
+    return out;
+}
+
+std::vector<std::pair<std::uint32_t, std::uint32_t>> file_segments(const std::vector<std::uint8_t> &elf) {
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> out;
+    if (elf.size() < 52) return out;
+    const auto u32 = [&](std::size_t at) {
+        std::uint32_t v = 0;
+        if (at + 4 <= elf.size()) std::memcpy(&v, elf.data() + at, 4);
+        return v;
+    };
+    const auto u16 = [&](std::size_t at) {
+        std::uint16_t v = 0;
+        if (at + 2 <= elf.size()) std::memcpy(&v, elf.data() + at, 2);
+        return v;
+    };
+    const std::uint32_t phoff = u32(28);
+    const std::uint16_t phentsize = u16(42), phnum = u16(44);
+    for (std::uint32_t i = 0; i < phnum; ++i) {
+        const std::size_t at = static_cast<std::size_t>(phoff) + static_cast<std::size_t>(i) * phentsize;
+        if (at + 32 > elf.size()) break;
+        if (u32(at) == 1 && u32(at + 16)) out.emplace_back(u32(at + 8), u32(at + 20));
     }
     return out;
 }
@@ -199,7 +247,7 @@ LiveResult generate_live(const LiveRequest &request, const std::filesystem::path
         o.size = size;
         o.base = request.base;
         o.name = request.name;
-        const std::vector<Translation> translations{{&image, &program, nullptr, request.prefix, false, request.name, size, checks_for_window(o, program), true, request.base}};
+        const std::vector<Translation> translations{{&image, &program, nullptr, request.prefix, false, request.name, size, request.sparse_checks ? entry_head_checks(o, program) : checks_for_window(o, program), true, request.base}};
         for (std::uint32_t pc = program.base; pc < program.end; pc += 4) result.code += program.is_code(pc);
         CodegenOptions options;
         options.output = ps2::os::utf8(out_dir);

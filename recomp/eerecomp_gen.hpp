@@ -39,6 +39,11 @@ std::vector<std::uint32_t> window_entries(const Image &image, const Program &pro
 // pick the other module.
 std::vector<std::pair<std::uint32_t, std::uint32_t>> checks_for_window(const Snr2Module &o, const Program &program);
 
+// For an image with data between its code (a program the game reads into memory as one piece): the checks are only the first words
+// of every function, up to its return, at most 16. A data word that the search for functions took for code and that the game writes
+// later (a counter) would otherwise make the whole image look changed. A different image in the same place still differs in these.
+std::vector<std::pair<std::uint32_t, std::uint32_t>> entry_head_checks(const Snr2Module &o, const Program &program);
+
 // ---------------------------------------------------------------------------------------------------------------- capturing
 
 // The code windows of an executable (what scripts/windows.py list prints): an executable LOAD segment with no file contents is a
@@ -46,6 +51,9 @@ std::vector<std::pair<std::uint32_t, std::uint32_t>> checks_for_window(const Snr
 inline constexpr std::uint32_t kWindowUnit = 0x4000;
 inline constexpr std::uint32_t kWindowCap = 0x40000;
 std::vector<std::uint32_t> code_windows(const std::vector<std::uint8_t> &elf);
+
+// Every segment that has contents in the file, code or data: {address, size in memory}. Memory the game loads code into does not overlap them.
+std::vector<std::pair<std::uint32_t, std::uint32_t>> file_segments(const std::vector<std::uint8_t> &elf);
 
 // The executable segments that have contents in the file (what the program itself translates): {address, size in memory}.
 std::vector<std::pair<std::uint32_t, std::uint32_t>> code_segments(const std::vector<std::uint8_t> &elf);
@@ -78,6 +86,7 @@ struct LiveRequest {
     std::vector<std::uint32_t> entries;  // absolute addresses to translate from
     std::uint64_t stamp = 0;             // not 0: the stamp the library carries (CodegenOptions::live_stamp)
     bool focused = false;                // true: translate only what the entries reach (an earlier library covers the rest of the image)
+    bool sparse_checks = false;          // true: the image is checked by the first words of its functions (entry_head_checks)
 };
 
 struct LiveResult {

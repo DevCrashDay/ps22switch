@@ -695,9 +695,16 @@ std::int32_t load_module_buffer(const std::vector<std::uint8_t> &data, const std
     relocate(elf, base, total, type == 0xFF81u);
     link_imports(base, total);
 
+    // A module the EE sent as a buffer has no file name: it is known by the name in its own header (the iopmod record, version first,
+    // then the name), which is what SearchModuleByName looks for (Tekken 5 asks the IOP for "mcserv" before it starts the memory card).
+    std::string module_name = name;
+    if (path == "buffer" && iopmod + 26 < data.size()) {
+        const char *text = reinterpret_cast<const char *>(data.data() + iopmod + 26);
+        module_name.assign(text, strnlen(text, std::min<std::size_t>(data.size() - iopmod - 26, 56)));
+    }
     const int id = g_next_module++;
-    g_modules[id] = Module{id, name, base, total, base + entry, base + gp};
-    if (g_trace_modules) std::fprintf(stderr, "[iop] module %d %s at 0x%08X size 0x%X entry 0x%08X\n", id, name.c_str(), base, total, base + entry);
+    g_modules[id] = Module{id, module_name, base, total, base + entry, base + gp};
+    if (g_trace_modules) std::fprintf(stderr, "[iop] module %d %s at 0x%08X size 0x%X entry 0x%08X\n", id, module_name.c_str(), base, total, base + entry);
 
     std::vector<std::string> argv{path};
     std::size_t start = 0;
