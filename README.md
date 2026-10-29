@@ -15,7 +15,11 @@ Based on [ps2-native-recomp](https://github.com/exoteric33/ps2-native-recomp) an
    The VU1 programs the exploring runs on the PC recorded are statically translated to C++ (vector code that GCC turns into ARM NEON). A program the build does not know is interpreted: the Switch has no compiler to translate it while the game runs, so the more of the game the PC runs saw, the faster it plays.
 
 3. **Graphics Synthesizer (GS):**
-   Rendered through the built-in PS2 GS software rasterizer and presented onto the Switch display using hardware-accelerated SDL2 streaming textures (`SDL_PIXELFORMAT_ABGR8888`), running in native Switch docked (1080p) or handheld (720p) mode.
+   Drawn on the Switch's GPU with Vulkan through Mesa's NVK driver (the same driver build OpenTrickyNX uses). The renderer is
+   the PC's own WebGPU drawing program: `runtime/src/gs/gpu/vk` implements the WebGPU calls it makes on Vulkan, and
+   `scripts/wgsl_spirv.py` turns its shader into SPIR-V with naga (run it after changing `gs.wgsl`). On the PC the same
+   layer draws Tekken 4 pixel for pixel like wgpu-native (`-DPS2_VULKAN=ON -DPS2_VULKAN_INCLUDE=<folder with vulkan/vulkan.h>`).
+   The finished picture is shown through SDL2. `--software` builds with the old software renderer instead (far too slow).
 
 4. **Audio (SPU2):**
    The PS2 SPU2 synthesizer streams 48,000 Hz stereo audio with dynamic time stretching directly into the Nintendo Switch SDL2 audio driver.
@@ -31,6 +35,9 @@ Based on [ps2-native-recomp](https://github.com/exoteric33/ps2-native-recomp) an
 - Windows 10/11 with WSL2 and a distribution named `devkita64` holding devkitPro's devkitA64, libnx and `switch-sdl2`,
   with `switch-cmake` / `switch-ninja` wrappers in `/usr/local/bin` (`--wsl-distro` picks another name). On Linux,
   devkitPro installed directly (`$DEVKITPRO`) is used instead.
+- The Mesa NVK SDK for the Switch: `mesa-switch-nvk-sdk.zip` from the `nvk-sdk` release of
+  [OpenTrickyNX](https://github.com/DevCrashDay/OpenTrickyNX/releases/tag/nvk-sdk), unzipped into `tools/nvk-sdk`
+  (or `--nvk-sdk <its portlibs/switch folder>`).
 - What the native build needs on the PC (Git Bash and the translator tools: run `Start.cmd` once, or `scripts/setup.sh --native-only`).
 - Python 3
 

@@ -32,6 +32,7 @@ SCRIPTS = ROOT / "scripts"
 GAMES_DIR = ROOT / "games"
 GENERATED_DIR = ROOT / "generated"
 SWITCH_OUT_DIR = ROOT / "build" / "switch"
+DEFAULT_NVK_SDK = ROOT / "tools" / "nvk-sdk" / "portlibs" / "switch"
 WINDOWS = os.name == "nt"
 
 
@@ -161,6 +162,14 @@ def build_nro(name: str, gen_dir: Path, args) -> Path:
              f"-DSWITCH_TITLE={args.title}", f"-DSWITCH_AUTHOR={args.author}", f"-DSWITCH_VERSION={args.version}"]
         if args.icon:
             d.append(f"-DSWITCH_ICON={to_path(Path(args.icon))}")
+        if args.software:
+            d.append("-DPS2_VULKAN=OFF")
+        else:
+            nvk = Path(args.nvk_sdk) if args.nvk_sdk else DEFAULT_NVK_SDK
+            if not (nvk / "lib" / "libvulkan.a").is_file():
+                sys.exit(f"no NVK SDK in {nvk}: download mesa-switch-nvk-sdk.zip from the nvk-sdk release of github.com/DevCrashDay/OpenTrickyNX, "
+                         f"unzip it into tools/nvk-sdk (or give --nvk-sdk <its portlibs/switch folder>), or build with --software")
+            d += ["-DPS2_VULKAN=ON", f"-DNVK_SDK={to_path(nvk)}"]
         return d
 
     if WINDOWS:
@@ -236,6 +245,8 @@ def main():
     parser.add_argument("--pnach-section", action="append", default=[], help="patch section to enable, as for port.sh")
     parser.add_argument("--widescreen", action="store_true", help="tell the game the TV is 16:9")
     parser.add_argument("--no-disc-copy", action="store_true", help="do not copy the disc image into the SD card folder")
+    parser.add_argument("--nvk-sdk", default="", help="mesa-switch NVK SDK (portlibs/switch folder) for the Vulkan renderer (default: tools/nvk-sdk/portlibs/switch)")
+    parser.add_argument("--software", action="store_true", help="draw with the software renderer instead of Vulkan (much slower)")
     parser.add_argument("--wsl-distro", default="devkita64", help="WSL distribution with devkitA64 and switch-cmake (Windows)")
     args = parser.parse_args()
 
