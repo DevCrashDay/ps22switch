@@ -39,7 +39,7 @@ Tried with real discs (mine are US releases), as far as each was played (no know
 
 | Game | How far | Tested by |
 |---|---|---|
-| God of War II | **played from start to end**, with a game controller; keyboard and mouse work too, and so do quick saves and the game's own save | my friend Petar |
+| God of War II | **played from start to end**, with a game controller; keyboard and mouse work too, and so do quick saves and the game's own save | petarsti |
 | God of War | plays well, not played through yet: from power-on through the menus and the opening film into the first fight on the ship, also in 16:9 | me |
 | Gran Turismo 4 | plays well, not played through yet: from power-on through the film and the menus, and a whole race played | me |
 | Resident Evil 4 | plays well, not played through yet: the menus, the opening, Leon in the forest | me |
