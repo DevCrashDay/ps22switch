@@ -31,6 +31,7 @@ void frame_tick() {}
 #include <deque>
 #include <fstream>
 #include <iterator>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <set>
@@ -95,6 +96,7 @@ struct State {
     fs::path compiler;
     std::vector<std::uint32_t> windows;   // bases of the code windows of the program
     std::vector<std::pair<std::uint32_t, std::uint32_t>> segments;   // the code the program itself has: {address, size}
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> file_segments;   // everything the executable's file fills, code or data: {address, size in memory}
     std::uint64_t stamp = 0;
     std::vector<std::string> flags;
     std::vector<std::string> quick_flags; // for the first translation of a window, which the game waits for: fast to compile, slower code
@@ -108,7 +110,10 @@ struct State {
     bool headers = false;   // under prep_mutex
     int failures = 0;
     std::set<std::uint32_t> failed;       // addresses that were tried and did not work: not again
+    std::map<std::string, std::string> overlay_kept;   // image name -> the image in overlays\ that stands for it (itself, or a near copy that was there before)
+    bool overlay_limit_said = false;      // the log line about the overlay limits was written
     std::set<std::string> whole;          // window images that were translated as a whole (marker files in the cache): later misses translate only what they reach
+    std::set<std::uint32_t> flat_started; // bases of loaded-code runs (memory the program never mentions) that were translated as a whole in this run
     std::unique_ptr<recomp::StaticProgram> program_analysis;   // built at the first translation, for the calls into a window (under prep_mutex)
     std::vector<std::uint32_t> main_entries;
     bool analysed = false;
@@ -207,23 +212,152 @@ std::vector<std::uint8_t> read_file(const fs::path &p) {
     return std::vector<std::uint8_t>((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
 }
 
+// The captured windows in overlays\ are bounded, because the next build of the game translates every one of them. A window whose
+// code shares its memory with data that keeps changing (Tekken 5 at 0x00488000: the loaded game's own tables) gets a new name, the
+// CRC-32 of its content, at nearly every miss, and 1400 images of 256 KiB (374 MB) were written in a few runs. The rules:
+//  - an image that differs from one already there in at most 1/16 of its words is the same code with other data: that image stands
+//    for it (and is marked as just used), nothing is written, and the entry points go under the name of the one that is kept;
+//  - at most kOverlaysPerBase images per window address, kOverlaysTotal in all, kOverlayBytes together. Past a limit the images
+//    used least recently (by the time of the file) go: the folder keeps what the latest plays needed.
+// 8 per address is enough for a game that loads one image per area into the same window (Silent Hill 2: a handful of areas a
+// session), 32 in all and 16 MiB hold several windows at 256 KiB each, and the build analyses every image once: 32 stay quick.
+// scripts/windows.py (capture and trim) uses the same numbers and the same rule for a folder that is too full from before.
+// PS2_EE_LIVE_OVERLAYS=<total> lowers the total (a test of the limit).
+constexpr std::size_t kOverlaysPerBase = 8, kOverlaysTotal = 32;
+constexpr std::uint64_t kOverlayBytes = 16u << 20;
+
+struct SavedOverlay {
+    fs::path file;
+    std::string name;
+    std::uint32_t base = 0;
+    std::uint64_t size = 0;
+    fs::file_time_type time;
+};
+
+// <8 hex digits>_<8 hex digits>.bin: the names the runner and windows.py make (eerecomp reads other names too; those are left alone).
+bool overlay_file(const fs::path &p, std::string &name, std::uint32_t &base) {
+    name = ps2::os::utf8(p.stem());
+    if (p.extension() != ".bin" || name.size() != 17 || name[8] != '_') return false;
+    for (std::size_t i = 0; i < 17; ++i)
+        if (i != 8 && !std::isxdigit(static_cast<unsigned char>(name[i]))) return false;
+    base = static_cast<std::uint32_t>(std::stoul(name.substr(0, 8), nullptr, 16));
+    return true;
+}
+
+std::vector<SavedOverlay> list_overlays(const fs::path &dir) {
+    std::vector<SavedOverlay> all;
+    std::error_code error;
+    for (fs::directory_iterator it(dir, error), end; !error && it != end; it.increment(error)) {
+        SavedOverlay o;
+        if (!it->is_regular_file(error) || !overlay_file(it->path(), o.name, o.base)) continue;
+        o.file = it->path();
+        o.size = it->file_size(error);
+        o.time = it->last_write_time(error);
+        all.push_back(std::move(o));
+    }
+    return all;
+}
+
+// The same code with other data: at most 1/16 of the words differ (a different length counts as different words).
+bool near_duplicate(const std::vector<std::uint8_t> &a, const std::vector<std::uint8_t> &b) {
+    const std::size_t common = std::min(a.size(), b.size()) / 4, longest = std::max(a.size(), b.size()) / 4;
+    std::size_t different = longest - common;
+    for (std::size_t i = 0; i < common && different * 16 <= longest; ++i)
+        if (std::memcmp(a.data() + i * 4, b.data() + i * 4, 4) != 0) ++different;
+    return different * 16 <= longest;
+}
+
+// Removes the images past the limits, least recently used first; `keep` is never removed.
+void trim_overlays(std::vector<SavedOverlay> all, const std::string &keep) {
+    static const std::size_t total_limit = [] {
+        const std::string v = ps2::os::env("PS2_EE_LIVE_OVERLAYS");
+        const long n = v.empty() ? 0 : std::strtol(v.c_str(), nullptr, 10);
+        return n > 0 ? std::min<std::size_t>(static_cast<std::size_t>(n), kOverlaysTotal) : kOverlaysTotal;
+    }();
+    std::stable_sort(all.begin(), all.end(), [&](const SavedOverlay &a, const SavedOverlay &b) {
+        if ((a.name == keep) != (b.name == keep)) return a.name == keep;
+        return a.time > b.time;
+    });
+    std::map<std::uint32_t, std::size_t> per_base;
+    std::size_t kept = 0, removed = 0;
+    std::uint64_t bytes = 0;
+    for (const SavedOverlay &o : all) {
+        const bool fits = per_base[o.base] < std::min(kOverlaysPerBase, total_limit) && kept < total_limit && bytes + o.size <= kOverlayBytes;
+        if (fits || o.name == keep) {
+            ++per_base[o.base];
+            ++kept;
+            bytes += o.size;
+            continue;
+        }
+        std::error_code error;
+        if (fs::remove(o.file, error)) ++removed;
+    }
+    if (removed && !g->overlay_limit_said) {
+        g->overlay_limit_said = true;
+        say("the folder overlays\\ is at its limit (%zu images per window address, %zu in all, %u MiB): removed %zu of the images used least recently; this is said once", std::min(kOverlaysPerBase, total_limit), total_limit,
+            static_cast<unsigned>(kOverlayBytes >> 20), removed);
+    }
+}
+
+// Saves a captured window image, or finds the saved one that stands for it; returns the name it is saved under.
+std::string save_overlay(const fs::path &dir, const std::string &name, std::uint32_t base, const std::vector<std::uint8_t> &image) {
+    std::error_code error;
+    const auto touch = [&](const fs::path &f) { fs::last_write_time(f, fs::file_time_type::clock::now(), error); };
+    const fs::path file = dir / (name + ".bin");
+    if (fs::exists(file, error)) {
+        touch(file);
+        return name;
+    }
+    std::vector<SavedOverlay> all = list_overlays(dir);
+    std::vector<const SavedOverlay *> same_base;
+    for (const SavedOverlay &o : all)
+        if (o.base == base) same_base.push_back(&o);
+    std::sort(same_base.begin(), same_base.end(), [](const SavedOverlay *a, const SavedOverlay *b) { return a->time > b->time; });
+    for (const SavedOverlay *o : same_base)
+        if (o->size >= image.size() / 2 && o->size <= image.size() * 2 && near_duplicate(read_file(o->file), image)) {
+            touch(o->file);
+            return o->name;
+        }
+    {
+        std::ofstream out(file, std::ios::binary);
+        out.write(reinterpret_cast<const char *>(image.data()), static_cast<std::streamsize>(image.size()));
+    }
+    SavedOverlay added;
+    added.file = file;
+    added.name = name;
+    added.base = base;
+    added.size = image.size();
+    added.time = fs::file_time_type::clock::now();
+    all.push_back(std::move(added));
+    trim_overlays(std::move(all), name);
+    return name;
+}
+
 // Puts what was found where port.sh keeps it, when the game folder has them: the entry point in entries.txt and the captured window
 // in overlays\, so that the next build of the game translates it ahead of time (scripts/windows.py capture does the same).
 void remember(const std::string &name, std::uint32_t base, const std::vector<std::uint8_t> &image, const std::vector<std::uint32_t> &entries, bool program) {
     if (g->game_dir.empty()) return;
     std::error_code error;
+    // The image that stands for this one in overlays\ (itself unless a near copy was saved before): entries go under its name.
+    std::string kept = name;
+    const fs::path overlays = g->game_dir / "overlays";
+    if (!program && fs::is_directory(overlays, error)) {
+        const auto it = g->overlay_kept.find(name);
+        if (it != g->overlay_kept.end()) kept = it->second;
+        else g->overlay_kept[name] = kept = save_overlay(overlays, name, base, image);
+    }
     const fs::path entries_file = g->game_dir / "entries.txt";
     if (fs::is_regular_file(entries_file, error)) {
         std::set<std::uint32_t> known;
         const recomp::Entries have = recomp::read_entries(ps2::os::utf8(entries_file));
         if (program) known.insert(have.main.begin(), have.main.end());
-        else if (const auto it = have.modules.find(name); it != have.modules.end()) known.insert(it->second.begin(), it->second.end());
+        else if (const auto it = have.modules.find(kept); it != have.modules.end()) known.insert(it->second.begin(), it->second.end());
         std::string text;
         for (const std::uint32_t entry : entries) {
             if (!known.insert(program ? entry : entry - base).second) continue;
             char token[96];
             if (program) std::snprintf(token, sizeof token, "%x\n", entry);   // an entry point of the program itself
-            else std::snprintf(token, sizeof token, "%s:%x\n", name.c_str(), entry - base);
+            else std::snprintf(token, sizeof token, "%s:%x\n", kept.c_str(), entry - base);
             text += token;
         }
         if (!text.empty()) {
@@ -236,14 +370,6 @@ void remember(const std::string &name, std::uint32_t base, const std::vector<std
             std::ofstream out(entries_file, std::ios::binary | std::ios::app);
             if (needs_newline) out << '\n';
             out << text;
-        }
-    }
-    const fs::path overlays = g->game_dir / "overlays";
-    if (!program && fs::is_directory(overlays, error)) {
-        const fs::path file = overlays / (name + ".bin");
-        if (!fs::exists(file, error)) {
-            std::ofstream out(file, std::ios::binary);
-            out.write(reinterpret_cast<const char *>(image.data()), static_cast<std::streamsize>(image.size()));
         }
     }
 }
@@ -738,6 +864,7 @@ void start(const std::string &program, const std::string &cache, const std::stri
     const std::vector<std::uint8_t> elf = read_file(g->program);
     g->windows = recomp::code_windows(elf);
     g->segments = recomp::code_segments(elf);
+    g->file_segments = recomp::file_segments(elf);
     if (elf.empty()) return;  // the program cannot be read (the runner will say so): nothing to translate for
 
     // PS2_EE_LIVE_OPT=-O0 .. -O3 chooses the optimisation level of the libraries; the game waits while one is made, so a quick compile
@@ -821,6 +948,39 @@ void start(const std::string &program, const std::string &cache, const std::stri
 
 bool active() { return g && g->ready; }
 
+// Code the game read from the disc into memory that its executable never mentions (Tekken 5: the boot program is a small loader, the game
+// proper is read to 0x001EA000 and called from there). There is no window and no segment to go by, so the run of non-empty 16 KiB units
+// around the address is the image, as for a window, only longer: such a program is 1 to 2 MiB with data between its code.
+constexpr std::uint32_t kLoadedCap = 0x400000;
+bool loaded_run(std::uint32_t pc, std::uint32_t &base, std::uint32_t &size) {
+    constexpr std::uint32_t kUnit = recomp::kWindowUnit, kLowest = 0x00100000u;
+    if (pc < kLowest || pc >= kRamSize || (pc & 3u)) return false;
+    const auto filled = [](std::uint32_t at) {
+        for (std::uint32_t i = 0; i < kUnit; i += 8) {
+            std::uint64_t word;
+            std::memcpy(&word, g_ram + at + i, 8);
+            if (word) return true;
+        }
+        return false;
+    };
+    std::uint32_t first = pc & ~(kUnit - 1), last = first;
+    if (!filled(first)) return false;
+    while (first > kLowest && last - first + kUnit < kLoadedCap / 2 && filled(first - kUnit)) first -= kUnit;
+    while (last + 2 * kUnit <= kRamSize && last + kUnit - first < kLoadedCap && filled(last + kUnit)) last += kUnit;
+    std::uint32_t begin = first, end = last + kUnit;
+    // What the executable's own file fills (its code and its data, which the game writes all the time) is not part of the image.
+    for (const auto &[address, bytes] : g->file_segments) {
+        if (pc - address < bytes) return false;
+        if (address >= end || address + bytes <= begin) continue;
+        if (address > pc) end = std::min(end, address);
+        else begin = std::max(begin, (address + bytes + 3u) & ~3u);
+    }
+    if (end - begin < 0x400u) return false;
+    base = begin;
+    size = end - begin;
+    return true;
+}
+
 bool translate_missing(std::uint32_t pc) {
     if (!g || !g->ready || g->failed.count(pc)) return false;
     const auto began = Clock::now();
@@ -861,16 +1021,18 @@ bool translate_missing(std::uint32_t pc) {
                 found = region = true;
                 break;
             }
+    bool flat = false;
+    if (!found && loaded_run(pc, base, size)) found = flat = true;
     if (!found) {
         g->failed.insert(pc);
-        say("no translated code at 0x%08X, and it is in none of the %zu code windows and not in the code of the program: the game stops", pc, g->windows.size());
+        say("no translated code at 0x%08X, and it is in none of the %zu code windows, not in the code of the program and not in memory the game loaded: the game stops", pc, g->windows.size());
         return false;
     }
     std::vector<std::uint8_t> image(g_ram + base, g_ram + base + size);
     const std::string name = (region ? "main_" : "") + recomp::window_name(base, image.data(), image.size());
 
     // The window settled a while ago and its translation is under way in the background: wait for the rest of it.
-    if (!region && use_background(pc, base, name)) {
+    if (!region && !flat && use_background(pc, base, name)) {
         say("switched in after %.1f s of waiting for the background translation", lb::seconds_since(began));
         return true;
     }
@@ -878,9 +1040,9 @@ bool translate_missing(std::uint32_t pc) {
     // A window image that was translated as a whole before (by this run or an earlier one) only lacks the entry point that was missed:
     // translating all of it again for that costs seconds. One that was not (the build has a module of the same code, made from the
     // entry points it knew) is looked through completely this time.
-    const bool whole_done = g->whole.count(name) != 0;
+    const bool whole_done = g->whole.count(name) != 0 || (flat && g->flat_started.count(base) != 0);
     if (region) say("no translated code at 0x%08X (the program's own code, not reached by the build): translating it now, the game waits", pc);
-    else say("no translated code at 0x%08X (window 0x%08X, image %s, %u KiB): translating it now, the game waits", pc, base, name.c_str(), size / 1024);
+    else say("no translated code at 0x%08X (%s 0x%08X, image %s, %u KiB): translating it now, the game waits", pc, flat ? "loaded code at" : "window", base, name.c_str(), size / 1024);
 
     recomp::LiveRequest request;
     request.base = base;
@@ -888,6 +1050,7 @@ bool translate_missing(std::uint32_t pc) {
     request.name = name;
     static const bool force_focus = !ps2::os::env("PS2_EE_LIVE_FOCUS").empty();   // debugging: every miss translates only what it reaches
     request.focused = region || whole_done || force_focus;
+    request.sparse_checks = flat;
     // The first translation of a whole window is the long one: it is compiled with little optimisation (the game waits for it), and the
     // same code is made again with the normal flags in the background afterwards. Single functions (the focused ones) are small: normal flags.
     const bool quick = !request.focused && g->two_step;
@@ -928,12 +1091,13 @@ bool translate_missing(std::uint32_t pc) {
             lb::seconds_since(began) - entries_s - built.timing.generate - built.timing.compile - built.timing.link - lb::seconds_since(load_began));
     say("switched in after %.1f s%s (translate %.1f, compile %.1f, link %.1f): %zu entry points%s%s, %zu instructions, %zu files", lb::seconds_since(began), quick ? " (quick)" : "", built.timing.generate, built.timing.compile, built.timing.link,
         built.generated.accepted.size(), static_calls ? " (calls of the program included)" : "", known_entries ? " (entries.txt included)" : "", built.generated.code, built.files);
+    if (flat) g->flat_started.insert(base);
     if (!request.focused) {
         g->whole.insert(name);
         if (quick) g->fast.insert(name);
         write_marker(name, quick);
     }
-    remember(name, base, image, {pc}, region);
+    if (!flat) remember(name, base, image, {pc}, region);   // a loaded program is not an overlay of the build: eerecomp checks those word for word
     if (quick) queue_upgrade(base, name, std::move(image));
     return true;
 }

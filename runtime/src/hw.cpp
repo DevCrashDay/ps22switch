@@ -14,6 +14,7 @@
 #include "ps2/state.hpp"
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <set>
@@ -186,8 +187,96 @@ void dmac_raise(unsigned channel) {
     if (g_dmac_stat & (0x10000u << channel)) kernel::wake_idle();
 }
 
+std::uint64_t g_slow_seq = 0;
+
+namespace {
+
+// Skipping a waiting loop. A game that waits for the next picture reads INTC_STAT again and again in a loop of a few instructions
+// (sceGsSyncV): on the real console it just burns the time, here it burned half of the emulation thread (about 5 ms of every
+// 20 ms frame in Robotech, about 4 ms in God of War II). When the loop is a fixed point (the same value read, the same registers
+// and the same number of cycles between three reads in a row, and no other hardware access or system call in between) every
+// further turn would do exactly the same, so the clock is moved forward by whole turns instead of running them. The budget of
+// the slice never goes past the next event, so the clock never passes one; the registers, the memory and the hardware are the
+// same as after running the turns, which makes the result the same (cycle for cycle) as without the skip. The skip is a
+// multiple of four turns, so a loop with two reads of INTC_STAT in a turn keeps its phase. PS2_NO_SPIN_SKIP=1 switches it off.
+struct RegSnapshot {
+    Reg128 r[32], hi, lo;
+    std::uint32_t sa, f[32], facc, fcr31;
+};
+
+void snapshot(RegSnapshot &s) {
+    std::memcpy(s.r, g_cpu.r, sizeof s.r);
+    s.hi = g_cpu.hi;
+    s.lo = g_cpu.lo;
+    s.sa = g_cpu.sa;
+    std::memcpy(s.f, g_cpu.f, sizeof s.f);
+    s.facc = g_cpu.facc;
+    s.fcr31 = g_cpu.fcr31;
+}
+
+bool same_registers(const RegSnapshot &s) {
+    return std::memcmp(s.r, g_cpu.r, sizeof s.r) == 0 && std::memcmp(&s.hi, &g_cpu.hi, sizeof s.hi) == 0 && std::memcmp(&s.lo, &g_cpu.lo, sizeof s.lo) == 0 &&
+           s.sa == g_cpu.sa && std::memcmp(s.f, g_cpu.f, sizeof s.f) == 0 && s.facc == g_cpu.facc && s.fcr31 == g_cpu.fcr31;
+}
+
+struct SpinWatch {
+    bool off = std::getenv("PS2_NO_SPIN_SKIP") != nullptr;
+    std::uint32_t value = 0, streak = 0;
+    std::uint64_t seq = 0, at = 0, delta = 0, skipped = 0;
+    RegSnapshot regs;
+};
+SpinWatch g_spin;
+
+constexpr std::uint32_t kSpinAfter = 24;  // reads in a row with the same value before the registers are looked at
+
+void spin_watch(std::uint32_t value) {
+    SpinWatch &w = g_spin;
+    if (w.off) return;
+    const std::uint64_t t = now();
+    if (value != w.value || g_slow_seq != w.seq || t < w.at) {  // something else happened since the last read: start counting again
+        w.value = value;
+        w.seq = g_slow_seq;
+        w.streak = 0;
+        w.at = t;
+        return;
+    }
+    const std::uint64_t delta = t - w.at;
+    w.at = t;
+    if (++w.streak < kSpinAfter) return;
+    if (w.streak == kSpinAfter) {  // first look: take the registers and the time between two reads
+        snapshot(w.regs);
+        w.delta = delta;
+        return;
+    }
+    if (delta != w.delta || !same_registers(w.regs)) {  // not a fixed point (a counter runs, or the loop is longer): look again later
+        snapshot(w.regs);
+        w.delta = delta;
+        w.streak = kSpinAfter;
+        return;
+    }
+    if (w.streak < kSpinAfter + 2) return;  // three reads in a row looked the same
+    const std::int64_t left = g_cpu.budget;
+    const std::uint64_t step = 4u * delta;
+    if (delta == 0 || left <= static_cast<std::int64_t>(step) + 1) return;
+    const std::int64_t skip = static_cast<std::int64_t>(static_cast<std::uint64_t>(left - 1) / step * step);
+    g_cpu.budget = static_cast<std::int32_t>(left - skip);
+    w.skipped += static_cast<std::uint64_t>(skip);
+    w.at = now();
+    w.streak = 0;
+}
+
+}  // namespace
+
+std::uint64_t spin_skipped_cycles() { return g_spin.skipped; }
+
+std::uint32_t read_intc_stat() {
+    const std::uint32_t value = g_intc_stat | (kernel::interruptible() ? g_intc_latched : 0u);
+    spin_watch(value);
+    return value;
+}
+
 std::uint32_t read32(std::uint32_t a) {
-    if (a == kIntcStat) return g_intc_stat | (kernel::interruptible() ? g_intc_latched : 0u);
+    if (a == kIntcStat) return read_intc_stat();
     if (a == kIntcMask) return g_intc_mask;
     if (a == kDmacStat) return g_dmac_stat;
     if (a >= 0x12000000u && a < 0x12002000u) return static_cast<std::uint32_t>(gs::read_privileged(a & ~7u) >> ((a & 4u) * 8));

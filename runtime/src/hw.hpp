@@ -51,6 +51,13 @@ void gs_set_imr(std::uint64_t value);
 void gs_set_crt(std::uint32_t interlace, std::uint32_t mode, std::uint32_t field);
 
 std::uint32_t read32(std::uint32_t a);
+// INTC_STAT read straight from the memory slow path (the game's waiting loops hammer it), with the waiting-loop skip of hw.cpp
+std::uint32_t read_intc_stat();
+// Counts the memory accesses that went the slow way (hardware registers, scratch memory of the vector units, ...) and system calls: a
+// waiting loop is only skipped when none happened between two of its reads
+extern std::uint64_t g_slow_seq;
+// Cycles of waiting loops skipped so far (for the line at the end of a run)
+std::uint64_t spin_skipped_cycles();
 void write32(std::uint32_t a, std::uint32_t v);
 std::uint64_t read64(std::uint32_t a);
 void write64(std::uint32_t a, std::uint64_t v);

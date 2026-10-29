@@ -43,6 +43,7 @@ import ctypes.wintypes as wt
 import json
 import os
 import re
+import shutil
 import statistics
 import subprocess
 import sys
@@ -515,7 +516,10 @@ def build_run(args, scene, backend, scale):
         state, start, moves = (Path(args.from_state) if args.from_state else None), args.from_frame, args.moves or ""
     out = args.out
     out.mkdir(parents=True, exist_ok=True)
-    cmd = [str(exe), str(program), "--disc", str(root / "games" / args.game / "disc.iso"), "--window", "--memcard", str(out / "speed-card.ps2"),
+    card = out / "speed-card.ps2"
+    if args.memcard:  # a fresh copy of the given card for every run: the game writes to its card
+        shutil.copyfile(args.memcard, card)
+    cmd = [str(exe), str(program), "--disc", str(root / "games" / args.game / "disc.iso"), "--window", "--memcard", str(card),
            "--quick-dir", str(out / "quick")]
     if state:
         cmd += ["--load-state", str(state)]
@@ -607,7 +611,7 @@ def run_once(args, scene, backend, scale, label):
         samples, last_seen, last_sample = [], None, 0.0
         warm_done, mid_done = False, False
         thread_a = sys_a = thread_b = sys_b = None
-        sampler = None
+        sampler = gpu_counter = None
         wall_a = wall_b = 0.0
         next_check = 0.0
         while proc.poll() is None:
@@ -632,6 +636,9 @@ def run_once(args, scene, backend, scale, label):
             if not warm_done and now >= args.warmup:
                 warm_done = True
                 thread_a, sys_a, wall_a = thread_cpu(proc.pid), system_times(), time.time()
+                if not args.no_gpu_engine:  # Windows' own counter of how busy the 3D engine is with the runner's work (the title bar's GPU % is wrong on some drivers)
+                    gpu_counter = subprocess.Popen(["typeperf", f"\\GPU Engine(pid_{proc.pid}_*engtype_3D)\\Utilization Percentage", "-si", "1", "-sc", str(int(args.seconds) + 5)],
+                                                   stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
                 if args.sample:
                     sampler = Sampler(proc.pid)
                     sampler.start()
@@ -642,6 +649,22 @@ def run_once(args, scene, backend, scale, label):
         thread_b, sys_b, wall_b = thread_cpu(proc.pid), system_times(), time.time()
         if sampler is not None:
             sampler.stop()
+        if gpu_counter is not None:
+            gpu_counter.terminate()  # our own helper process
+            try:
+                text = (gpu_counter.communicate(timeout=5)[0] or b"").decode("cp1252", errors="replace")  # the German summary lines hold non-ASCII letters
+            except subprocess.TimeoutExpired:
+                gpu_counter.kill()
+                text = ""
+            sums = []
+            for line in text.splitlines()[1:]:
+                cells = [c.strip('"') for c in line.split('","')]
+                try:
+                    sums.append(sum(float(c) for c in cells[1:] if c.strip()))
+                except ValueError:
+                    pass  # the summary lines of typeperf
+            if sums:
+                result["gpu_3d"] = {"mean": round(statistics.mean(sums), 1), "max": round(max(sums), 1), "n": len(sums)}
         result["title_last"] = window_title(hwnd)
         if thread_a is not None and wall_b > wall_a:
             wall = wall_b - wall_a
@@ -673,6 +696,8 @@ def run_once(args, scene, backend, scale, label):
             result["title_gpu_percent"] = round(statistics.mean(s[3] for s in samples))
             result["audio_ms_mean"] = round(statistics.mean(s[5] for s in samples))
             result["series"] = [round(f) for f in fps]
+            for t in result.get("threads", []):  # work per frame: the game is capped at its disc's rate, so percent of a core alone hides how much a frame costs
+                t["ms_per_frame"] = round(t["cpu_percent"] * 10.0 / max(result["fps"]["mean"], 1e-9), 2)
         return result
     finally:
         if proc.poll() is None:
@@ -710,8 +735,10 @@ def describe(r):
     text = (f"{r['scene']:9} {r.get('backend', r['backend_asked']):12} x{r['scale']}  "
             + (f"fps mean {f['mean']:5.1f}  median {f['median']:5.1f}  min {f['min']:5.1f}  p10 {f['p10']:5.1f}  >=58: {f['seconds_at_58_or_more']}/{f['n']} s" if f else "no speed read")
             + f"  | title CPU {r.get('title_cpu_percent', '?')}% GPU {r.get('title_gpu_percent', '?')}% audio {r.get('audio_ms_mean', '?')} ms")
-    threads = ", ".join(f"{t['name'] or t['start']} {t['cpu_percent']:.0f}%" for t in r.get("threads", [])[:5])
-    text += f"\n          threads (% of one thread): {threads}   rest of PC {r.get('other_cpu_percent', '?')}%"
+    threads = ", ".join(f"{t['name'] or t['start']} {t['cpu_percent']:.0f}%" + (f" ({t['ms_per_frame']:.1f} ms/frame)" if "ms_per_frame" in t else "") for t in r.get("threads", [])[:5])
+    text += f"\n          threads (% of one thread, CPU ms per frame; the unnamed one is the vector units): {threads}   rest of PC {r.get('other_cpu_percent', '?')}%"
+    if r.get("gpu_3d"):
+        text += f"\n          graphics chip 3D engine (Windows counter): mean {r['gpu_3d']['mean']}%, max {r['gpu_3d']['max']}% over {r['gpu_3d']['n']} s"
     text += f"\n          {where}, {power.get('battery_percent', '?')}% battery, mode {power.get('mode', '?')}, plan {power.get('plan', '?')}"
     if r.get("clocks"):
         text += "; busiest logical CPUs (number: busy %, MHz; 0-3 are the two fast cores, the rest the small ones): " + ", ".join(f"#{i}: {b}%/{m}" for b, m, i in r["clocks"])
@@ -822,6 +849,8 @@ def main():
     ap.add_argument("--from", dest="from_state", help="your own scene: a state file")
     ap.add_argument("--from-frame", type=int, default=0, help="the frame of that state (the number in its name)")
     ap.add_argument("--moves", help="your own scene: buttons, scripts/play.py syntax")
+    ap.add_argument("--name", default="custom", help="the name of your own scene in the results (default: custom)")
+    ap.add_argument("--memcard", type=Path, help="a memory card to start from (a fresh copy for every run, so the file itself is never changed), for a state that needs a saved profile")
     ap.add_argument("--backends", default="default", help="comma list of default, vulkan, d3d12")
     ap.add_argument("--scale", type=int, default=1, help="PS2_SCALE, the internal resolution (1 to 3)")
     ap.add_argument("--seconds", type=float, help="seconds measured (default: 30 or 35, depends on the scene)")
@@ -835,6 +864,7 @@ def main():
     ap.add_argument("--table", help="print this results file as a markdown table and stop")
     ap.add_argument("--picture", action="store_true", help="instead of timing: take one picture of every scene and backend (a short run each)")
     ap.add_argument("--profile-summary", help="add up a PS2_PROFILE file by part of the console and stop")
+    ap.add_argument("--no-gpu-engine", action="store_true", help="do not read Windows' 3D engine counter of the runner (by default it is read once a second with typeperf)")
     ap.add_argument("--sample", action="store_true", help="look where each busy thread of the runner is, about every millisecond, and keep it in sample-<run>.json")
     ap.add_argument("--sample-report", help="name the functions in such a file (with --exe, default build/native-<game>/ps2run.exe) and stop")
     ap.add_argument("extra", nargs="*")
@@ -866,8 +896,10 @@ def main():
                 print(scene, backend, take_picture(args, scene, backend), flush=True)
                 continue
             for n in range(args.repeat):
-                label = f"{scene}-{backend}-x{args.scale}-{time.strftime('%H%M%S')}"
+                shown = args.name if scene == "custom" else scene
+                label = f"{shown}-{backend}-x{args.scale}-{time.strftime('%H%M%S')}"
                 result = run_once(args, scene, backend, args.scale, label)
+                result["scene"] = shown
                 print(describe(result), flush=True)
                 with open(results_file, "a", encoding="utf-8") as f:
                     f.write(json.dumps(result) + "\n")

@@ -884,7 +884,10 @@ const char *syscall_name(std::uint32_t n) {
 
 namespace ps2 {
 
-void syscall(Cpu &c, std::uint32_t pc) { kernel::handle_syscall(c, pc); }
+void syscall(Cpu &c, std::uint32_t pc) {
+    ++hw::g_slow_seq;  // a system call is something a waiting loop is not skipped over (hw.cpp, spin_watch)
+    kernel::handle_syscall(c, pc);
+}
 
 std::uint32_t mfc0(Cpu &c, std::uint32_t reg, std::uint32_t) {
     switch (reg) {

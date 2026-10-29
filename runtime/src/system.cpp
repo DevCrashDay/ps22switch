@@ -440,7 +440,9 @@ void machine_state(state::Stream &s) {
     s.pod(g_given);
     s.pod(g_frames);
     s.pod(g_iop_synced);
+    const bool forced_rate = g_options.rate_forced, forced_pal = g_options.pal;
     s.pod(g_options.pal);
+    if (forced_rate) g_options.pal = forced_pal;  // --pal / --ntsc win over the state (a 50 Hz disc can be run at 60 Hz to see what a 60 Hz one asks)
     s.vec(g_events, [&s](Event &e) {
         s.pod(e.id);
         s.pod(e.at);
@@ -536,14 +538,22 @@ bool load_elf(const std::string &path, std::uint32_t &entry) {
     const auto u16 = [&](std::size_t o) { std::uint16_t v; std::memcpy(&v, data.data() + o, 2); return v; };
     entry = u32(24);
     const std::uint32_t phoff = u32(28);
-    for (std::uint32_t i = 0; i < u16(44); ++i) {
-        const std::size_t ph = phoff + i * u16(42);
-        if (u32(ph) != 1) continue;
-        const std::uint32_t offset = u32(ph + 4), vaddr = physical(u32(ph + 8)), filesz = u32(ph + 16), memsz = u32(ph + 20);
-        if (vaddr + memsz > kRamSize || offset + filesz > data.size()) return false;
-        std::memcpy(g_ram + vaddr, data.data() + offset, filesz);
-        watch_span(vaddr, filesz, "boot:load_exec");
-        std::memset(g_ram + vaddr + filesz, 0, memsz - filesz);
+    // The zero fill of every segment comes first and the file contents after it, so a later segment's zero fill (Tekken 5's
+    // overlay area is a 24 MiB segment with no file contents that lies over its own loader code) never wipes the contents of an
+    // earlier one. Memory is zero at power-on, so this is what a loader that only copies the file contents gives.
+    for (const bool copy : {false, true}) {
+        for (std::uint32_t i = 0; i < u16(44); ++i) {
+            const std::size_t ph = phoff + i * u16(42);
+            if (u32(ph) != 1) continue;
+            const std::uint32_t offset = u32(ph + 4), vaddr = physical(u32(ph + 8)), filesz = u32(ph + 16), memsz = u32(ph + 20);
+            if (vaddr + memsz > kRamSize || offset + filesz > data.size()) return false;
+            if (copy) {
+                std::memcpy(g_ram + vaddr, data.data() + offset, filesz);
+                watch_span(vaddr, filesz, "boot:load_exec");
+            } else if (memsz > filesz) {
+                std::memset(g_ram + vaddr + filesz, 0, memsz - filesz);
+            }
+        }
     }
     return true;
 }
@@ -693,6 +703,7 @@ void core_sample(Who who) {
 int run() {
     thread_tune(Who::Emulation);
     Cpu &c = g_cpu;
+    const std::uint64_t started_at = now();  // for the share of waiting loops skipped (hw.cpp)
     if (!g_resumed) set_budget(c, kMaxSlice);
     while (!g_halted) {
         core_sample(Who::Emulation);
@@ -755,6 +766,9 @@ int run() {
     dmac::stats();
     gif::stats();
     vif::stats();
+    if (const std::uint64_t skipped = hw::spin_skipped_cycles())
+        std::fprintf(stderr, "[spin] %llu cycles of waiting loops skipped (%.1f %% of the time since this run started)\n", static_cast<unsigned long long>(skipped),
+                     100.0 * static_cast<double>(skipped) / static_cast<double>(std::max<std::uint64_t>(now() - started_at, 1)));
     std::fprintf(stderr, "[ee] stopped after %llu frames, %llu cycles: %s\n",
                  static_cast<unsigned long long>(g_frames), static_cast<unsigned long long>(now()), g_halt_reason.c_str());
     return 0;

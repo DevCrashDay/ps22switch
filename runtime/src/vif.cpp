@@ -449,6 +449,12 @@ void state(ps2::state::Stream &s) {
         s.pod(u->stalled);
         s.vec(u->pending);
     }
+    // The vector thread keeps its own copy of VIF1 (g_vu_side) and the emulation thread tracks the same unit in g_units[1] without
+    // running the vector unit. A run without the vector thread never touches g_vu_side, so a state it saved carries an empty one:
+    // loaded into a run with the thread, VIF1 would restart with cycle, mask, base and offset at zero, UNPACK would write
+    // nonsense into the vector unit's memory, and the program would loop on it forever (Robotech: Battlecry, issue #10). Both
+    // copies describe the same unit, so the one that is always right (g_units[1]) is also the vector thread's start.
+    if (s.loading()) g_vu_side = g_units[1];
 }
 
 }

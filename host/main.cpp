@@ -23,6 +23,9 @@
 #include <atomic>
 #include <chrono>
 #include <thread>
+#if defined(__x86_64__) || defined(__i386__)
+#include <cpuid.h>
+#endif
 #ifdef PS2_WINDOW
 #include <deque>
 #include <mutex>
@@ -388,6 +391,53 @@ void install_signal_handlers() {}
 
 }
 
+// One line about the machine for the log, next to the [gpu] lines: a tester's log then says which processor (and how many cores) the speed
+// was seen on. The name comes from CPUID on x86 (any system); the core count and the split into fast and small cores (an "efficiency
+// class" of Windows) from Windows' own list; elsewhere only the number of logical processors is known.
+static void log_machine() {
+    std::string name = "unknown processor";
+#if defined(__x86_64__) || defined(__i386__)
+    unsigned int regs[12] = {};
+    if (__get_cpuid_max(0x80000000u, nullptr) >= 0x80000004u) {
+        for (unsigned int i = 0; i < 3; ++i) __cpuid(0x80000002u + i, regs[i * 4], regs[i * 4 + 1], regs[i * 4 + 2], regs[i * 4 + 3]);
+        name.assign(reinterpret_cast<const char *>(regs), 48);
+        name.resize(std::strlen(name.c_str()));
+        const auto first = name.find_first_not_of(' ');
+        name = first == std::string::npos ? std::string("unknown processor") : name.substr(first);
+    }
+#endif
+    char detail[160] = "";
+    const unsigned int logical = std::thread::hardware_concurrency();
+#ifdef _WIN32
+    DWORD bytes = 0;
+    GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &bytes);
+    std::vector<unsigned char> buffer(bytes);
+    int cores = 0, best = -1, fast = 0;
+    std::vector<int> classes;
+    if (bytes && GetLogicalProcessorInformationEx(RelationProcessorCore, reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(buffer.data()), &bytes)) {
+        for (DWORD at = 0; at < bytes;) {
+            const auto *info = reinterpret_cast<const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *>(buffer.data() + at);
+            if (info->Size == 0) break;
+            ++cores;
+            classes.push_back(info->Processor.EfficiencyClass);
+            best = std::max<int>(best, info->Processor.EfficiencyClass);
+            at += info->Size;
+        }
+        for (const int c : classes) fast += c == best;
+    }
+    MEMORYSTATUSEX memory{};
+    memory.dwLength = sizeof memory;
+    const double gigabytes = GlobalMemoryStatusEx(&memory) ? static_cast<double>(memory.ullTotalPhys) / (1024.0 * 1024.0 * 1024.0) : 0.0;
+    if (cores > 0 && fast < cores) std::snprintf(detail, sizeof detail, "%d cores (%d fast, %d small), %u logical processors", cores, fast, cores - fast, logical);
+    else if (cores > 0) std::snprintf(detail, sizeof detail, "%d cores, %u logical processors", cores, logical);
+    else std::snprintf(detail, sizeof detail, "%u logical processors", logical);
+    if (gigabytes > 0.0) std::snprintf(detail + std::strlen(detail), sizeof detail - std::strlen(detail), ", %.0f GB RAM", gigabytes);
+#else
+    std::snprintf(detail, sizeof detail, "%u logical processors", logical);
+#endif
+    std::fprintf(stderr, "[cpu] %s: %s\n", name.c_str(), detail);
+}
+
 // The window run's threads without a window (PS2_THREADS=1): this thread draws, one runs the vector units, one is the emulation.
 // The emulation waits for the drawing as in a window (post_present lets it run two pictures ahead), nothing is shown.
 // --frames-dir works too: the pictures are read back here, on the drawing side, at the same frames as in a run with one thread, under the
@@ -739,10 +789,16 @@ int main(int argc, char **argv) {
 #endif
     };
 #ifdef PS2_WINDOW
-    if (window) return run_window(emulate);
+    if (window) {
+        log_machine();
+        return run_window(emulate);
+    }
 #endif
     // PS2_THREADS=1: a headless run with the three threads of a window run (emulation, vector units, drawing) so that replays and
     // tests can cover the path a player's window takes (docs/sh2.md).
-    if (ps2::os::env("PS2_THREADS") == "1") return run_threads_headless(emulate);
+    if (ps2::os::env("PS2_THREADS") == "1") {
+        log_machine();
+        return run_threads_headless(emulate);
+    }
     return emulate();
 }
