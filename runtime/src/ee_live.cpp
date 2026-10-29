@@ -45,7 +45,7 @@ namespace {
 
 // Bump when recomp/codegen.cpp or recomp/analysis.cpp change what they write for the same code in a way the headers do not show: an
 // old library would otherwise still be loaded (the cache also drops libraries of another runner version by the stamp).
-constexpr const char *kGeneratorVersion = "ee-live 1";
+constexpr const char *kGeneratorVersion = "ee-live 2";
 
 using Clock = lb::Clock;
 
@@ -64,6 +64,7 @@ struct State {
     bool headers = false;
     int failures = 0;
     std::set<std::uint32_t> failed;       // addresses that were tried and did not work: not again
+    std::set<std::string> whole;          // window images that were translated as a whole (marker files in the cache): later misses translate only what they reach
     std::unique_ptr<recomp::StaticProgram> program_analysis;   // built at the first translation, for the calls into a window
     std::vector<std::uint32_t> main_entries;
     bool analysed = false;
@@ -191,7 +192,7 @@ void start(const std::string &program, const std::string &cache, const std::stri
     if (const std::string v = ps2::os::env("PS2_EE_LIVE_OPT"); !v.empty()) opt = v;
     g->flags = lb::compile_flags(opt);
     g->keep_work = !ps2::os::env("PS2_EE_LIVE_KEEP").empty();
-    g->jobs = std::clamp<std::size_t>(std::thread::hardware_concurrency() / 2, 2, 6);
+    g->jobs = std::clamp<std::size_t>(std::thread::hardware_concurrency() * 3 / 4, 2, 9);   // the game is paused while this runs: most of the machine
     if (const std::string v = ps2::os::env("PS2_EE_LIVE_JOBS"); !v.empty()) g->jobs = std::clamp<std::size_t>(std::strtoul(v.c_str(), nullptr, 10), 1, 16);
 
     // The stamp says which libraries this runner may load: the translator, the headers, the flags and the program they were made for.
@@ -213,7 +214,11 @@ void start(const std::string &program, const std::string &cache, const std::stri
         std::vector<fs::path> libraries;
         for (const auto &e : fs::directory_iterator(g->cache, error)) {
             std::string prefix;
-            if (e.is_regular_file() && is_cache_library(e.path(), prefix)) {
+            const std::string file = ps2::os::utf8(e.path().filename());
+            if (e.is_regular_file() && file.size() > 18 && file.ends_with(".mark") && file.compare(8, 7, "-whole-") == 0) {
+                if (file.compare(0, 8, mine) == 0) g->whole.insert(file.substr(15, file.size() - 20));
+                else fs::remove(e.path(), error);
+            } else if (e.is_regular_file() && is_cache_library(e.path(), prefix)) {
                 if (prefix == mine) libraries.push_back(e.path());
                 else fs::remove(e.path(), error);
             } else if (e.is_directory() && ps2::os::utf8(e.path().filename()).rfind("work-", 0) == 0) {
@@ -276,7 +281,10 @@ bool translate_missing(std::uint32_t pc) {
     }
     std::vector<std::uint8_t> image(g_ram + base, g_ram + base + size);
     const std::string name = (region ? "main_" : "") + recomp::window_name(base, image.data(), image.size());
-    const bool covered = region || ps2::window_module_in_place(pc);   // some translation of this content is there, it lacks this entry point
+    // A window image that was translated as a whole before (by this run or an earlier one) only lacks the entry point that was missed:
+    // translating all of it again for that costs seconds. One that was not (the build has a module of the same code, made from the
+    // entry points it knew) is looked through completely this time.
+    const bool whole_done = g->whole.count(name) != 0;
     if (region) say("no translated code at 0x%08X (the program's own code, not reached by the build): translating it now, the game waits", pc);
     else say("no translated code at 0x%08X (window 0x%08X, image %s, %u KiB): translating it now, the game waits", pc, base, name.c_str(), size / 1024);
 
@@ -285,10 +293,11 @@ bool translate_missing(std::uint32_t pc) {
     request.image = image;
     request.name = name;
     request.stamp = g->stamp;
+    request.focused = region || whole_done;
     request.entries.push_back(pc);
     std::size_t static_calls = 0, known_entries = 0;
-    if (!covered) {
-        // A content nothing in the build has seen: the calls the program itself makes into the window, and what entries.txt knows of this
+    if (!request.focused) {
+        // An image that is translated as a whole now: the calls the program itself makes into the window, and what entries.txt knows of this
         // image from before, are translated together with the entry point that was missed, so that this is not repeated for each of them.
         if (!g->analysed) {
             g->analysed = true;
@@ -377,6 +386,10 @@ bool translate_missing(std::uint32_t pc) {
     g->failures = 0;
     say("switched in after %.1f s (translate %.1f, compile %.1f, link %.1f): %zu entry points%s%s, %zu instructions, %zu files", lb::seconds_since(began), timing.generate, timing.compile, timing.link,
         generated.accepted.size(), static_calls ? " (calls of the program included)" : "", known_entries ? " (entries.txt included)" : "", generated.code, job.sources.size());
+    if (!request.focused) {
+        g->whole.insert(name);
+        std::ofstream(g->cache / (lb::hex(g->stamp >> 32, 8) + "-whole-" + name + ".mark")) << "whole image translated\n";
+    }
     remember(name, base, image, {pc}, region);
     return true;
 }

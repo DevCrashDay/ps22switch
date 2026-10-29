@@ -201,9 +201,22 @@ std::vector<std::uint32_t> frame_starts(const Image &image, std::uint32_t begin,
     return found;
 }
 
+// The word after `jr ra` and its delay slot (padding zeros skipped) starts the next function, also when that function is a short one
+// without a stack frame that only a table of pointers names.
+std::vector<std::uint32_t> return_starts(const Image &image, std::uint32_t begin, std::uint32_t end) {
+    std::vector<std::uint32_t> found;
+    for (std::uint32_t pc = begin; pc + 8 < end; pc += 4) {
+        if (image.word(pc).value_or(0) != 0x03E00008u) continue;
+        std::uint32_t at = pc + 8;
+        while (at < end && at - pc < 40 && image.word(at).value_or(1) == 0) at += 4;
+        if (at < end && image.word(at).value_or(0) != 0) found.push_back(at);
+    }
+    return found;
 }
 
-Program analyse(const Image &image, const std::vector<std::uint32_t> &extra_entries, const std::set<std::uint32_t> &dynamic) {
+}
+
+Program analyse(const Image &image, const std::vector<std::uint32_t> &extra_entries, const std::set<std::uint32_t> &dynamic, const Search &search) {
     Program p;
     p.dynamic = dynamic;
     p.base = UINT32_MAX;
@@ -237,11 +250,17 @@ Program analyse(const Image &image, const std::vector<std::uint32_t> &extra_entr
         std::vector<std::uint32_t> candidates = address_constants(image, p);
         const std::vector<std::uint32_t> branches = computed_branches(image, p);
         candidates.insert(candidates.end(), branches.begin(), branches.end());
-        const std::vector<std::uint32_t> frames = frame_starts(image, text_begin, text_end);
-        candidates.insert(candidates.end(), frames.begin(), frames.end());
-        for (const auto &segment : image.segments())
-            for (std::size_t offset = 0; offset + 4 <= segment.bytes.size(); offset += 4)
-                candidates.push_back(*image.word(segment.address + static_cast<std::uint32_t>(offset)));
+        if (search.whole_image) {
+            const std::vector<std::uint32_t> frames = frame_starts(image, text_begin, text_end);
+            candidates.insert(candidates.end(), frames.begin(), frames.end());
+            for (const auto &segment : image.segments())
+                for (std::size_t offset = 0; offset + 4 <= segment.bytes.size(); offset += 4)
+                    candidates.push_back(*image.word(segment.address + static_cast<std::uint32_t>(offset)));
+        }
+        if (search.after_return) {
+            const std::vector<std::uint32_t> leaves = return_starts(image, text_begin, text_end);
+            candidates.insert(candidates.end(), leaves.begin(), leaves.end());
+        }
         std::sort(candidates.begin(), candidates.end());
         candidates.erase(std::unique(candidates.begin(), candidates.end()), candidates.end());
 

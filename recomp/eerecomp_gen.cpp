@@ -167,8 +167,16 @@ LiveResult generate_live(const LiveRequest &request, const std::filesystem::path
         }
         // The same steps as eerecomp takes for an image of overlays/: analyse it from its entry points, check every word of it that is
         // code, translate it as a module that sits at a fixed base.
-        const Image image = Image::raw(request.base, request.image, {0, size});
-        Program program = analyse(image, request.entries, {});
+        // The text range is the whole window: with {0, size}, which is right for a module that sits at address 0, the search for function
+        // starts stopped at the last place the entries reached, and a window's other functions were each found by a pause of their own.
+        const Image image = Image::raw(request.base, request.image, {request.base, request.base + size});
+        // The first translation of an image looks through all of it (and takes every place after a return as a function start, so that the
+        // short functions that only pointer tables name are there too: each missed one used to cost a pause of its own). A later one for an
+        // image that is already in place translates just what the missed entry reaches, which is a fraction of the compile time.
+        Search search;
+        search.whole_image = !request.focused;
+        search.after_return = !request.focused;
+        Program program = analyse(image, request.entries, {}, search);
         for (const std::uint32_t entry : request.entries) {
             if (program.entries.count(entry) && program.is_code(entry)) result.accepted.insert(entry);
             else result.rejected.insert(entry);

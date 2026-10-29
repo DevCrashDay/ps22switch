@@ -23,6 +23,16 @@ struct Program {
     }
 };
 
-Program analyse(const Image &image, const std::vector<std::uint32_t> &extra_entries, const std::set<std::uint32_t> &dynamic = {});
+// How far the search for entry points goes beyond the code that the given entries reach.
+struct Search {
+    // Scan the whole image for places that look like the start of a function (a stack frame after a return, every word of the image that
+    // is an address of code). Off: only what the entries reach, plus the address constants and jump tables inside that code.
+    bool whole_image = true;
+    // Also take the place right after a return and its delay slot as a function start (a short function without a stack frame, which
+    // nothing in the image calls by name). Used for code that is translated while the game runs (docs/gvz.md).
+    bool after_return = false;
+};
+
+Program analyse(const Image &image, const std::vector<std::uint32_t> &extra_entries, const std::set<std::uint32_t> &dynamic = {}, const Search &search = {});
 
 }

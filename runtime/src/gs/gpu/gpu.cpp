@@ -1913,7 +1913,10 @@ void draw(const State &st, const Vertex *v, int count) {
             const std::uint32_t tpsm = setup[14];
             const bool upper_byte = tpsm == PSMT8H || tpsm == PSMT4HL || tpsm == PSMT4HH;
             const bool z_untouched = upper_byte && b.zpsm == PSMZ24;
-            const auto written = [&](const Range &t) { return t.overlaps(b.fb_range.lo, b.fb_range.hi) || (b.zwrite && !z_untouched && t.overlaps(b.z_range.lo, b.z_range.hi)); };
+            // The same holds for a 24-bit colour buffer: write_frame (gs.wgsl) keeps bits 24 to 31 of a PSMCT24 word. Gundam vs. Zeta Gundam
+            // keeps its font in the upper byte of its 24-bit colour buffer and reads it in thousands of small draws per menu frame (docs/gvz.md).
+            const bool fb_untouched = upper_byte && b.fpsm == PSMCT24;
+            const auto written = [&](const Range &t) { return (!fb_untouched && t.overlaps(b.fb_range.lo, b.fb_range.hi)) || (b.zwrite && !z_untouched && t.overlaps(b.z_range.lo, b.z_range.hi)); };
             int rect[4];
             if (written(tex)) {
                 if (!texel_rect(setup, v, count, prim, fst, rect)) {

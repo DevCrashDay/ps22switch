@@ -77,6 +77,7 @@ struct LiveRequest {
     std::string prefix;                  // names the functions of the library (unique inside the runner)
     std::vector<std::uint32_t> entries;  // absolute addresses to translate from
     std::uint64_t stamp = 0;             // not 0: the stamp the library carries (CodegenOptions::live_stamp)
+    bool focused = false;                // true: translate only what the entries reach (an earlier library covers the rest of the image)
 };
 
 struct LiveResult {
