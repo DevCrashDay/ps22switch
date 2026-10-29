@@ -74,7 +74,11 @@ struct Job {
     fs::path compiler;
     std::vector<std::string> flags;  // compile flags; the link step takes the ones that are neither -O nor -std
     std::size_t jobs = 2;
+    std::size_t jobs_urgent = 0;     // more at a time once `urgent` is set (the game waits: use the whole machine)
     bool below_normal = true;        // the game comes first; a paused game (ee_live.cpp) compiles at normal priority
+    bool starve = true;              // false: a compile that gets no processor time does not switch the toolchain to normal priority by itself
+    const std::atomic<bool> *cancel = nullptr;  // set: stop at once (the compilers are ended, nothing more is said); the caller no longer wants the result
+    const std::atomic<bool> *urgent = nullptr;  // set while the game waits for this job (ee_live.cpp, background translation): normal priority from then on
     std::function<void(const std::string &)> say;  // one line of the log
 };
 struct Timing {

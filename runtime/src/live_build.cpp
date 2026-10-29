@@ -210,7 +210,16 @@ bool same(const Process &a, const Process &b) {
 // then; the game itself stays faster with compiled programs than without).
 void watch_priority(Clock::time_point since, const Job &job) {
     Toolchain &tc = toolchain();
-    if (!job.below_normal || tc.normal_priority.load() || tc.starve_s <= 0 || seconds_since(since) < tc.starve_s) return;
+    if (job.urgent && job.urgent->load()) {
+        // The game waits for this job (a background translation that the game now needs, ee_live.cpp): the compilers it has running go
+        // to normal priority now, the ones it starts later start there. Only this job is meant, and the toolchain's setting stays.
+        if (job.below_normal && !tc.normal_priority.load()) {
+            std::lock_guard lock(tc.mutex);
+            for (Process &p : tc.alive) raise_priority(p);
+        }
+        return;
+    }
+    if (!job.starve || !job.below_normal || tc.normal_priority.load() || tc.starve_s <= 0 || seconds_since(since) < tc.starve_s) return;
     tc.normal_priority.store(true);
     {
         std::lock_guard lock(tc.mutex);
@@ -412,7 +421,10 @@ bool compile_and_link(const Job &job, Timing &timing) {
     const auto reap = [&] {
         auto [process, index] = running.front();
         running.erase(running.begin());
-        const int code = wait_for(process, [&] { watch_priority(t, job); });
+        const int code = wait_for(process, [&] {
+            watch_priority(t, job);
+            if (job.cancel && job.cancel->load()) kill_process(process);
+        });
         {
             std::lock_guard lock(tc.mutex);
             for (std::size_t i = 0; i < tc.alive.size(); ++i)
@@ -424,11 +436,13 @@ bool compile_and_link(const Job &job, Timing &timing) {
         release(process);
         if (code != 0) {
             ok = false;
+            if (job.cancel && job.cancel->load()) return;
             say("the compiler stopped with code " + std::to_string(code) + " on " + ps2::os::utf8(job.sources[index].filename()) + ":" + log_tail(log, 6));
         }
     };
     while ((next < job.sources.size() && ok) || !running.empty()) {
-        while (ok && next < job.sources.size() && running.size() < job.jobs) {
+        if (job.cancel && job.cancel->load()) ok = false;
+        while (ok && next < job.sources.size() && running.size() < ((job.urgent && job.urgent->load()) ? std::max(job.jobs, job.jobs_urgent) : job.jobs)) {
             std::vector<std::string> args = {compiler};
             args.insert(args.end(), job.flags.begin(), job.flags.end());
             args.push_back(include);
@@ -439,7 +453,7 @@ bool compile_and_link(const Job &job, Timing &timing) {
             args.push_back("-o");
             args.push_back(ps2::os::utf8(object));
             Process process;
-            if (!spawn(args, log, process, job.below_normal)) {
+            if (!spawn(args, log, process, job.below_normal && !(job.urgent && job.urgent->load()))) {
                 say("cannot start " + compiler);
                 ok = false;
                 break;
@@ -471,7 +485,7 @@ bool compile_and_link(const Job &job, Timing &timing) {
         args.push_back("-o");
         args.push_back(ps2::os::utf8(job.library));
         Process process;
-        if (!spawn(args, log, process, job.below_normal)) {
+        if (!spawn(args, log, process, job.below_normal && !(job.urgent && job.urgent->load()))) {
             say("cannot start " + compiler);
             return false;
         }

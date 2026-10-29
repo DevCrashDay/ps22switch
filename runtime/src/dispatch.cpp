@@ -168,6 +168,14 @@ void add_modules(const ModuleInfo *modules, std::uint32_t count) {
 
 bool window_module_in_place(std::uint32_t pc) { return instance_for(pc) != nullptr; }
 
+bool window_covered(std::uint32_t base, std::uint32_t size) {
+    // A module that holds the range, whatever base it begins at (windows are steps of 16 KiB in one area, and a window inside a
+    // translated one holds the same code).
+    for (const ModuleInfo &m : g_modules)
+        if (m.fixed_base && base >= m.fixed_base && base - m.fixed_base <= m.size && size <= m.size - (base - m.fixed_base) && loaded_at(m, m.fixed_base)) return true;
+    return false;
+}
+
 bool has_code(std::uint32_t pc) {
     const UnitInfo *u = unit_for(pc);
     if (u && u->entries[(pc - u->base) >> 2] != 0) return true;

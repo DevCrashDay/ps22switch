@@ -11,6 +11,7 @@
 #include "iop/spu2.hpp"
 #include "ipu/ipu.hpp"
 #include "ps2/disc.hpp"
+#include "ps2/ee_live.hpp"
 #include "kernel.hpp"
 #include "ps2/generated.hpp"
 #include "ps2/memory.hpp"
@@ -270,6 +271,7 @@ void vblank() {
     quick::frame_check();
     apply_patches(false);
     track_words();
+    ee::live::frame_tick();   // code windows that settled are translated in the background, finished libraries come in here (docs/gvz.md)
     if (g_options.on_vblank) g_options.on_vblank();
     iop::sio2::flush_cards();
     if (g_options.trace_iop_modules && g_frames % 25 == 0) std::fprintf(stderr, "[frame] %llu prims %llu\n", static_cast<unsigned long long>(g_frames), static_cast<unsigned long long>(gs::primitives_drawn()));

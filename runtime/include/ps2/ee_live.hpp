@@ -25,4 +25,20 @@ bool active();
 // looks again); false when that is not possible (nothing is changed; the reason is in the log).
 bool translate_missing(std::uint32_t pc);
 
+// Called by the emulation thread at every frame boundary (the vertical blank), after the frame's own work. It watches the code windows
+// (a few memory areas the game fills with different code as it goes); when the content of one has stopped changing and nothing
+// translated serves it, it starts translating that window on a thread of its own, so that the pause of translate_missing shrinks to
+// the rest of the work or disappears. It also takes finished libraries into use, here, on the emulation thread: the game never sees
+// a library arrive at any other place. It changes nothing the game can notice (docs/gvz.md).
+void frame_tick();
+
 }  // namespace ps2::ee::live
+
+namespace ps2 {
+
+// Is there a translated module in place for the code that sits in the window at `base` over its first `size` bytes? A question only
+// (runtime/src/dispatch.cpp): nothing is added or dropped and the spot-check cursor stays where it is, so asking does not change what
+// the game does.
+bool window_covered(std::uint32_t base, std::uint32_t size);
+
+}  // namespace ps2

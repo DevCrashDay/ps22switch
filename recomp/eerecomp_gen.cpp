@@ -177,6 +177,12 @@ LiveResult generate_live(const LiveRequest &request, const std::filesystem::path
         search.whole_image = !request.focused;
         search.after_return = !request.focused;
         Program program = analyse(image, request.entries, {}, search);
+        if (request.entries.empty()) {
+            // No entry point given: a window translated before the game has called into it (runtime/src/ee_live.cpp, background
+            // translation). What the search for function starts found is what there is.
+            for (const std::uint32_t entry : program.entries)
+                if (program.is_code(entry)) result.accepted.insert(entry);
+        }
         for (const std::uint32_t entry : request.entries) {
             if (program.entries.count(entry) && program.is_code(entry)) result.accepted.insert(entry);
             else result.rejected.insert(entry);
