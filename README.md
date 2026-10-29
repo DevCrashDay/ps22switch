@@ -41,6 +41,12 @@ Tried with my own discs (US releases), as far as each was played (no known bugs)
 | Silent Hill 2 | the opening at the rest stop and 17 minutes of play from there |
 | Shadow of the Colossus | the opening film, the shrine, riding Agro across the land and climbing |
 
+Reported by playtesters with their own discs:
+
+| Game | How far | Tested by |
+|---|---|---|
+| The Super Dimension Fortress Macross | plays well: menus and gameplay at about 60 fps (Windows 11, a laptop with Intel graphics, a game controller; [#3](https://github.com/exoteric33/ps2-native-recomp/issues/3)) | omegakatana92 |
+
 54 of the 55 programs of the free [ps2autotests](https://github.com/unknownbrackets/ps2autotests) suite print exactly
 what the console prints (`python scripts/autotests.py`).
 
