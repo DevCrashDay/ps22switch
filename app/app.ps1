@@ -347,6 +347,297 @@ function Test-GameRunning([string]$exe) {
     $false
 }
 
+# ---------------------------------------------------------------------------------------------------------------------
+# Updates (the Update button). The only network use is two small lookups at the start (the newest version of the public repo)
+# and, when the player presses Update, the download of that version's zip. Nothing is ever uploaded.
+#
+# How the versions are told apart: the newest one is the commit id GitHub names for the branch main of the public repo (a 40-digit
+# hex text, asked with the "sha" media type). The installed one is tools\update\installed.txt, written by an update. A copy that
+# came straight from the zip has no such file; it is compared file by file with the newest version instead (GitHub lists the
+# git hash of every file; the app hashes its own files the same way, .md files and .github left out), and when they are equal the
+# file is written. The zip of a commit carries the commit id as its zip comment, which is how a downloaded zip is checked.
+
+$UpdateRepo = 'exoteric33/ps2-native-recomp'
+$UpdateApi = "https://api.github.com/repos/$UpdateRepo"
+$UpdateArchive = "https://github.com/$UpdateRepo/archive"
+# For tests only (docs\app.md): a local test server instead of GitHub. Anything but a local address is ignored.
+if ($env:PS2APP_UPDATE_TEST -match '^http://(127\.0\.0\.1|localhost):\d+$') { $UpdateApi = $env:PS2APP_UPDATE_TEST + '/api'; $UpdateArchive = $env:PS2APP_UPDATE_TEST + '/archive' }
+$UpdateDir = Join-Path $Root 'tools\update'
+# What an update never touches: everything the player made or downloaded, and a git clone's own folder.
+$UpdateKeep = @('games', 'tools', 'build', 'generated', 'isos', 'third_party', 'wt', 'logs', '.git')
+
+function Get-InstalledVersion {
+    $file = Join-Path $UpdateDir 'installed.txt'
+    try { if (Test-Path -LiteralPath $file) { $text = (Get-Content -LiteralPath $file -Raw).Trim(); if ($text -match '^[0-9a-f]{40}$') { return $text } } } catch { }
+    ''
+}
+
+# A clone made with git is updated with git, and a developer can switch the lookup off.
+function Test-UpdateAllowed {
+    if ($env:PS2APP_NO_UPDATE_CHECK -eq '1') { return $false }
+    if (Test-Path -LiteralPath (Join-Path $Root '.git')) { return $false }
+    $true
+}
+
+# The games waiting to be built again after an update: tools\update\rebuild.txt, one game name per line.
+function Get-PendingRebuild {
+    $file = Join-Path $UpdateDir 'rebuild.txt'
+    $names = @()
+    try {
+        if (Test-Path -LiteralPath $file) {
+            foreach ($line in Get-Content -LiteralPath $file) {
+                $n = $line.Trim()
+                if ((Test-GameName $n) -and (Test-Path -LiteralPath (Join-Path $Root "build\native-$n\ps2run.exe"))) { $names += $n }
+            }
+        }
+    } catch { }
+    @($names)
+}
+
+function Set-PendingRebuild($names) {
+    $file = Join-Path $UpdateDir 'rebuild.txt'
+    try {
+        if (@($names).Count -eq 0) { if (Test-Path -LiteralPath $file) { Remove-Item -LiteralPath $file -Force }; return }
+        New-Item -ItemType Directory -Force -Path $UpdateDir | Out-Null
+        Set-Content -LiteralPath $file -Value @($names) -Encoding UTF8
+    } catch { Write-AppLog $_.Exception.ToString() }
+}
+
+# Every game that was built (not only the three on the welcome screen), in alphabetical order.
+function Get-AllBuiltNames {
+    $found = @()
+    if (Test-Path -LiteralPath $GamesDir) {
+        foreach ($dir in Get-ChildItem -LiteralPath $GamesDir -Directory) {
+            $game = Read-Game $dir.Name
+            if ($game -and $game.built -and (Test-Path -LiteralPath (Join-Path $Root "build\native-$($dir.Name)\ps2run.exe"))) { $found += $dir.Name }
+        }
+    }
+    @($found | Sort-Object)
+}
+
+# The worker runs in its own runspace (a second thread), so the window never waits for the network. It talks to the window through
+# the synchronized table $sh: Result is empty while it works. Mode 'check' says whether a newer version exists; mode 'download'
+# fetches, checks and unpacks it into tools\update\new.
+$UpdateWorker = @'
+param($sh, $mode, $api, $archive, $root, $dir, $sha)
+$ErrorActionPreference = 'Stop'
+try {
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    function Open-Get([string]$url, [string]$accept, [int]$timeout) {
+        $req = [Net.HttpWebRequest]::Create($url)
+        $req.UserAgent = 'ps2-native-recomp-app'
+        $req.Accept = $accept
+        $req.Timeout = $timeout
+        $req.ReadWriteTimeout = $timeout
+        $req.GetResponse()
+    }
+    function Get-Text([string]$url, [string]$accept) {
+        $r = Open-Get $url $accept 10000
+        try { (New-Object IO.StreamReader($r.GetResponseStream(), [Text.Encoding]::UTF8)).ReadToEnd() } finally { $r.Close() }
+    }
+    if ($mode -eq 'check') {
+        $newest = (Get-Text "$api/commits/main" 'application/vnd.github.sha').Trim()
+        if ($newest -notmatch '^[0-9a-f]{40}$') { throw 'unexpected answer' }
+        $sh.Sha = $newest
+        $installed = ''
+        try { $installed = (Get-Content -LiteralPath (Join-Path $dir 'installed.txt') -Raw).Trim() } catch { }
+        if ($installed -eq $newest) { $sh.Result = 'current'; return }
+        # Not the version this app recorded (or none): are the files the same as the newest version's anyway?
+        $tree = (Get-Text "$api/git/trees/${newest}?recursive=1" 'application/vnd.github+json') | ConvertFrom-Json
+        $same = $true
+        $count = 0
+        foreach ($entry in $tree.tree) {
+            if ($entry.type -ne 'blob') { continue }
+            $path = [string]$entry.path
+            if ($path -like '*.md' -or $path -like '.github/*') { continue }
+            $count++
+            $file = Join-Path $root ($path.Replace('/', '\'))
+            if (-not (Test-Path -LiteralPath $file -PathType Leaf)) { $same = $false; break }
+            $bytes = [IO.File]::ReadAllBytes($file)
+            $head = [Text.Encoding]::ASCII.GetBytes("blob $($bytes.Length)`0")
+            $hash = [Security.Cryptography.SHA1]::Create()
+            [void]$hash.TransformBlock($head, 0, $head.Length, $null, 0)
+            [void]$hash.TransformFinalBlock($bytes, 0, $bytes.Length)
+            $hex = ($hash.Hash | ForEach-Object { $_.ToString('x2') }) -join ''
+            if ($hex -ne [string]$entry.sha) { $same = $false; break }
+        }
+        if ($same -and $count -gt 20) {
+            New-Item -ItemType Directory -Force -Path $dir | Out-Null
+            Set-Content -LiteralPath (Join-Path $dir 'installed.txt') -Value $newest -Encoding ASCII
+            $sh.Result = 'current'
+        } else { $sh.Result = 'newer' }
+        return
+    }
+
+    # mode 'download'
+    New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    $part = Join-Path $dir 'download.zip.part'
+    $zipFile = Join-Path $dir 'download.zip'
+    foreach ($f in $part, $zipFile) { if (Test-Path -LiteralPath $f) { Remove-Item -LiteralPath $f -Force } }
+    $sh.Phase = 'download'
+    $resp = Open-Get "$archive/$sha.zip" 'application/zip' 15000
+    $sh.Total = [double]$resp.ContentLength
+    $in = $resp.GetResponseStream()
+    $out = [IO.File]::Create($part)
+    try {
+        $buffer = New-Object byte[] 65536
+        while ($true) {
+            if ($sh.Cancel) { $sh.Result = 'cancelled'; return }
+            $n = $in.Read($buffer, 0, $buffer.Length)
+            if ($n -le 0) { break }
+            $out.Write($buffer, 0, $n)
+            $sh.Done = $sh.Done + $n
+            if ($sh.Done -gt 150MB) { throw 'invalid: too big' }
+        }
+    } finally { $out.Dispose(); $in.Dispose(); $resp.Close() }
+    if ($sh.Total -gt 0 -and $sh.Done -ne $sh.Total) { throw 'network: the download broke off' }
+    Move-Item -LiteralPath $part -Destination $zipFile
+
+    # Is it the zip of the version that was looked up, made by the public repo? The zip comment is the commit id.
+    $sh.Phase = 'check'
+    $bytes = [IO.File]::ReadAllBytes($zipFile)
+    $comment = $null
+    for ($i = $bytes.Length - 22; $i -ge [Math]::Max(0, $bytes.Length - 22 - 65535); $i--) {
+        if ($bytes[$i] -eq 0x50 -and $bytes[$i + 1] -eq 0x4B -and $bytes[$i + 2] -eq 5 -and $bytes[$i + 3] -eq 6) {
+            $len = $bytes[$i + 20] + 256 * $bytes[$i + 21]
+            if ($i + 22 + $len -eq $bytes.Length) { $comment = [Text.Encoding]::ASCII.GetString($bytes, $i + 22, $len); break }
+        }
+    }
+    if ($null -eq $comment) { throw 'network: the zip file is incomplete' }
+    if ($comment.Trim() -ne $sha) { throw 'invalid: the zip does not name the expected version' }
+    Add-Type -AssemblyName System.IO.Compression
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $new = Join-Path $dir 'new'
+    if (Test-Path -LiteralPath $new) { Remove-Item -LiteralPath $new -Recurse -Force }
+    New-Item -ItemType Directory -Force -Path $new | Out-Null
+    $zip = [IO.Compression.ZipFile]::OpenRead($zipFile)
+    try {
+        $top = $null
+        $seen = @{}
+        foreach ($entry in $zip.Entries) {
+            $name = $entry.FullName.Replace('\', '/')
+            $parts = @($name.Split('/') | Where-Object { $_ -ne '' })
+            if ($parts.Count -eq 0) { continue }
+            if ($name.StartsWith('/') -or $name -match ':' -or ($parts -contains '..')) { throw 'invalid: unsafe path in the zip' }
+            if ($null -eq $top) { $top = $parts[0] } elseif ($parts[0] -ne $top) { throw 'invalid: more than one top folder' }
+            if ($parts.Count -eq 1) { if ($name.EndsWith('/')) { continue } else { throw 'invalid: file outside the top folder' } }
+            $rel = ($parts[1..($parts.Count - 1)]) -join '\'
+            $seen[$parts[1].ToLower()] = $true
+            $target = Join-Path $new $rel
+            if ($name.EndsWith('/')) { New-Item -ItemType Directory -Force -Path $target | Out-Null; continue }
+            New-Item -ItemType Directory -Force -Path (Split-Path -Parent $target) | Out-Null
+            [IO.Compression.ZipFileExtensions]::ExtractToFile($entry, $target, $true)
+        }
+    } finally { $zip.Dispose() }
+    # File times decide what the build tools compile again: a file with the same content as today's keeps today's time (so the
+    # translator tools and the games' programs are not compiled again for nothing), a changed or new file gets the time of now
+    # (the zip's own times are the commit's, which can be older than the programs that were built since).
+    $stamp = [DateTime]::UtcNow
+    $sha1 = [Security.Cryptography.SHA1]::Create()
+    foreach ($f in Get-ChildItem -LiteralPath $new -Recurse -File -Force) {
+        $rel = $f.FullName.Substring($new.Length + 1)
+        $mine = Join-Path $root $rel
+        $when = $stamp
+        if (Test-Path -LiteralPath $mine -PathType Leaf) {
+            try {
+                $info = Get-Item -LiteralPath $mine -Force
+                if ($info.Length -eq $f.Length -and ([BitConverter]::ToString($sha1.ComputeHash([IO.File]::ReadAllBytes($mine))) -eq [BitConverter]::ToString($sha1.ComputeHash([IO.File]::ReadAllBytes($f.FullName))))) { $when = $info.LastWriteTimeUtc }
+            } catch { }   # a file in use counts as changed
+        }
+        $f.LastWriteTimeUtc = $when
+    }
+    foreach ($must in 'app\app.ps1', 'app\ui.cs', 'Start.cmd', 'scripts\port.sh', 'scripts\setup.sh', 'CMakeLists.txt') {
+        if (-not (Test-Path -LiteralPath (Join-Path $new $must))) { throw "invalid: $must is missing" }
+    }
+    $sh.Result = 'ready'
+} catch {
+    $text = $_.Exception.Message
+    $sh.Error = $text
+    $sh.Result = if ($text -like 'invalid:*') { 'invalid' } elseif ($text -like 'network:*' -or $sh.Phase -ne 'check') { 'failed' } else { 'unpack' }
+    foreach ($f in Get-ChildItem -LiteralPath $dir -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -like 'download*' }) { Remove-Item -LiteralPath $f.FullName -Force -ErrorAction SilentlyContinue }
+} finally {
+    if ($sh.Result -eq 'cancelled') {
+        foreach ($f in Get-ChildItem -LiteralPath $dir -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -like 'download*' }) { Remove-Item -LiteralPath $f.FullName -Force -ErrorAction SilentlyContinue }
+    }
+}
+'@
+
+function Start-UpdateWorker([string]$mode, [string]$sha) {
+    $sh = [hashtable]::Synchronized(@{ Result = ''; Sha = $sha; Error = ''; Phase = ''; Done = [double]0; Total = [double]0; Cancel = $false })
+    $runspace = [runspacefactory]::CreateRunspace()
+    $runspace.ApartmentState = 'MTA'
+    $runspace.Open()
+    $ps = [powershell]::Create()
+    $ps.Runspace = $runspace
+    [void]$ps.AddScript($UpdateWorker).AddArgument($sh).AddArgument($mode).AddArgument($UpdateApi).AddArgument($UpdateArchive).AddArgument($Root).AddArgument($UpdateDir).AddArgument($sha)
+    $handle = $ps.BeginInvoke()
+    @{ Sh = $sh; Ps = $ps; Runspace = $runspace; Handle = $handle; Mode = $mode }
+}
+
+function Stop-UpdateWorker($job) {
+    if ($null -eq $job) { return }
+    try { $job.Sh.Cancel = $true } catch { }
+    # Never wait for the network: the thread is a background thread and ends with the app.
+    try { [void]$job.Ps.BeginStop($null, $null) } catch { }
+}
+
+# A rename on the same drive: it happens completely or not at all (Move-Item copies and deletes file by file when it cannot
+# rename, and a failure half way leaves a folder in two places).
+function Move-Entry([string]$from, [string]$to) {
+    if (Test-Path -LiteralPath $from -PathType Container) { [IO.Directory]::Move($from, $to) } else { [IO.File]::Move($from, $to) }
+}
+
+# Puts the unpacked version (tools\update\new) in place of the app's own files. Everything the player made stays (UpdateKeep).
+# A top-level folder or file of the new version replaces the old one as a whole, so a source file that is gone in the new version
+# is gone here too; the old ones are moved to tools\update\old first (a rename, nothing is copied), and when anything goes wrong
+# they are moved back, so a failed update leaves the app as it was.
+function Install-Update([string]$sha) {
+    $new = Join-Path $UpdateDir 'new'
+    $old = Join-Path $UpdateDir 'old'
+    if (-not (Test-Path -LiteralPath (Join-Path $new 'app\app.ps1'))) { throw 'The unpacked update is incomplete.' }
+    if (Test-Path -LiteralPath $old) { Remove-Item -LiteralPath $old -Recurse -Force }
+    New-Item -ItemType Directory -Force -Path $old | Out-Null
+    $newNames = @(Get-ChildItem -LiteralPath $new -Force | ForEach-Object { $_.Name } | Where-Object { $UpdateKeep -notcontains $_.ToLower() })
+    $manifest = Join-Path $UpdateDir 'files.txt'
+    $oldNames = @()
+    try { if (Test-Path -LiteralPath $manifest) { $oldNames = @(Get-Content -LiteralPath $manifest | Where-Object { $_ }) } } catch { }
+    $gone = @($oldNames | Where-Object { ($newNames -notcontains $_) -and ($UpdateKeep -notcontains $_.ToLower()) -and (Test-Path -LiteralPath (Join-Path $Root $_)) })
+    $undo = New-Object 'Collections.Generic.List[object]'
+    try {
+        foreach ($name in $gone) {
+            Move-Entry (Join-Path $Root $name) (Join-Path $old $name)
+            $undo.Add(@{ Kind = 'old'; Name = $name })
+        }
+        foreach ($name in $newNames) {
+            $target = Join-Path $Root $name
+            if (Test-Path -LiteralPath $target) {
+                Move-Entry $target (Join-Path $old $name)
+                $undo.Add(@{ Kind = 'old'; Name = $name })
+            }
+            Move-Entry (Join-Path $new $name) $target
+            $undo.Add(@{ Kind = 'new'; Name = $name })
+        }
+    } catch {
+        $problem = $_
+        for ($i = $undo.Count - 1; $i -ge 0; $i--) {
+            $step = $undo[$i]
+            try {
+                if ($step.Kind -eq 'new') { Move-Entry (Join-Path $Root $step.Name) (Join-Path $new $step.Name) }
+                else { Move-Entry (Join-Path $old $step.Name) (Join-Path $Root $step.Name) }
+            } catch { Write-AppLog ("Update rollback: " + $_.Exception.Message) }
+        }
+        throw $problem
+    }
+    # Done: remember the version and the names, and what is left to build again.
+    Set-Content -LiteralPath $manifest -Value $newNames -Encoding UTF8
+    Set-Content -LiteralPath (Join-Path $UpdateDir 'installed.txt') -Value $sha -Encoding ASCII
+    Set-PendingRebuild (Get-AllBuiltNames)
+    foreach ($leftover in 'old', 'new') {
+        try { if (Test-Path -LiteralPath (Join-Path $UpdateDir $leftover)) { Remove-Item -LiteralPath (Join-Path $UpdateDir $leftover) -Recurse -Force } } catch { }
+    }
+    try { Remove-Item -LiteralPath (Join-Path $UpdateDir 'download.zip') -Force } catch { }
+}
+
 # One window per app folder: two at once would build into the same folders.
 $created = $false
 $Mutex = New-Object Threading.Mutex($true, ('Local\Ps2NativeRecompApp_' + ($Root.ToLower() -replace '[^a-z0-9]', '_')), [ref]$created)
@@ -358,7 +649,7 @@ if (-not $created) {
 # ---------------------------------------------------------------------------------------------------------------------
 # Child processes
 
-$State = @{ Build = $null; Image = ''; Name = ''; Game = $null; Playing = $null; Seq = 0; Patch = $null }
+$State = @{ Build = $null; Image = ''; Name = ''; Game = $null; Playing = $null; Seq = 0; Patch = $null; Newest = ''; UpdateJob = $null; Batch = $null; Restarting = $false }
 
 # PCSX2 patches of the chosen game (optional). Status: idle (not asked yet), working, found, none (the collection has no file for
 # this game) or error. Chosen holds the ticked section names; Items the tick boxes (Key = section name, S = what pnach.py says).
@@ -577,7 +868,7 @@ $form.Font = New-Font 11
 try { $form.Icon = New-AppIcon } catch { Write-AppLog $_.Exception.ToString() }
 
 $P = @{}   # the screens
-foreach ($screen in 'welcome', 'choose', 'patches', 'build', 'done') {
+foreach ($screen in 'welcome', 'choose', 'patches', 'build', 'done', 'update') {
     $panel = New-Object Ps2Ui.Page
     $panel.Name = "screen-$screen"
     $panel.Dock = 'Fill'
@@ -597,8 +888,10 @@ $steps = @(
     @('3', 'Press Play', 'Start the game from here, or make a desktop shortcut and start it from there next time.')
 )
 $x = 40
+$U.stepCards = @()
 foreach ($s in $steps) {
     $card = New-Glass $w "stepcard$($s[0])" $x 104 232 142
+    $U.stepCards += $card
     [void](Add-Badge $card "step$($s[0])" $s[0] 14 14)
     [void](Add-Label $card "step$($s[0])-title" $s[1] 54 16 170 26 (New-Font 12 $true) $C.Ink)
     [void](Add-Label $card "step$($s[0])-text" $s[2] 16 54 204 84 (New-Font 10) $C.Muted)
@@ -621,6 +914,16 @@ $U.again.Size = New-Size 720 212
 $w.Controls.Add($U.again)
 $U.fasterButtons = @{}
 $U.patchMode = ''
+# The notice in the place of the three cards: a newer version is out (Update), or the app was updated and the games should be built
+# again (Build my games again). See Update-Banner.
+$U.noteCard = New-Glass $w 'NoteCard' 40 104 720 142
+$U.noteCard.Visible = $false
+$U.noteTitle = Add-Label $U.noteCard 'noteTitle' '' 18 12 440 30 (New-Font 15 $true) $C.Accent
+$U.noteText = Add-Label $U.noteCard 'noteText' '' 18 44 440 62 (New-Font 10.5) $C.Ink
+$U.noteSmall = Add-Label $U.noteCard 'noteSmall' '' 18 108 440 30 (New-Font 9) $C.Muted
+$U.noteButton = Add-Button $U.noteCard 'NoteButton' 'Update' 478 18 226 66 'primary' 18
+$U.noteLater = Add-Button $U.noteCard 'NoteLater' 'Not now' 478 92 226 40 'secondary' 11
+$U.noteMode = ''
 
 # --- choose: the disc image and the name, then a card for the extras, then Build
 $w = $P['choose']
@@ -755,6 +1058,27 @@ $U.another = Add-Button $w 'BuildAnother' 'Add another game' 40 512 210 48 'seco
 $U.changeExtras = Add-Button $w 'ChangeExtras' 'Change extras...' 262 512 210 48 'secondary' 12
 $U.close = Add-Button $w 'Close' 'Close' 620 512 140 48 'secondary' 12
 
+# --- update: downloading the newest version, a failure, and the result of Build my games again
+$w = $P['update']
+$U.updTitle = Add-Label $w 'updTitle' 'Updating the app' 38 16 720 54 (New-Font 26 $false $TitleFont) $C.Ink
+$U.updCard = New-Glass $w 'UpdateCard' 40 84 720 170
+$U.updStatus = Add-Label $U.updCard 'updStatus' '' 18 14 684 58 (New-Font 15 $true) $C.Ink
+$U.updDetail = Add-Label $U.updCard 'updDetail' '' 18 74 684 44 (New-Font 11) $C.Muted
+$U.updBar = New-Object Ps2Ui.Bar
+$U.updBar.Name = 'UpdateProgress'
+$U.updBar.AccessibleName = 'Progress'
+$U.updBar.AccessibleRole = 'ProgressBar'
+$U.updBar.Location = New-Point 18 128
+$U.updBar.Size = New-Size 684 22
+$U.updBar.Minimum = 0
+$U.updBar.Maximum = 1000
+$U.updCard.Controls.Add($U.updBar)
+$U.updList = Add-Label $w 'updList' '' 44 270 712 226 (New-Font 10.5) $C.Ink
+$U.updCancel = Add-Button $w 'UpdateCancel' 'Cancel' 600 508 160 52 'secondary' 13
+$U.updRetry = Add-Button $w 'UpdateTryAgain' 'Try again' 400 502 180 58 'primary' 14
+$U.updBack = Add-Button $w 'UpdateBack' 'Back' 600 508 160 52 'secondary' 13
+$U.updDone = Add-Button $w 'UpdateDone' 'Done' 440 502 320 60 'primary' 17
+
 function Show-Screen([string]$name) {
     foreach ($key in @($P.Keys)) { $P[$key].Visible = ($key -eq $name) }
     switch ($name) {
@@ -762,6 +1086,7 @@ function Show-Screen([string]$name) {
         'choose' { $form.AcceptButton = $U.build; Update-ChooseState }
         'patches' { $form.AcceptButton = $U.patchesDone; Update-PatchScreen }
         'done' { $form.AcceptButton = $U.play; Update-FasterOffers }
+        'update' { $form.AcceptButton = $null }
         default { $form.AcceptButton = $null }
     }
 }
@@ -880,6 +1205,7 @@ $playTimer.Add_Tick({
 })
 
 function Update-Welcome {
+    Update-Banner
     $U.installProblem.Text = if ($InstallProblem) { $InstallProblem } else { '' }
     $U.installProblem.Visible = [bool]$InstallProblem
     $U.privacy.Visible = -not $InstallProblem
@@ -1550,16 +1876,17 @@ function Flush-Log($b) {
 }
 
 # $patch is given only for Make it faster: the patch choice the game was built with (Start-Faster reads it from app.json).
-function Start-Build([string]$name, [string]$image, [bool]$faster = $false, $patch = $null) {
+# $batch is given only for Build my games again after an update: @{ Index; Total; First } (First = also prepare the translator tools).
+function Start-Build([string]$name, [string]$image, [bool]$faster = $false, $patch = $null, $batch = $null) {
     if (-not $faster) { $patch = Get-BuildPatches }
     $b = @{ Name = $name; Image = $image; Plan = @(); Index = -1; Pending = (New-Object 'Collections.Generic.List[string]'); Clock = [Diagnostics.Stopwatch]::StartNew()
             LogFile = (Get-GameFile $name 'build.log'); Child = $null; Bar = 0.0; Tail = New-Object 'Collections.Generic.List[string]'; Error = ''; Failed = $false; Step = 0
-            Patch = $patch; Wide = $false; Faster = $faster }
+            Patch = $patch; Wide = $false; Faster = $faster; Batch = $batch }
     New-Item -ItemType Directory -Force -Path (Join-Path $GamesDir $name) | Out-Null
     [IO.File]::WriteAllText($b.LogFile, '', (New-Object Text.UTF8Encoding($false)))
     $State.Build = $b
     $U.log.Clear()
-    $U.buildTitle.Text = if ($faster) { "Making it faster: $name" } else { "Building: $name" }
+    $U.buildTitle.Text = if ($batch) { "Building again ($($batch.Index) of $($batch.Total)): $name" } elseif ($faster) { "Making it faster: $name" } else { "Building: $name" }
     $U.cancel.Text = 'Cancel'
     $U.tip.Text = if ($faster) { 'This takes a short while. You can leave this window open and use your PC for other things.' } else { 'This can take a while. You can leave this window open and use your PC for other things. Please do not shut the PC down.' }
     $U.bar.Value = 0
@@ -1592,7 +1919,7 @@ function Start-Build([string]$name, [string]$image, [bool]$faster = $false, $pat
     $tc = Get-ToolchainState
     $b.Tools = @{ Missing = @($tc.Missing); Total = [double]$tc.Bytes; Done = 0.0; Cur = 0.0; Current = $null; Short = '' }
     if ($tc.Missing.Count -gt 0 -or -not $tc.HasEnv) { $b.Plan += @{ Id = 'tools'; Weight = 30 } }
-    if ((Test-SetupNeeded) -or $b.Plan.Count -gt 0) { $b.Plan += @{ Id = 'setup'; Weight = 12 } }
+    if ((Test-SetupNeeded) -or $b.Plan.Count -gt 0 -or ($batch -and $batch.First)) { $b.Plan += @{ Id = 'setup'; Weight = 12 } }
     $b.Plan += @{ Id = 'port'; Weight = 58 }
     $sum = 0.0
     foreach ($s in $b.Plan) { $sum += $s.Weight }
@@ -1799,6 +2126,13 @@ function Get-FailureMessage($b) {
 function Set-BuildFailed($b, [string]$message) {
     $timer.Stop()
     if ($b.Child) { Stop-Child $b.Child; $b.Child = $null }
+    # Build my games again: one game that does not build does not stop the others (a failure of the tools does).
+    if ($b.Batch -and $b.ContainsKey('Stage') -and $b.Stage.Id -eq 'port') {
+        $b.Failed = $true
+        Flush-Log $b
+        Complete-Rebuild $b 'failed' $message
+        return
+    }
     $State.Build = $b
     $b.Failed = $true
     $U.buildTitle.Text = 'The build stopped'
@@ -1811,7 +2145,8 @@ function Set-BuildFailed($b, [string]$message) {
     $U.buildExtras.Visible = $false
     Set-LogPlace
     $extra = if ($b.Error) { "$($b.Error)`n" } else { '' }
-    $U.detail.Text = "${extra}Press Try again, or Back to choose another disc image or other extras.`nThe full log is saved here (Show details has it too):`n$($b.LogFile)"
+    $advice = if ($b.Batch) { 'Press Try again to go on with your games, or Back.' } else { 'Press Try again, or Back to choose another disc image or other extras.' }
+    $U.detail.Text = "${extra}${advice}`nThe full log is saved here (Show details has it too):`n$($b.LogFile)"
     $U.bar.Visible = $false; $U.elapsed.Visible = $false; $U.percent.Visible = $false; $U.tip.Visible = $false
     $U.cancel.Visible = $false; $U.retry.Visible = $true; $U.buildBack.Visible = $true
     Flush-Log $b
@@ -1858,6 +2193,7 @@ function Complete-Build($b) {
     if ($b.Faster) { $old = Read-Game $name; if ($old -and $old.source) { $source = $old.source }; if ($old) { $took = $old.took } }
     Write-Game @{ name = $name; source = $source; built = (Get-Date).ToString('s'); took = $took; elf = (Get-RootRelative $elf); iso = (Get-RootRelative $iso)
                   pnach = (Get-RootRelative $b.Patch.File); sections = @($b.Patch.Chosen); patches = (Get-RootRelative $patchList); widescreen = $(if ($b.Wide) { '1' } else { '' }) }
+    if ($b.Batch) { Complete-Rebuild $b 'done' ''; return }
     $State.Game = $name
     try { [Media.SystemSounds]::Asterisk.Play() } catch { }
     $lead = if ($b.Faster) { "$name is faster now." } else { "$name is built." }
@@ -1931,19 +2267,23 @@ $U.cancel.Add_Click({
         Stop-Child $State.Build.Child
         $faster = $State.Build.Faster
         $name = $State.Build.Name
+        $wasBatch = [bool]$State.Build.Batch
         $State.Build = $null
-        if ($faster) { Show-Ready $name "$name is as it was before. Play opens the game in its own window; close that window to stop it." }
+        if ($wasBatch) { $State.Batch = $null; Show-Screen 'welcome' }
+        elseif ($faster) { Show-Ready $name "$name is as it was before. Play opens the game in its own window; close that window to stop it." }
         else { Show-Screen 'choose' }
     }
 })
 $U.retry.Add_Click({
-    if ($State.Build -and $State.Build.Faster) { Start-Faster $State.Build.Name }
+    if ($State.Build -and $State.Build.Batch) { Start-RebuildAll }
+    elseif ($State.Build -and $State.Build.Faster) { Start-Faster $State.Build.Name }
     elseif ($State.Name -and $State.Image) { Start-Build $State.Name $State.Image }
 })
 $U.buildBack.Add_Click({
     $b = $State.Build
     $State.Build = $null
-    if ($b -and $b.Faster) { Show-Ready $b.Name "$($b.Name) is as it was before. Play opens the game in its own window; close that window to stop it." }
+    if ($b -and $b.Batch) { $State.Batch = $null; Show-Screen 'welcome' }
+    elseif ($b -and $b.Faster) { Show-Ready $b.Name "$($b.Name) is as it was before. Play opens the game in its own window; close that window to stop it." }
     else { Show-Screen 'choose' }
 })
 
@@ -1952,34 +2292,287 @@ $U.buildBack.Add_Click({
 # --no-explore (about 10 seconds for God of War II instead of minutes) and the patch options the game was built with, which
 # app.json keeps. Shown on the Done screen and under the Play buttons of the welcome screen; the build screen is the usual one.
 
-function Start-Faster([string]$name) {
+# What a rebuild of an already built game needs, or why it cannot start: @{ Error = <plain sentence> } or @{ Image; Patch }.
+function Get-FasterPlan([string]$name) {
     $game = Read-Game $name
     $exe = Join-Path $Root "build\native-$name\ps2run.exe"
     if (-not $game -or -not $game.built -or -not (Test-Path -LiteralPath $exe)) {
-        [void][Windows.Forms.MessageBox]::Show("The game '$name' is not built yet (or its files are gone). Please build it again.", $AppTitle, 'OK', 'Information')
-        return
+        return @{ Error = "The game '$name' is not built yet (or its files are gone). Please build it again." }
     }
     if (Test-GameRunning $exe) {
-        [void][Windows.Forms.MessageBox]::Show("The game '$name' is still open. Close its window first, then press Make it faster again.", $AppTitle, 'OK', 'Information')
-        return
+        return @{ Error = "The game '$name' is still open. Close its window first, then try again." }
     }
     # port.sh needs the disc image only when games\<name>\disc.iso is gone; offer it the place the build used, else where the game plays from.
     $image = $game.source
     if (-not $image -or -not (Test-Path -LiteralPath $image)) { $image = Resolve-AppPath $game.iso }
     if (-not (Test-Path -LiteralPath $image)) {
-        [void][Windows.Forms.MessageBox]::Show("The disc image of '$name' is not at its old place any more:`n$image`nPut it back, or build the game again.", $AppTitle, 'OK', 'Information')
-        return
+        return @{ Error = "The disc image of '$name' is not at its old place any more:`n$image`nPut it back, or build the game again." }
     }
     $patch = @{ File = ''; Sections = @(); Chosen = @() }
     if ($game.pnach) {
         $file = Resolve-AppPath $game.pnach
         if (-not (Test-Path -LiteralPath $file)) {
-            [void][Windows.Forms.MessageBox]::Show("The patch file the game was built with is not there any more:`n$file`nBuild the game again (Patches, then Build), so that it keeps its patches.", $AppTitle, 'OK', 'Information')
-            return
+            return @{ Error = "The patch file the game was built with is not there any more:`n$file`nBuild the game again (Patches, then Build), so that it keeps its patches." }
         }
         $patch = @{ File = $file; Sections = @($game.sections | Where-Object { $_ -ne $WholeFile }); Chosen = @($game.sections) }
     }
-    Start-Build $name $image $true $patch
+    @{ Image = $image; Patch = $patch }
+}
+
+function Start-Faster([string]$name) {
+    $plan = Get-FasterPlan $name
+    if ($plan.ContainsKey('Error')) {
+        [void][Windows.Forms.MessageBox]::Show($plan.Error, $AppTitle, 'OK', 'Information')
+        return
+    }
+    Start-Build $name $plan.Image $true $plan.Patch
+}
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Update, and Build my games again
+
+# The notice on the welcome screen, in the place of the three cards. Priority: games waiting to be built again (right after an
+# update), else a newer version. Only texts and visibility change, so a click that is just landing is never lost.
+function Update-Banner {
+    $mode = ''
+    $pending = @(Get-PendingRebuild)
+    if (-not $InstallProblem) {
+        if ($pending.Count -gt 0) { $mode = 'rebuild' }
+        elseif ($State.Newest -and $State.Newest -ne (Get-InstalledVersion)) { $mode = 'update' }
+    }
+    if ($mode -eq '' -and (Test-Path -LiteralPath (Join-Path $UpdateDir 'rebuild.txt')) -and -not $State.Batch) { Set-PendingRebuild @() }
+    $U.noteCard.Visible = [bool]$mode
+    foreach ($card in $U.stepCards) { $card.Visible = -not $mode }
+    if ($mode -ne $U.noteMode) {
+        $U.noteMode = $mode
+        switch ($mode) {
+            'update' {
+                $U.noteTitle.Text = 'A newer version is out'
+                $U.noteText.Text = 'The update brings the newest fixes. Your games, saves, quick saves and the downloaded build tools all stay. Afterwards the app starts again and offers to build your games again.'
+                $U.noteSmall.Text = "Version $($State.Newest.Substring(0, 7)). About 1 MB from GitHub; nothing is uploaded."
+                $U.noteButton.Text = 'Update'
+                $U.noteButton.Font = New-Font 18 $true
+                $U.noteLater.Visible = $false
+            }
+            'rebuild' {
+                $U.noteTitle.Text = 'The app was updated'
+                $U.noteText.Text = 'To get the fixes into your games, they are built once more. Extras, saves, quick saves and your progress stay.'
+                $U.noteButton.Font = New-Font 13.5 $true
+                $U.noteLater.Visible = $true
+            }
+        }
+        $U.noteButton.AccessibleName = $U.noteButton.Text
+    }
+    if ($mode -eq 'rebuild') {
+        $n = $pending.Count
+        $U.noteButton.Text = 'Build my games again'
+        $U.noteButton.AccessibleName = $U.noteButton.Text
+        $U.noteSmall.Text = $(if ($n -eq 1) { '1 game is waiting. If its disc image is gone, it is skipped.' } else { "$n games are waiting. A game with no disc image is skipped." })
+    }
+}
+
+# --- Looking for a newer version (once, when the app starts; quietly)
+$updTimer = New-Object Windows.Forms.Timer
+$updTimer.Interval = 250
+
+function Close-UpdateJob {
+    $job = $State.UpdateJob
+    $State.UpdateJob = $null
+    if ($job) { Stop-UpdateWorker $job }
+}
+
+function Update-UpdateJob {
+    $job = $State.UpdateJob
+    if ($null -eq $job) { $updTimer.Stop(); return }
+    $sh = $job.Sh
+    if ($job.Mode -eq 'download') {
+        if ($sh.Phase -eq 'download' -and $sh.Total -gt 0) {
+            $U.updBar.Value = [int][Math]::Min(1000, $sh.Done / $sh.Total * 1000)
+        }
+        if ($sh.Phase -eq 'check' -and $U.updStatus.Text -ne 'Checking and unpacking the download') {
+            $U.updStatus.Text = 'Checking and unpacking the download'
+            $U.updBar.Value = 1000
+            $U.updCancel.Visible = $false
+        }
+    }
+    if ($sh.Result -eq '') {
+        # The worker ended without an answer: treat it as a failure.
+        if ($job.Handle.IsCompleted) { $sh.Result = 'failed'; $sh.Error = 'the worker ended' } else { return }
+    }
+    $result = [string]$sh.Result
+    $error_ = [string]$sh.Error
+    Close-UpdateJob
+    $updTimer.Stop()
+    if ($job.Mode -eq 'check') {
+        if ($result -eq 'newer') { $State.Newest = [string]$sh.Sha; if ($P['welcome'].Visible) { Update-Banner } }
+        return
+    }
+    switch ($result) {
+        'ready' {
+            try {
+                Install-Update ([string]$sh.Sha)
+            } catch {
+                Write-AppLog $_.Exception.ToString()
+                Show-UpdateFailed 'The update could not be put in place, so nothing was changed.' "A file may be in use. Close other windows that show this folder, then try again.`n$($_.Exception.Message)"
+                return
+            }
+            Restart-App
+        }
+        'cancelled' { Show-Screen 'welcome' }
+        'invalid' {
+            Write-AppLog "Update refused: $error_"
+            Show-UpdateFailed 'The downloaded file is not a version of this app, so it was not used.' 'Nothing was changed. If this happens again, download the zip from the project page by hand.'
+        }
+        'unpack' {
+            Write-AppLog "Update could not be unpacked: $error_"
+            Show-UpdateFailed 'The new version was downloaded, but it could not be prepared.' "Nothing was changed. Close other windows that show this folder, then try again.`n$error_"
+        }
+        default {
+            Write-AppLog "Update download failed: $error_"
+            Show-UpdateFailed 'The new version could not be downloaded.' 'Nothing was changed. Please check your internet connection and try again.'
+        }
+    }
+}
+$updTimer.Add_Tick({ try { Update-UpdateJob } catch { $updTimer.Stop(); Write-AppLog $_.Exception.ToString(); Close-UpdateJob; Show-UpdateFailed 'The update hit a problem, so nothing was changed.' $_.Exception.Message } })
+
+function Start-UpdateCheck {
+    if (-not (Test-UpdateAllowed) -or $InstallProblem) { return }
+    try { $State.UpdateJob = Start-UpdateWorker 'check' ''; $updTimer.Start() } catch { Write-AppLog $_.Exception.ToString() }
+}
+
+# --- The update itself
+function Show-UpdateScreen([string]$title, [string]$status, [string]$detail) {
+    $U.updTitle.Text = $title
+    $U.updStatus.Text = $status
+    $U.updStatus.ForeColor = $C.Ink
+    $U.updDetail.Text = $detail
+    $U.updList.Text = ''
+    $U.updBar.Value = 0
+    $U.updBar.Visible = $true
+    $U.updCard.Height = S 170
+    $U.updCancel.Visible = $false; $U.updRetry.Visible = $false; $U.updBack.Visible = $false; $U.updDone.Visible = $false
+    Show-Screen 'update'
+}
+
+function Start-UpdateDownload {
+    if (-not $State.Newest) { return }
+    Close-UpdateJob
+    Show-UpdateScreen 'Updating the app' 'Downloading the newest version' 'Only the app''s own files are replaced. Your games, saves, quick saves and the build tools stay where they are.'
+    $U.updCancel.Visible = $true
+    try {
+        $State.UpdateJob = Start-UpdateWorker 'download' $State.Newest
+        $updTimer.Start()
+    } catch {
+        Write-AppLog $_.Exception.ToString()
+        Show-UpdateFailed 'The update could not be started, so nothing was changed.' $_.Exception.Message
+    }
+}
+
+function Show-UpdateFailed([string]$message, [string]$detail) {
+    $updTimer.Stop()
+    Show-UpdateScreen 'The update stopped' $message $detail
+    $U.updStatus.ForeColor = $C.Danger
+    $U.updBar.Visible = $false
+    $U.updRetry.Visible = $true; $U.updBack.Visible = $true
+}
+
+# The new files are in place: start the app again, so the new code runs, and close this window. The mutex goes first, so the
+# new window is not turned away as "already open".
+function Restart-App {
+    $State.Restarting = $true
+    try { $Mutex.ReleaseMutex(); $Mutex.Dispose() } catch { }
+    $psi = New-Object Diagnostics.ProcessStartInfo
+    $psi.FileName = Join-Path $env:SystemRoot 'System32\cmd.exe'
+    $psi.Arguments = '/c ""' + (Join-Path $Root 'Start.cmd') + '""'
+    $psi.WorkingDirectory = $Root
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    [void][Diagnostics.Process]::Start($psi)
+    $form.Close()
+}
+
+$U.noteButton.Add_Click({
+    if ($U.noteMode -eq 'update') { Start-UpdateDownload }
+    elseif ($U.noteMode -eq 'rebuild') { Start-RebuildAll }
+})
+$U.noteLater.Add_Click({
+    $answer = [Windows.Forms.MessageBox]::Show('Your games keep working as they are; only the new fixes are missing in them. Skip building them again?', $AppTitle, 'YesNo', 'Question')
+    if ($answer -eq 'Yes') { Set-PendingRebuild @(); Update-Banner }
+})
+$U.updCancel.Add_Click({ Close-UpdateJob; $updTimer.Stop(); Show-Screen 'welcome' })
+$U.updRetry.Add_Click({ if ($State.Newest) { Start-UpdateDownload } else { Show-Screen 'welcome' } })
+$U.updBack.Add_Click({ Show-Screen 'welcome' })
+$U.updDone.Add_Click({ Show-Screen 'welcome' })
+
+# --- Build my games again: every game, one after the other, with the usual build screen. The same as Make it faster for each
+# game (port.sh --no-explore keeps its extras, recorded vector programs and saves), and the translator tools are prepared once
+# first, because the new version may have changed them. rebuild.txt is shortened after each game, so a stopped run goes on
+# with the rest.
+function Start-RebuildAll {
+    $names = @(Get-PendingRebuild)
+    if ($names.Count -eq 0) { Set-PendingRebuild @(); Show-Screen 'welcome'; return }
+    $open = @($names | Where-Object { Test-GameRunning (Join-Path $Root "build\native-$_\ps2run.exe") })
+    if ($open.Count -gt 0) {
+        [void][Windows.Forms.MessageBox]::Show("A game is still open: $($open -join ', ').`nClose its window first, then press the button again.", $AppTitle, 'OK', 'Information')
+        return
+    }
+    $State.Batch = @{ Queue = (New-Object 'Collections.Generic.List[string]'); Total = $names.Count; Count = 0; First = $true; Results = (New-Object 'Collections.Generic.List[object]') }
+    foreach ($n in $names) { $State.Batch.Queue.Add($n) }
+    Start-NextRebuild
+}
+
+function Start-NextRebuild {
+    $batch = $State.Batch
+    while ($batch.Queue.Count -gt 0) {
+        $name = $batch.Queue[0]
+        $batch.Queue.RemoveAt(0)
+        $batch.Count++
+        $plan = Get-FasterPlan $name
+        if ($plan.ContainsKey('Error')) {
+            $batch.Results.Add(@{ Name = $name; Status = 'skipped'; Text = $plan.Error })
+            Set-PendingRebuild @(Get-PendingRebuild | Where-Object { $_ -ne $name })
+            continue
+        }
+        $info = @{ Index = $batch.Count; Total = $batch.Total; First = $batch.First }
+        $batch.First = $false
+        Start-Build $name $plan.Image $true $plan.Patch $info
+        return
+    }
+    Show-RebuildResult
+}
+
+function Complete-Rebuild($b, [string]$status, [string]$text) {
+    $batch = $State.Batch
+    $batch.Results.Add(@{ Name = $b.Name; Status = $status; Text = $text })
+    Set-PendingRebuild @(Get-PendingRebuild | Where-Object { $_ -ne $b.Name })
+    $State.Build = $null
+    Start-NextRebuild
+}
+
+function Show-RebuildResult {
+    $batch = $State.Batch
+    $State.Batch = $null
+    $results = $batch.Results.ToArray()   # not @(...): PowerShell 5.1 cannot turn a List of hashtables into an array that way
+    $ok = @($results | Where-Object { $_.Status -eq 'done' }).Count
+    $bad = $results.Count - $ok
+    $title = if ($bad -eq 0) { 'Your games are up to date' } else { 'Your games were built again' }
+    $status = if ($ok -eq 1) { '1 game was built again.' } else { "$ok games were built again." }
+    $detail = if ($bad -eq 0) { 'Play opens each game as before. Its saves, quick saves and extras are still there.' } else { 'Some games were left as they were. You can see why below. They still work as before.' }
+    Show-UpdateScreen $title $status $detail
+    $U.updBar.Visible = $false
+    $U.updCard.Height = S 130
+    $U.updList.Top = $U.updCard.Bottom + (S 16)
+    $lines = New-Object 'Collections.Generic.List[string]'
+    foreach ($r in $results | Select-Object -First 8) {
+        $one = ([string]$r.Text -replace '\s+', ' ').Trim()
+        if ($one.Length -gt 150) { $one = $one.Substring(0, 147) + '...' }
+        $word = switch ($r.Status) { 'done' { 'built again' } 'skipped' { 'skipped' } default { 'did not build' } }
+        $lines.Add($(if ($one) { "$($r.Name): $word. $one" } else { "$($r.Name): $word." }))
+    }
+    if ($results.Count -gt 8) { $lines.Add("... and $($results.Count - 8) more.") }
+    $U.updList.Text = ($lines -join "`n")
+    $U.updDone.Visible = $true
+    try { [Media.SystemSounds]::Asterisk.Play() } catch { }
 }
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -2018,6 +2611,7 @@ $U.close.Add_Click({ $form.Close() })
 $form.Add_FormClosing({
     param($sender, $e)
     if ($State.Patch.Run) { Stop-PatchRun }
+    if ($State.UpdateJob -and $State.UpdateJob.Mode -eq 'download' -and -not $State.Restarting) { Close-UpdateJob }
     if ($State.Build -and $State.Build.Child) {
         $answer = [Windows.Forms.MessageBox]::Show('A build is still running. Stop it and close the app?', $AppTitle, 'YesNo', 'Question')
         if ($answer -ne 'Yes') { $e.Cancel = $true; return }
@@ -2037,8 +2631,13 @@ $form.Add_Shown({ $form.Activate() })
 # The game window was in front while it recorded vector programs: look again when this window comes back.
 $form.Add_Activated({ try { Update-FasterOffers } catch { Write-AppLog $_.Exception.ToString() } })
 
+# Leftovers of an update that was stopped half way (nothing of them is used), then the quiet look for a newer version.
+foreach ($leftover in 'new', 'old') { try { Remove-Item -LiteralPath (Join-Path $UpdateDir $leftover) -Recurse -Force -ErrorAction Stop } catch { } }
+try { Get-ChildItem -LiteralPath $UpdateDir -File -ErrorAction Stop | Where-Object { $_.Name -like 'download*' } | Remove-Item -Force } catch { }
+Start-UpdateCheck
 Show-Screen 'welcome'
 [void]$form.ShowDialog()
+Close-UpdateJob
 $timer.Dispose()
 
 }
