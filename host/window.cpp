@@ -82,6 +82,16 @@ std::uint64_t g_last = 0;
 std::vector<std::uint32_t> g_pixels;
 bool g_gpu_present = false;
 
+// Where the window thread is in its own loop ("asking the system for events", "drawing") and since when. Always on: two stores per
+// step. The Linux watchdog prints it when no frame comes, so a window thread that is stuck in one call names the call (docs/linux.md,
+// "The window freeze").
+std::atomic<const char *> g_window_stage{nullptr};
+std::atomic<std::int64_t> g_window_stage_since_ns{0};
+void window_stage(const char *name) {
+    g_window_stage_since_ns.store(ps2::hitch::now_ns(), std::memory_order_relaxed);
+    g_window_stage.store(name, std::memory_order_release);
+}
+
 // --- keyboard and mouse (host/keymap.cpp, docs/keys.md) ---
 //
 // Which key works which button comes from keys.ini (written with the defaults on the first start, read again when the window
@@ -453,46 +463,123 @@ void edit_keys_file() {
 }
 #endif
 
-// F1: the key card. A message box of the system; while it is open the window thread does not run, so the game holds (the picture
-// stands, the sound goes quiet) and goes on where it was when the box closes. The buttons are the quick save and the quick load,
+// F1 (or the help key, H by default): the key card. A message box of the system. The buttons are the quick save and the quick load,
 // for laptops where F5 and F8 need the Fn key.
-void show_key_card() {
-    reload_keys_if_changed();
-    std::string text = keymap::card_text(g_keys);
-    if (!g_keys_path.empty()) text += "\nTo change keys, edit this file (the game reads it again when you come back):\n" + g_keys_path + "\n";
-    enum { kClose, kSave, kLoad, kEdit };
-    SDL_MessageBoxButtonData buttons[] = {
-        {SDL_MESSAGEBOX_BUTTON_RETURNKEY_DEFAULT | SDL_MESSAGEBOX_BUTTON_ESCAPEKEY_DEFAULT, kClose, "Close"},
-        {0, kSave, "Quick save (F5)"},
-        {0, kLoad, "Quick load (F8)"},
+//
+// Windows and macOS: the box blocks the window thread while it is open (Windows keeps answering the window's messages inside the box;
+// the game holds: the picture stands, the sound goes quiet, and it goes on where it was when the box closes).
+//
+// Everywhere else (Linux, the BSDs): the box runs on a thread of its own and the game keeps running behind it. SDL's box there is a
+// separate program (zenity) or a window of the compositor, and the window thread must never wait for it: a box that is hidden by the
+// compositor, opened on another workspace, or simply not noticed stopped the whole game for as long as it stood (the window thread
+// answers the compositor, draws the pictures and takes the emulation's frames; GTA III froze 14 s that way on 2026-10-29,
+// docs/linux.md "The window freeze"). The answer is taken in poll(), on the window thread.
+#if !defined(_WIN32) && !defined(__APPLE__)
+#define PS2_KEY_CARD_ON_A_THREAD 1
+#endif
+
+enum KeyCardChoice { kCardClose, kCardSave, kCardLoad, kCardEdit };
+
+struct KeyCard {
+    std::string text;
+    std::atomic<int> state{0};  // 0 no box, 1 the box is open (its thread is in SDL_ShowMessageBox), 2 closed, the answer waits in poll()
+    std::atomic<int> chosen{kCardClose};
+    std::atomic<bool> failed{false};
+    ps2::hitch::Clock::time_point opened{};
+};
+// never destroyed: a box that is still open when the program ends must not meet a destroyed object
+KeyCard &g_card = *new KeyCard;
+Uint32 g_focus_gained_ticks = 0;  // when the window last got the keyboard focus, for the log line when the card opens
+
+// what happens after the box: the cursor back, the mouse mode again, the button that was chosen
+void key_card_answer(int chosen) {
+    SDL_ShowCursor(SDL_DISABLE);
+    apply_mouse_mode();
+    if (chosen == kCardSave) ps2::quick_request(ps2::QuickKey::save);
+    else if (chosen == kCardLoad) ps2::quick_request(ps2::QuickKey::load);
 #ifdef _WIN32
-        {0, kEdit, "Edit keys.ini"},
+    else if (chosen == kCardEdit) edit_keys_file();
+#endif
+}
+
+// the window thread, once per pass of poll(): the box on its thread has closed
+void take_key_card_answer() {
+#ifdef PS2_KEY_CARD_ON_A_THREAD
+    if (g_card.state.load(std::memory_order_acquire) != 2) return;
+    const double seconds = ps2::hitch::ms_since(g_card.opened) / 1000.0;
+    if (!g_card.failed.load()) std::fprintf(stderr, "[keys] the key card was closed after %.1f s (the game ran on behind it)\n", seconds);
+    const int chosen = g_card.chosen.load();
+    g_card.state.store(0, std::memory_order_release);
+    key_card_answer(chosen);
+#endif
+}
+
+// why: the name of the key that opened it, for the log (how a card opens that nobody meant to open is the question this answers)
+void show_key_card(const char *why) {
+#ifdef PS2_KEY_CARD_ON_A_THREAD
+    if (g_card.state.load(std::memory_order_acquire) != 0) return;  // one box at a time
+#endif
+    reload_keys_if_changed();
+    g_card.text = keymap::card_text(g_keys);
+    if (!g_keys_path.empty()) g_card.text += "\nTo change keys, edit this file (the game reads it again when you come back):\n" + g_keys_path + "\n";
+    if (g_notice_text == "F1 = keys") {
+        g_notice_text.clear();
+        refresh_title();
+    }
+    const Uint32 since_focus = SDL_GetTicks() - g_focus_gained_ticks;
+    std::fprintf(stderr, "[keys] the key card opens (%s; the window got the keyboard focus %s)\n", why,
+                 g_focus_gained_ticks && since_focus < 3000 ? (std::to_string(since_focus) + " ms before").c_str() : "more than 3 s before or never");
+    SDL_SetRelativeMouseMode(SDL_FALSE);  // the box needs the pointer
+    SDL_ShowCursor(SDL_ENABLE);
+    g_card.opened = ps2::hitch::Clock::now();
+#ifdef PS2_KEY_CARD_ON_A_THREAD
+    g_card.failed.store(false);
+    g_card.chosen.store(kCardClose);
+    g_card.state.store(1, std::memory_order_release);
+    std::thread([] {
+        SDL_MessageBoxButtonData buttons[] = {
+            {SDL_MESSAGEBOX_BUTTON_RETURNKEY_DEFAULT | SDL_MESSAGEBOX_BUTTON_ESCAPEKEY_DEFAULT, kCardClose, "Close"},
+            {0, kCardSave, "Quick save (F5)"},
+            {0, kCardLoad, "Quick load (F8)"},
+        };
+        SDL_MessageBoxData box{};
+        box.flags = SDL_MESSAGEBOX_INFORMATION;
+        box.window = nullptr;  // the box is not tied to the game window, whose thread is not the one that waits for it
+        box.title = "Keys (F1)";
+        box.message = g_card.text.c_str();
+        box.numbuttons = static_cast<int>(std::size(buttons));
+        box.buttons = buttons;
+        int chosen = kCardClose;
+        if (SDL_ShowMessageBox(&box, &chosen) != 0) {
+            std::fprintf(stderr, "[keys] cannot show the key card: %s\n", SDL_GetError());
+            g_card.failed.store(true);
+            chosen = kCardClose;
+        }
+        g_card.chosen.store(chosen);
+        g_card.state.store(2, std::memory_order_release);
+    }).detach();
+#else
+    SDL_MessageBoxButtonData buttons[] = {
+        {SDL_MESSAGEBOX_BUTTON_RETURNKEY_DEFAULT | SDL_MESSAGEBOX_BUTTON_ESCAPEKEY_DEFAULT, kCardClose, "Close"},
+        {0, kCardSave, "Quick save (F5)"},
+        {0, kCardLoad, "Quick load (F8)"},
+#ifdef _WIN32
+        {0, kCardEdit, "Edit keys.ini"},
 #endif
     };
     SDL_MessageBoxData box{};
     box.flags = SDL_MESSAGEBOX_INFORMATION;
     box.window = g_window;
     box.title = "Keys (F1)";
-    box.message = text.c_str();
+    box.message = g_card.text.c_str();
     box.numbuttons = static_cast<int>(std::size(buttons));
     box.buttons = buttons;
-    if (g_notice_text == "F1 = keys") {
-        g_notice_text.clear();
-        refresh_title();
-    }
-    SDL_SetRelativeMouseMode(SDL_FALSE);  // the box needs the pointer
-    SDL_ShowCursor(SDL_ENABLE);
-    int chosen = kClose;
+    int chosen = kCardClose;
     if (SDL_ShowMessageBox(&box, &chosen) != 0) {
         std::fprintf(stderr, "[keys] cannot show the key card: %s\n", SDL_GetError());
-        chosen = kClose;
+        chosen = kCardClose;
     }
-    SDL_ShowCursor(SDL_DISABLE);
-    apply_mouse_mode();
-    if (chosen == kSave) ps2::quick_request(ps2::QuickKey::save);
-    else if (chosen == kLoad) ps2::quick_request(ps2::QuickKey::load);
-#ifdef _WIN32
-    else if (chosen == kEdit) edit_keys_file();
+    key_card_answer(chosen);
 #endif
 }
 
@@ -686,6 +773,7 @@ void show_notice() {
 // PS2_HITCH_LOG=<ms>: SDL_PollEvent also pumps the system's messages and looks for controllers; say when it, or the handling of
 // one event, took long (docs/hitches.md).
 bool timed_poll_event(SDL_Event &e) {
+    window_stage("asking the system for window events (SDL_PollEvent)");
     if (!ps2::hitch::on()) return SDL_PollEvent(&e) != 0;
     const auto t0 = ps2::hitch::Clock::now();
     const bool got = SDL_PollEvent(&e) != 0;
@@ -706,10 +794,13 @@ struct EventTimer {
 };
 
 void poll() {
+    window_stage("window thread: starting a pass of poll()");
     if (!g_script.empty()) play_pad_script();
     ps2::quick_watchdog();
+    take_key_card_answer();
     SDL_Event e;
     while (timed_poll_event(e)) {
+        window_stage("handling a window event");
         const EventTimer event_timer{e.type};
         if (e.type == SDL_QUIT) {
             ps2::flush_memory_card();  // right away: a save made a moment ago must not wait for the emulation to wind down
@@ -723,7 +814,7 @@ void poll() {
         if (e.type == SDL_KEYDOWN && !e.key.repeat) {
             const std::vector<int> &help = g_keys.inputs[keymap::Help];
             if (e.key.keysym.scancode == SDL_SCANCODE_F1 || std::find(help.begin(), help.end(), static_cast<int>(e.key.keysym.scancode)) != help.end())
-                show_key_card();
+                show_key_card((std::string("key ") + SDL_GetScancodeName(e.key.keysym.scancode) + " went down").c_str());
             if (e.key.keysym.scancode == SDL_SCANCODE_F2) cycle_look();
             if (e.key.keysym.scancode == SDL_SCANCODE_F5) ps2::quick_request(ps2::QuickKey::save);
             else if (e.key.keysym.scancode == SDL_SCANCODE_F8) ps2::quick_request(ps2::QuickKey::load);
@@ -735,7 +826,10 @@ void poll() {
             ps2::resize_window(static_cast<std::uint32_t>(w), static_cast<std::uint32_t>(h));
         }
         if (e.type == SDL_WINDOWEVENT && (e.window.event == SDL_WINDOWEVENT_FOCUS_GAINED || e.window.event == SDL_WINDOWEVENT_FOCUS_LOST)) {
-            if (e.window.event == SDL_WINDOWEVENT_FOCUS_GAINED) reload_keys_if_changed();
+            if (e.window.event == SDL_WINDOWEVENT_FOCUS_GAINED) {
+                g_focus_gained_ticks = SDL_GetTicks();
+                reload_keys_if_changed();
+            }
             apply_mouse_mode();
         }
         if (e.type == SDL_MOUSEMOTION && g_keys.mouse_stick) {
@@ -752,6 +846,7 @@ void poll() {
             std::fprintf(stderr, "[pad] %s is not used: SDL knows no button layout for it (docs/sound-pad.md: gamecontrollerdb.txt)\n",
                          or_unknown(SDL_JoystickNameForIndex(e.jdevice.which)));
     }
+    window_stage("reading the controllers");
     const auto after_events = ps2::hitch::on() ? ps2::hitch::Clock::now() : ps2::hitch::Clock::time_point{};
     poll_port(0);
     poll_port(1);
@@ -1246,6 +1341,11 @@ void report_threads(std::uint64_t frame, int stalled_seconds) {
                          static_cast<double>(ps2::hitch::now_ns() - stage.since_ns.load(std::memory_order_relaxed)) / 1e9);
         else
             std::fprintf(stderr, "[watchdog] the window thread is not in the hand-over of a picture to the screen\n");
+        const char *loop = g_window_stage.load(std::memory_order_acquire);
+        if (loop)
+            std::fprintf(stderr, "[watchdog] the window thread's loop has been in \"%s\" for %.1f s\n", loop,
+                         static_cast<double>(ps2::hitch::now_ns() - g_window_stage_since_ns.load(std::memory_order_relaxed)) / 1e9);
+        if (g_card.state.load() == 1) std::fprintf(stderr, "[watchdog] the key card is open (its box runs on a thread of its own)\n");
     }
     std::fflush(stderr);
     const pid_t self = getpid();
@@ -1349,21 +1449,28 @@ int run_window(const std::function<int()> &emulate) {
         } else {
             poll();
         }
+        window_stage("drawing the pictures of the emulation (render_pending)");
         if (!g_waits.on) {
-            if (ps2::render_pending(g_gpu_present, g_gpu_present ? none : copy, show_speed, 8.0) == ps2::Rendered::idle) ps2::wait_render_work(4);
+            if (ps2::render_pending(g_gpu_present, g_gpu_present ? none : copy, show_speed, 8.0) == ps2::Rendered::idle) {
+                window_stage("waiting for the emulation to post work (wait_render_work)");
+                ps2::wait_render_work(4);
+            }
             continue;
         }
         const auto t0 = WaitLog::Clock::now();
         const bool idle = ps2::render_pending(g_gpu_present, g_gpu_present ? none : copy, show_speed, 8.0) == ps2::Rendered::idle;
         const auto t1 = WaitLog::Clock::now();
-        if (idle) ps2::wait_render_work(4);
+        if (idle) {
+            window_stage("waiting for the emulation to post work (wait_render_work)");
+            ps2::wait_render_work(4);
+        }
         g_waits.working.store(g_waits.working.load() + std::chrono::duration<double, std::milli>(t1 - t0).count());
         if (idle) g_waits.idle.store(g_waits.idle.load() + WaitLog::ms(t1));
     }
     emulation.join();
     ps2::flush_memory_card();
     finish_audio();
-    SDL_Quit();
+    if (g_card.state.load() == 0) SDL_Quit();  // a key card still open is on a thread inside SDL: the program ends without taking SDL down under it
     if (ps2::g_options.on_exit) ps2::g_options.on_exit();  // the host's log copy hands over the last lines before the process ends
     std::fflush(nullptr);
     std::_Exit(result);
