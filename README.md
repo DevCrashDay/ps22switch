@@ -44,6 +44,7 @@ Tried with real discs (mine are US releases), as far as each was played (no know
 | The King of Fighters XI | plays well, not played through yet: works perfectly | TsimpleD (Reddit) |
 | God Hand | plays well, not played through yet: as far as the casino hub, no problems so far | theraineydaze (Reddit) |
 | Tekken 4 | plays well, not played through yet: fights in Story Battle at 60 fps, only a short stutter when a fight starts (Windows 11, a Radeon RX 6800 XT, keyboard and mouse; [#8](https://github.com/exoteric33/ps2-native-recomp/issues/8)) | DevCrashDay |
+| Armored Trooper VOTOMS (Japan) | plays well, not played through yet: the tutorial and the first mission at about 60 fps, and saves work; it slowed down once, the first time a new part loaded (Windows 11, a laptop with Intel graphics, a game controller; [#5](https://github.com/exoteric33/ps2-native-recomp/issues/5)) | omegakatana92 |
 
 54 of the 55 programs of the free [ps2autotests](https://github.com/unknownbrackets/ps2autotests) suite print exactly
 what the console prints (`python scripts/autotests.py`).
