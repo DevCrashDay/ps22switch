@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <ctime>
 #include <map>
 #include <memory>
@@ -32,6 +33,23 @@ struct CdState {
     std::uint32_t error = 0;
     std::vector<int> sync_waiters;
 } g_cd;
+
+// The disc stream of the IOP library (sceCdSt*). A game's own IOP module (Robotech: Battlecry's vcIOPFile) streams music and
+// files with it: sceCdStInit, sceCdStStart at a sector, then sceCdStRead into its own buffer. Here the stream is virtual: a
+// read takes the next sectors straight from the disc, and the "ring buffer" always counts as full.
+struct StreamState {
+    std::uint32_t buffer_sectors = 0;  // sceCdStInit: the ring buffer's size
+    std::uint32_t bank_sectors = 0;
+    std::uint32_t buffer_address = 0;
+    std::uint32_t position = 0;        // the next sector sceCdStRead delivers
+    bool active = false;
+} g_st;
+
+// PS2_TRACE_CD=1 prints every stream call (sceCdSt*) of the IOP.
+bool trace_cd() {
+    static const bool on = std::getenv("PS2_TRACE_CD") != nullptr;
+    return on;
+}
 
 std::uint8_t bcd(int v) { return static_cast<std::uint8_t>(((v / 10) << 4) | (v % 10)); }
 
@@ -76,6 +94,7 @@ bool start_read(std::uint32_t lsn, std::uint32_t sectors, std::uint32_t buffer, 
 
 void install_cdvd() {
     g_cd = CdState{};
+    g_st = StreamState{};
     register_job(kJobCdRead, [](const Job &j) {
         if (!disc::ready(j.a, j.b)) {
             schedule(now() + usec_to_cycles(1000), j);
@@ -140,6 +159,49 @@ void install_cdvd() {
     def("cdvdman", 37, "sceCdCallback", [](Cpu &c) { c.r[2] = g_cd.callback; g_cd.callback = arg(c, 0); });
     def("cdvdman", 38, "sceCdPause", [](Cpu &c) { c.r[2] = 1; });
     def("cdvdman", 39, "sceCdBreak", [](Cpu &c) { c.r[2] = 1; });
+    // The stream functions, numbered in the alphabetical order of the library's export table (Init, Read, Seek, Start, Stat, Stop).
+    def("cdvdman", 56, "sceCdStInit", [](Cpu &c) {
+        g_st = StreamState{};
+        if (trace_cd()) std::fprintf(stderr, "[cd] StInit buffer %u bank %u at 0x%08X\n", arg(c, 0), arg(c, 1), arg(c, 2));
+        g_st.buffer_sectors = arg(c, 0);
+        g_st.bank_sectors = arg(c, 1);
+        g_st.buffer_address = arg(c, 2);
+        c.r[2] = 1;
+    });
+    def("cdvdman", 57, "sceCdStRead", [](Cpu &c) {
+        // (sectors, destination in IOP memory, mode 0 = wait / 1 = do not wait, error out): returns the sectors delivered
+        const std::uint32_t sectors = arg(c, 0), dst = arg(c, 1), error = arg(c, 3);
+        if (trace_cd()) std::fprintf(stderr, "[cd] StRead %u sectors from %u to 0x%08X mode %u\n", sectors, g_st.position, dst, arg(c, 2));
+        if (error) write32(error, 0);
+        if (!g_st.active || sectors == 0 || (dst & 0x1FFFFFFFu) >= kRamSize) { c.r[2] = 0; return; }
+        std::vector<std::uint8_t> data(static_cast<std::size_t>(sectors) * disc::kSector);
+        disc::read(g_st.position, sectors, data.data());
+        for (std::size_t i = 0; i < data.size(); ++i) write8(dst + static_cast<std::uint32_t>(i), data[i]);
+        g_st.position += sectors;
+        c.r[2] = sectors;
+    });
+    def("cdvdman", 58, "sceCdStSeek", [](Cpu &c) {
+        if (trace_cd()) std::fprintf(stderr, "[cd] StSeek %u (was at %u)\n", arg(c, 0), g_st.position);
+        g_st.position = arg(c, 0);
+        disc::ready(g_st.position, g_st.buffer_sectors ? g_st.buffer_sectors : 16u);
+        c.r[2] = 1;
+    });
+    def("cdvdman", 59, "sceCdStStart", [](Cpu &c) {
+        if (trace_cd()) std::fprintf(stderr, "[cd] StStart %u (was at %u)\n", arg(c, 0), g_st.position);
+        g_st.position = arg(c, 0);
+        g_st.active = true;
+        disc::ready(g_st.position, g_st.buffer_sectors ? g_st.buffer_sectors : 16u);
+        c.r[2] = 1;
+    });
+    def("cdvdman", 60, "sceCdStStat", [](Cpu &c) {
+        c.r[2] = g_st.active ? g_st.buffer_sectors : 0u;
+        if (trace_cd()) std::fprintf(stderr, "[cd] StStat -> %u (position %u)\n", c.r[2], g_st.position);
+    });
+    def("cdvdman", 61, "sceCdStStop", [](Cpu &c) {
+        if (trace_cd()) std::fprintf(stderr, "[cd] StStop at %u\n", g_st.position);
+        g_st.active = false;
+        c.r[2] = 1;
+    });
     def("cdvdman", 74, "sceCdPowerOff", [](Cpu &c) { c.r[2] = 1; });
     def("cdvdman", 75, "sceCdMmode", [](Cpu &c) { c.r[2] = 1; });
     def("cdvdman", 78, "sceCdPOffCallback", [](Cpu &c) { c.r[2] = 0; });
@@ -183,6 +245,7 @@ void cdvd_state(ps2::state::Stream &s) {
     s.pod(g_cd.callback);
     s.pod(g_cd.error);
     s.vec(g_cd.sync_waiters);
+    if (s.version() >= 6) s.pod(g_st);
 }
 
 }

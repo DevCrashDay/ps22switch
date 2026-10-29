@@ -6,6 +6,7 @@
 
 #include "ps2/os.hpp"
 #include "ps2/state.hpp"
+#include "ps2/system.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -126,6 +127,12 @@ void dump_input(const std::uint8_t *bytes, std::size_t n) {
     if (file) std::fwrite(bytes, 1, n, file);
 }
 
+// PS2_DUMP_IPU_BITS=file writes only the bytes the decoder commands used up, in order and once (not the raw macroblocks CSC takes
+// from the same FIFO, not data thrown away by BCLR): the film's own bit stream as the player fed it, so it can be parsed offline.
+bool g_csc_active = false;
+std::size_t g_dump_pos = 0;
+void dump_bits_to(std::size_t end);
+
 bool pull() {
     std::uint8_t q[16];
     if (!dmac::ipu_pull(q)) return false;
@@ -189,8 +196,20 @@ std::uint32_t peek_now() {
     return n ? bits_at(g_bit, n) << (32 - n) : 0u;
 }
 
+void dump_bits_to(std::size_t end) {
+    static std::FILE *file = [] {
+        const std::string name = os::env("PS2_DUMP_IPU_BITS");
+        return name.empty() ? nullptr : os::open(name, "wb");
+    }();
+    end = std::min(end, g_in.size());
+    if (file && end > g_dump_pos) std::fwrite(g_in.data() + g_dump_pos, 1, end - g_dump_pos, file);
+    g_dump_pos = std::max(g_dump_pos, end);
+}
+
 void commit() {
     const std::size_t drop = std::min(g_bit / 128 * 16, g_in.size() / 16 * 16);
+    if (!g_csc_active) dump_bits_to(drop);
+    g_dump_pos = g_dump_pos > drop ? g_dump_pos - drop : 0;
     g_in.erase(g_in.begin(), g_in.begin() + static_cast<std::ptrdiff_t>(drop));
     g_bit -= drop * 8;
 }
@@ -451,8 +470,10 @@ bool run_command() {
     const std::uint32_t cmd = g_command;
     switch (cmd >> 28) {
     case kBclr:
+        dump_bits_to((g_bit + 7) / 8);
         g_in.clear();
         g_bit = cmd & 0x7Fu;
+        g_dump_pos = g_bit / 8;
         return true;
     case kIdec:
         return run_idec();
@@ -494,6 +515,12 @@ bool run_command() {
         return ok;
     }
     case kFdec: {
+        // A player that ends a film looks for the sequence end code (00 00 01 B7) with FDEC, and waits for the IPU to be idle OR for
+        // ECD in IPU_CTRL (Robotech: Battlecry's film player does). When the end code is at the read position, or where this
+        // command's result will be taken from, ECD is set at once: the command itself may then wait for bits behind the end of the
+        // last film, which nothing sends (the stream ends with the code).
+        for (const std::size_t at : {g_bit, g_bit + (cmd & 0x3Fu)})
+            if (g_in.size() * 8 >= at + 32 && bits_at(at, 32) == 0x1B7u) g_ctrl |= kEcd;
         const bool ok = atomic([&] {
             skip(cmd & 0x3Fu);
             g_result = peek(32);
@@ -525,16 +552,24 @@ bool run_command() {
         return true;
     }
     case kCsc:
+        dump_bits_to((g_bit + 7) / 8);
+        g_csc_active = true;
         while (g_count) {
             std::uint8_t raw[384];
             const bool ok = atomic([&] {
                 for (std::uint8_t &v : raw) v = static_cast<std::uint8_t>(get(8));
                 convert(raw, (cmd >> 27) & 1u);
             });
-            if (!ok) return false;
+            if (!ok) {
+                g_csc_active = false;
+                g_dump_pos = (g_bit + 7) / 8;
+                return false;
+            }
             commit();
             --g_count;
         }
+        g_csc_active = false;
+        g_dump_pos = (g_bit + 7) / 8;
         return true;
     case kSetth:
         g_th0 = static_cast<std::uint16_t>(cmd & 0x1FFu);
@@ -563,7 +598,11 @@ void step() {
             g_starved = !run_command();
             if (!g_starved) g_decoding = false;
         } catch (const BadCode &) {
-            std::fprintf(stderr, "[ipu] bad code in command 0x%08X\n", g_command);
+            static int shown = 0;
+            if (shown++ < 8)
+                std::fprintf(stderr, "[ipu] bad code in command 0x%08X (frame %llu, bit %zu of %zu, next %08X %08X, picture type %u)\n", g_command,
+                             static_cast<unsigned long long>(ps2::frames_run()), g_bit, g_in.size() * 8, bits_at(g_bit, 32), bits_at(g_bit + 32, 32),
+                             picture_type());
             g_ctrl |= kEcd;
             g_decoding = false;
             g_busy = false;
