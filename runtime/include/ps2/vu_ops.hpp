@@ -6,6 +6,8 @@
 
 #if defined(__SSE2__)
 #include <emmintrin.h>
+#elif defined(__ARM_NEON)
+#include <arm_neon.h>
 #endif
 
 #include <algorithm>
@@ -571,7 +573,14 @@ PS2_VU_INLINE v4u vsel(v4u old, v4u now, v4u mask) { return (now & mask) | (old 
 // What the vector units do to every number they take in or give out: an exponent of 255 is an ordinary number that is cut
 // down to the largest float (0x7F7FFFFF), and a denormal becomes a zero with its sign.
 PS2_VU_INLINE v4u vfix_generic(v4u x) {
+#if defined(__ARM_NEON)
+    const v4u clamped = (v4u)vminq_u32((uint32x4_t)(x & 0x7FFFFFFFu), vdupq_n_u32(0x7F7FFFFF));
+#elif defined(__clang__)
     const v4i clamped = __builtin_elementwise_min((v4i)(x & 0x7FFFFFFFu), (v4i){0x7F7FFFFF, 0x7F7FFFFF, 0x7F7FFFFF, 0x7F7FFFFF});
+#else
+    v4u mag = x & 0x7FFFFFFFu, clamped;
+    for (int i = 0; i < 4; ++i) clamped[i] = mag[i] < 0x7F7FFFFFu ? mag[i] : 0x7F7FFFFFu;
+#endif
     const v4i normal = (v4f)clamped >= (v4f)(v4i){0x00800000, 0x00800000, 0x00800000, 0x00800000};
     return (x & 0x80000000u) | (v4u)(clamped & normal);
 }
@@ -645,7 +654,15 @@ PS2_VU_INLINE v4u vftoi(v4u x, int fraction) { return vftoi_generic(x, fraction)
 PS2_VU_INLINE v4u vitof(v4u x, int fraction) {
     const v4i v = (v4i)x;
     v4f f = __builtin_convertvector(v, v4f);
+#if defined(__ARM_NEON)
+    const v4i cond = (v4i)(x + 0x01000000u > 0x02000000u);
+    if (vmaxvq_u32((uint32x4_t)cond) != 0) {
+#elif defined(__clang__)
     if (__builtin_reduce_or((v4i)(x + 0x01000000u > 0x02000000u))) {
+#else
+    const v4i cond = (v4i)(x + 0x01000000u > 0x02000000u);
+    if (cond[0] || cond[1] || cond[2] || cond[3]) {
+#endif
         const v4i big = f >= 2147483648.0f;
         const v4i back = __builtin_convertvector((v4f)((v4i)f & ~big), v4i);
         const v4i over = big | ((v >= 0) & (back > v)) | ((v < 0) & (back < v));

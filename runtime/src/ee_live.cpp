@@ -1,6 +1,6 @@
 #include "ps2/ee_live.hpp"
 
-#ifdef __EMSCRIPTEN__
+#if defined(__EMSCRIPTEN__) || defined(__SWITCH__)
 
 // The browser build has no compiler to call: code the build does not know still stops the game there.
 namespace ps2::ee::live {

@@ -2,7 +2,7 @@
 
 #include "ps2/os.hpp"
 
-#ifdef __EMSCRIPTEN__
+#if defined(__EMSCRIPTEN__) || defined(__SWITCH__)
 
 // The browser build has its own compiler for vector programs (vu_jit_web.cpp): nothing to do here.
 namespace ps2::vu::live {

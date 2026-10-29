@@ -9,6 +9,7 @@
 /generated/
 /tools/
 /build/
+/build-switch/
 
 *.ppm
 *.wav

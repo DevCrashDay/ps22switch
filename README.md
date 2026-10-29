@@ -1,21 +1,69 @@
-# ps2-native-recomp
+# ps22switch: Recompiling PS2 Games for Nintendo Switch
 
-Turns the disc image of a PS2 game you own into a native program for Windows or Linux. **This project is at an early
-stage** and still changes a lot. God of War II has been played from start to end on Windows; a few more games run as far
-as they have been played.
+Turns the disc image of a PS2 game you own into a native, standalone homebrew executable (`.nro`) for the **Nintendo Switch (Switch 1)**, or into a native program for Windows / Linux.
 
-**Don't expect every game to work on the first try.** Only a few games have been tried so far, and each game uses the
-console a little differently, so many still stop at a black screen, crash, or play with missing sound or wrong pictures.
-When a game doesn't work, please send me a report (see [*Playtesters wanted*](#playtesters-wanted)): every report shows
-me what to fix next, and one fix often helps several games at once.
+Based on [ps2-native-recomp](https://github.com/exoteric33/ps2-native-recomp) and [ps2-web-recomp](https://github.com/snuri00/ps2-web-recomp) by Samir Nuri.
 
-The game's main-CPU code is translated once into C++ (static recompilation) and compiled into a normal program, so there is
-no emulator for the main CPU. The rest of the console (graphics chip, vector units, sound, disc, controller, memory card)
-is reimplemented by a runtime that draws with WebGPU (wgpu-native, on Vulkan or Direct3D 12).
+---
 
-This project builds on [ps2-web-recomp](https://github.com/snuri00/ps2-web-recomp) by Samir Nuri (MIT), which does the
-same on Linux, macOS and in the browser, and whose README explains how the recompiler and the runtime work. The recompiler
-and the runtime started as his. What I added:
+## How It Works on Nintendo Switch
+
+1. **CPU Static Recompilation (Emotion Engine MIPS R5900):**
+   The game's MIPS R5900 machine code is analyzed and statically translated once into portable modern C++20 units via `eerecomp`. These units are cross-compiled directly for the Nintendo Switch ARMv8-A Cortex-A57 64-bit CPU cores using `devkitA64` (`aarch64-none-elf-gcc`). There is **zero CPU emulation overhead** at runtime.
+
+2. **Vector Units (VU0 / VU1):**
+   VU0 and VU1 microcode is either statically translated or interpreted with ARM NEON vector instructions (`<arm_neon.h>`), providing accelerated 128-bit vector arithmetic on the Switch CPU.
+
+3. **Graphics Synthesizer (GS):**
+   Rendered through the built-in PS2 GS software rasterizer and presented onto the Switch display using hardware-accelerated SDL2 streaming textures (`SDL_PIXELFORMAT_ABGR8888`), running in native Switch docked (1080p) or handheld (720p) mode.
+
+4. **Audio (SPU2):**
+   The PS2 SPU2 synthesizer streams 48,000 Hz stereo audio with dynamic time stretching directly into the Nintendo Switch SDL2 audio driver.
+
+5. **Controls:**
+   Native support for Joy-Cons and Nintendo Switch Pro Controllers through the libnx SDL2 GameController API.
+
+---
+
+## Quick Start for Nintendo Switch
+
+### Prerequisites
+- Windows 10/11 with WSL2 (installed automatically or `wsl --install`)
+- Official `devkitpro/devkita64` toolchain (installed in WSL)
+- Python 3
+
+### Building with One Command
+1. Place your PS2 game ISO (e.g. `Tekken 4 (USA).iso`) in the project directory.
+2. Run `Switch_Build.cmd` or invoke `scripts/switch_port.py`:
+   ```cmd
+   Switch_Build.cmd "Tekken 4 (USA).iso"
+   ```
+   Or via Python:
+   ```cmd
+   python scripts/switch_port.py "Tekken 4 (USA).iso" --title "Tekken 4"
+   ```
+3. The build pipeline automatically:
+   - Extracts `SYSTEM.CNF` and the game executable from the ISO.
+   - Translates all MIPS R5900 code to C++ units.
+   - Cross-compiles `ps2runtime` and game code for AArch64 Switch.
+   - Packages the `.nro` binary with NACP title and metadata.
+   - Creates a ready-to-use SD card directory under `build/switch/<GameName>/package/`.
+
+### Installing to your Switch
+Copy the `switch` folder from `build/switch/<GameName>/package/` to the root of your Switch SD card:
+```
+sdmc:/
+  └── switch/
+      └── ps22switch/
+          └── <GameName>/
+              ├── <GameName>.nro
+              ├── disc/
+              ├── app.json
+              └── keys.ini
+```
+Launch the game from the **Homebrew Menu (hbmenu)** on your Nintendo Switch or load the `.nro` in Ryujinx / Yuzu!
+
+---
 
 - **Windows:** the recompiler, the runtime and the game build with llvm-mingw and draw through Direct3D 12 or Vulkan.
 - **Faster drawing:** the graphics chip's drawing program does about a fifth less work per frame, with the same pictures

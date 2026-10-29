@@ -44,6 +44,9 @@
 #ifdef PS2_WINDOW
 #include <fcntl.h>
 #endif
+#ifdef __SWITCH__
+#include <switch.h>
+#endif
 #endif
 
 void register_generated_code();
@@ -152,6 +155,8 @@ public:
         if (_dup2(fds[1], err_fd_) != 0) return false;
         _setmode(err_fd_, _O_BINARY);
         SetStdHandle(STD_ERROR_HANDLE, reinterpret_cast<HANDLE>(_get_osfhandle(err_fd_)));  // code that writes to the handle (wgpu-native) too
+#elif defined(__SWITCH__)
+        return false;
 #else
         if (pipe(fds) != 0) return false;
         saved_ = dup(2);
@@ -185,7 +190,7 @@ public:
         _setmode(err_fd_, _O_BINARY);
         SetStdHandle(STD_ERROR_HANDLE, reinterpret_cast<HANDLE>(_get_osfhandle(err_fd_)));
         _close(write_fd_);
-#else
+#elif !defined(__SWITCH__)
         dup2(saved_, 2);
         close(write_fd_);
 #endif
@@ -193,7 +198,7 @@ public:
 #ifdef _WIN32
         _close(read_fd_);
         _close(saved_);
-#else
+#elif !defined(__SWITCH__)
         close(read_fd_);
         close(saved_);
 #endif
@@ -326,7 +331,7 @@ LONG WINAPI on_crash(EXCEPTION_POINTERS *info) {
 }
 #endif
 
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__SWITCH__)
 // The same for Linux. A run that ended without its closing lines ("[ee] stopped after ..." and the audio summary) used to leave no trace
 // of why: a crash (SIGSEGV), an abort (a failed allocation or an exception nobody caught: SIGABRT) and the terminal closing (SIGHUP) each
 // ended the process at once, and a core dump says nothing in the log. This writes one line and the stack of the thread that got the
@@ -366,6 +371,8 @@ void install_signal_handlers() {
     for (const int sig : {SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT, SIGHUP}) std::signal(sig, on_fatal_signal);
     std::signal(SIGPIPE, SIG_IGN);  // a log pipe whose reader went away makes a write fail instead of ending the run without a word
 }
+#elif defined(__SWITCH__)
+void install_signal_handlers() {}
 #endif
 
 // A name for the calling thread that Windows tools show (Process Explorer, a debugger, a profiler), so the CPU time of the
@@ -424,7 +431,76 @@ static int run_threads_headless(const std::function<int()> &emulate) {
     std::_Exit(result);
 }
 
+#ifdef __SWITCH__
+bool find_switch_target(std::string &elf_path, std::string &disc_path) {
+    std::error_code ec;
+    const std::vector<std::string> search_dirs = {"romfs:/", "./", "disc/", "games/Tekken-4/", "games/Tekken-4/disc/"};
+    for (const auto &dir : search_dirs) {
+        std::string json_path = dir + "app.json";
+        if (std::filesystem::exists(json_path, ec)) {
+            if (std::FILE *f = std::fopen(json_path.c_str(), "rb")) {
+                std::fseek(f, 0, SEEK_END);
+                long sz = std::ftell(f);
+                std::fseek(f, 0, SEEK_SET);
+                std::string content(sz, '\0');
+                if (std::fread(content.data(), 1, sz, f) == static_cast<std::size_t>(sz)) {
+                    auto pos = content.find("\"elf\"");
+                    if (pos != std::string::npos) {
+                        auto q1 = content.find('"', pos + 5);
+                        auto q2 = q1 != std::string::npos ? content.find('"', q1 + 1) : std::string::npos;
+                        if (q1 != std::string::npos && q2 != std::string::npos) {
+                            elf_path = content.substr(q1 + 1, q2 - q1 - 1);
+                            std::replace(elf_path.begin(), elf_path.end(), '\\', '/');
+                        }
+                    }
+                    pos = content.find("\"iso\"");
+                    if (pos != std::string::npos) {
+                        auto q1 = content.find('"', pos + 5);
+                        auto q2 = q1 != std::string::npos ? content.find('"', q1 + 1) : std::string::npos;
+                        if (q1 != std::string::npos && q2 != std::string::npos) {
+                            disc_path = content.substr(q1 + 1, q2 - q1 - 1);
+                            std::replace(disc_path.begin(), disc_path.end(), '\\', '/');
+                        }
+                    }
+                }
+                std::fclose(f);
+                if (!elf_path.empty()) return true;
+            }
+        }
+    }
+    for (const auto &dir : search_dirs) {
+        if (!std::filesystem::is_directory(dir, ec)) continue;
+        for (const auto &entry : std::filesystem::directory_iterator(dir, ec)) {
+            std::string name = entry.path().filename().string();
+            if (name.rfind("SLUS_", 0) == 0 || name.rfind("SLES_", 0) == 0 || 
+                name.rfind("SCES_", 0) == 0 || name.rfind("SLPS_", 0) == 0 || 
+                name == "core.elf" || (name.size() > 4 && (name.compare(name.size() - 4, 4, ".elf") == 0 || name.compare(name.size() - 4, 4, ".ELF") == 0))) {
+                elf_path = entry.path().string();
+                break;
+            }
+        }
+        if (!elf_path.empty()) break;
+    }
+    for (const auto &dir : search_dirs) {
+        if (!std::filesystem::is_directory(dir, ec)) continue;
+        for (const auto &entry : std::filesystem::directory_iterator(dir, ec)) {
+            std::string name = entry.path().filename().string();
+            if (name.size() > 4 && (name.compare(name.size() - 4, 4, ".iso") == 0 || name.compare(name.size() - 4, 4, ".ISO") == 0)) {
+                disc_path = entry.path().string();
+                break;
+            }
+        }
+        if (!disc_path.empty()) break;
+    }
+    return !elf_path.empty();
+}
+#endif
+
 int main(int argc, char **argv) {
+#ifdef __SWITCH__
+    romfsInit();
+    std::atexit([] { romfsExit(); });
+#endif
 #ifdef _WIN32
     connect_output();
     // argv is in the ANSI code page and loses every character outside it: take the UTF-16 command line and use it as UTF-8
@@ -440,7 +516,30 @@ int main(int argc, char **argv) {
         argv = utf8_argv.data();
     }
 #endif
+#ifdef __SWITCH__
+    std::string auto_elf, auto_disc;
+    std::string program_target;
+    std::vector<char *> switch_argv;
+    if (argc >= 2) {
+        program_target = argv[1];
+    } else if (find_switch_target(auto_elf, auto_disc)) {
+        program_target = auto_elf;
+        if (!auto_disc.empty() && ps2::g_options.disc_path.empty()) {
+            ps2::g_options.disc_path = auto_disc;
+        }
+        switch_argv.push_back(argv[0]);
+        switch_argv.push_back(const_cast<char *>(program_target.c_str()));
+        switch_argv.push_back(nullptr);
+        argc = 2;
+        argv = switch_argv.data();
+    } else {
+        std::fprintf(stderr, "[switch] No PS2 game ELF found in romfs:/, disc/ or current directory!\n");
+        return usage();
+    }
+#else
     if (argc < 2) return usage();
+    std::string program_target = argv[1];
+#endif
 #ifdef _WIN32
     SetConsoleCtrlHandler(on_console_event, TRUE);
     SetUnhandledExceptionFilter(on_crash);
@@ -448,11 +547,15 @@ int main(int argc, char **argv) {
     install_signal_handlers();
 #endif
     std::atexit([] { ps2::flush_memory_card(); });  // whatever way the program ends through exit()
-    std::vector<std::string> args{argv[1]};
+    std::vector<std::string> args{program_target};
     [[maybe_unused]] bool window = false, fullscreen = false;
+#ifdef __SWITCH__
+    window = true;
+    fullscreen = true;
+#endif
     std::string load_path;
     bool no_record = false;
-    ps2::g_options.program_path = argv[1];
+    ps2::g_options.program_path = program_target;
     for (int i = 0; i < argc; ++i) {
         const std::string a = argv[i];
         ps2::g_options.command_line += (i ? " " : "") + (a.find_first_of(" \t") == std::string::npos ? a : "\"" + a + "\"");

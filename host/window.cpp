@@ -15,6 +15,9 @@
 #include <sys/resource.h>
 #include <unistd.h>
 #endif
+#ifdef __SWITCH__
+#include <switch.h>
+#endif
 #ifdef __linux__
 #include <csignal>
 #include <cerrno>
@@ -474,7 +477,7 @@ void edit_keys_file() {
 // compositor, opened on another workspace, or simply not noticed stopped the whole game for as long as it stood (the window thread
 // answers the compositor, draws the pictures and takes the emulation's frames; GTA III froze 14 s that way on 2026-10-29,
 // docs/linux.md "The window freeze"). The answer is taken in poll(), on the window thread.
-#if !defined(_WIN32) && !defined(__APPLE__)
+#if !defined(_WIN32) && !defined(__APPLE__) && !defined(__SWITCH__)
 #define PS2_KEY_CARD_ON_A_THREAD 1
 #endif
 
@@ -912,7 +915,9 @@ void pace() {
 }
 
 double process_cpu_seconds() {
-#ifdef _WIN32
+#if defined(__SWITCH__)
+    return 0.0;
+#elif defined(_WIN32)
     FILETIME created, exited, kernel, user;
     GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernel, &user);
     const auto ticks = [](const FILETIME &t) { return static_cast<double>((static_cast<std::uint64_t>(t.dwHighDateTime) << 32) | t.dwLowDateTime); };
@@ -925,7 +930,9 @@ double process_cpu_seconds() {
 }
 
 double resident_mb() {
-#ifdef _WIN32
+#if defined(__SWITCH__)
+    return 0.0;
+#elif defined(_WIN32)
     PROCESS_MEMORY_COUNTERS counters{};
     GetProcessMemoryInfo(GetCurrentProcess(), &counters, sizeof counters);
     return static_cast<double>(counters.WorkingSetSize) / (1024.0 * 1024.0);
@@ -1441,6 +1448,13 @@ int run_window(const std::function<int()> &emulate) {
     });
     const std::function<void(const std::uint32_t *, std::uint32_t, std::uint32_t)> copy = show_pixels, none;
     while (!done.load()) {
+#ifdef __SWITCH__
+        if (!appletMainLoop()) {
+            ps2::flush_memory_card();
+            ps2::halt("switch applet exit");
+            break;
+        }
+#endif
         if (ps2::hitch::on()) {  // PS2_HITCH_LOG=<ms>: the window's own event handling
             const auto p0 = WaitLog::Clock::now();
             poll();

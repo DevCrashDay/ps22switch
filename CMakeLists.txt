@@ -16,7 +16,7 @@ if(EMSCRIPTEN)
     add_link_options(-msimd128 -mtail-call -fwasm-exceptions -sWASM_LEGACY_EXCEPTIONS=0 -pthread)
 endif()
 
-if(NOT EMSCRIPTEN)
+if(NOT EMSCRIPTEN AND NOT NINTENDO_SWITCH)
     add_executable(eerecomp
         recomp/main.cpp
         recomp/r5900.cpp
@@ -75,7 +75,7 @@ else()
         runtime/src/iop/sif.cpp
         runtime/src/iop/cdvdfsv.cpp)
     target_compile_options(ps2runtime PRIVATE -Wall -Wextra)
-    if(NOT EMSCRIPTEN)
+    if(NOT EMSCRIPTEN AND NOT NINTENDO_SWITCH)
         # Vector programs the build does not know are compiled while the game runs (runtime/src/vu_live.cpp, docs/vu-live.md): the
         # generator is the one of the vurecomp tool, and the headers its output includes are embedded in the runner.
         target_sources(ps2runtime PRIVATE recomp/vurecomp_gen.cpp)
@@ -98,7 +98,7 @@ else()
         set_property(SOURCE runtime/src/live_build.cpp APPEND PROPERTY COMPILE_DEFINITIONS "PS2_LIVE_DEFAULT_CXX=\"${CMAKE_CXX_COMPILER}\"")
     endif()
 endif()
-if(NOT WIN32 AND NOT EMSCRIPTEN)
+if(NOT WIN32 AND NOT EMSCRIPTEN AND NOT NINTENDO_SWITCH)
     target_link_libraries(ps2runtime ${PS2_API} ${CMAKE_DL_LIBS})  # vu_live.cpp loads libraries with dlopen
 endif()
 target_include_directories(ps2runtime ${PS2_API} "${CMAKE_CURRENT_SOURCE_DIR}/runtime/include")
@@ -195,9 +195,35 @@ if(PS2_GENERATED)
             # and stderr back: a pipe or file of the parent as it is, else the console of the parent, else NUL.
             set_target_properties(ps2run PROPERTIES WIN32_EXECUTABLE ON)
         endif()
-        # the game controller path tested with SDL's virtual controllers, no game needed: ninja -C build/native-<game> ps2padtest
-        add_executable(ps2padtest EXCLUDE_FROM_ALL host/pad_test.cpp host/window.cpp host/keymap.cpp host/stretch.cpp)
-        target_include_directories(ps2padtest PRIVATE runtime/src)
-        target_link_libraries(ps2padtest PRIVATE ps2runtime SDL2::SDL2)
+        if(NOT NINTENDO_SWITCH)
+            # the game controller path tested with SDL's virtual controllers, no game needed: ninja -C build/native-<game> ps2padtest
+            add_executable(ps2padtest EXCLUDE_FROM_ALL host/pad_test.cpp host/window.cpp host/keymap.cpp host/stretch.cpp)
+            target_include_directories(ps2padtest PRIVATE runtime/src)
+            target_link_libraries(ps2padtest PRIVATE ps2runtime SDL2::SDL2)
+        else()
+            set(SWITCH_TITLE "ps22switch" CACHE STRING "Switch NACP Title Name")
+            set(SWITCH_AUTHOR "DevCrashDay" CACHE STRING "Switch NACP Author")
+            set(SWITCH_VERSION "1.0.0" CACHE STRING "Switch NACP Version")
+            set(SWITCH_ICON "" CACHE FILEPATH "Optional 256x256 JPEG/PNG icon for the Switch NRO")
+            set(SWITCH_ROMFS "" CACHE PATH "Optional directory to embed into RomFS")
+
+            set(NRO_EXTRA_ARGS)
+            if(SWITCH_ICON AND EXISTS "${SWITCH_ICON}")
+                list(APPEND NRO_EXTRA_ARGS ICON "${SWITCH_ICON}")
+            endif()
+            if(SWITCH_ROMFS AND IS_DIRECTORY "${SWITCH_ROMFS}")
+                list(APPEND NRO_EXTRA_ARGS ROMFS "${SWITCH_ROMFS}")
+            endif()
+
+            nx_generate_nacp(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/ps2run.nacp"
+                NAME "${SWITCH_TITLE}"
+                AUTHOR "${SWITCH_AUTHOR}"
+                VERSION "${SWITCH_VERSION}")
+
+            nx_create_nro(ps2run
+                OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/ps2run.nro"
+                NACP "${CMAKE_CURRENT_BINARY_DIR}/ps2run.nacp"
+                ${NRO_EXTRA_ARGS})
+        endif()
     endif()
 endif()
