@@ -54,9 +54,9 @@ Tried with real discs (mine are US releases), as far as each was played (no know
 
 Known not to work yet (reported by playtesters, on my list to fix):
 
-| Game | What happens |
-|---|---|
-| Ben 10: Alien Force - Vilgax Attacks | stops at "Checking memory card" right after the start and goes no further |
+| Game | What happens | Reported by |
+|---|---|---|
+| Ben 10: Alien Force - Vilgax Attacks | stops at "Checking memory card" right after the start and goes no further | Travani |
 
 54 of the 55 programs of the free [ps2autotests](https://github.com/unknownbrackets/ps2autotests) suite print exactly
 what the console prints (`python scripts/autotests.py`).
