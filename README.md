@@ -30,7 +30,7 @@ and the runtime started as his. What I added:
 
 ## What runs
 
-Tried with my own discs (US releases), as far as each was played(without bugs):
+Tried with my own discs (US releases), as far as each was played (no known bugs):
 
 | Game | How far |
 |---|---|
