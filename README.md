@@ -4,6 +4,11 @@ Turns the disc image of a PS2 game you own into a native program for Windows or 
 stage** and still changes a lot. God of War II has been played from start to end on Windows; a few more games run as far
 as they have been played.
 
+**Don't expect every game to work on the first try.** Only a few games have been tried so far, and each game uses the
+console a little differently, so many still stop at a black screen, crash, or play with missing sound or wrong pictures.
+When a game doesn't work, please send me a report (see [*Playtesters wanted*](#playtesters-wanted)): every report shows
+me what to fix next, and one fix often helps several games at once.
+
 The game's main-CPU code is translated once into C++ (static recompilation) and compiled into a normal program, so there is
 no emulator for the main CPU. The rest of the console (graphics chip, vector units, sound, disc, controller, memory card)
 is reimplemented by a runtime that draws with WebGPU (wgpu-native, on Vulkan or Direct3D 12).
