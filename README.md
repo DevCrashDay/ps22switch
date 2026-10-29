@@ -38,8 +38,8 @@ Tried with real discs (mine are US releases), as far as each was played (no know
 | God of War | plays well, not played through yet: from power-on through the menus and the opening film into the first fight on the ship, also in 16:9 | me |
 | Gran Turismo 4 | plays well, not played through yet: from power-on through the film and the menus, and a whole race played | me |
 | Resident Evil 4 | plays well, not played through yet: the menus, the opening, Leon in the forest | me |
-| Silent Hill 2 | plays well, not played through yet: the opening at the rest stop and 17 minutes of play from there | me |
-| Shadow of the Colossus | plays well, not played through yet: the opening film, the shrine, riding Agro across the land and climbing | me |
+| Silent Hill 2 | plays well, not played through yet: the opening at the rest stop and about 20 minutes of play from there but works fine| me |
+| Shadow of the Colossus | plays well, not played through yet: played like 30 minutes that went very well | me |
 | The Super Dimension Fortress Macross | plays well, not played through yet: menus and gameplay at about 60 fps (Windows 11, a laptop with Intel graphics, a game controller; [#3](https://github.com/exoteric33/ps2-native-recomp/issues/3)) | omegakatana92 |
 
 54 of the 55 programs of the free [ps2autotests](https://github.com/unknownbrackets/ps2autotests) suite print exactly
