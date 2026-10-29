@@ -321,7 +321,10 @@ void rpc_loop(iop::Cpu &c) {
     queue.pop_front();
     const std::uint32_t server = request.call.server_data ^ kServerXor;
     const Server &s = g_servers[server];
-    if (s.buf && !request.data.empty()) std::memcpy(iop::ram_ptr(s.buf), request.data.data(), request.data.size());
+    if (s.buf && !request.data.empty()) {
+        iop::watch_copy("RPC data", s.buf, 0, static_cast<std::uint32_t>(request.data.size()), 0);
+        std::memcpy(iop::ram_ptr(s.buf), request.data.data(), request.data.size());
+    }
     t->rpc_server = server;
     g_held_calls[server] = request.call;
     c.r[4] = request.call.rpc_number;
@@ -483,6 +486,7 @@ void install_iop_side() {
     });
     def("sifcmd", 23, "sceSifGetOtherData", [](iop::Cpu &c) {
         const std::uint32_t src = arg(c, 1), dst = arg(c, 2), size = arg(c, 3);
+        iop::watch_copy("sceSifGetOtherData", dst, src, size, c.r[31]);
         std::memcpy(iop::ram_ptr(dst), g_ram + (src & (kRamSize - 1)), size);
         c.r[2] = 0;
     });
@@ -776,7 +780,10 @@ std::uint32_t set_dma(std::uint32_t transfers, std::uint32_t count) {
         if (dst == kRpcRecvAddr) g_data_addr = src;
         else if (dst == 0) reboot(src);
         else if (dst == kCmdBuffer) command(src, size);
-        else std::memcpy(iop::ram_ptr(dst), g_ram + src, std::min(size, iop::kRamSize - (iop::phys(dst) & (iop::kRamSize - 1))));
+        else {
+            iop::watch_copy("EE DMA (sceSifSetDma)", dst, src, size, 0);
+            std::memcpy(iop::ram_ptr(dst), g_ram + src, std::min(size, iop::kRamSize - (iop::phys(dst) & (iop::kRamSize - 1))));
+        }
     }
     g_ee_dma_done = std::max(g_ee_dma_done, now()) + 256u + bytes * 2u;
     return g_ee_dma_id++;

@@ -8,6 +8,7 @@
 #include "ps2/state.hpp"
 
 #include <cstdio>
+#include <cstdlib>
 #include <map>
 #include <set>
 
@@ -20,6 +21,24 @@ alignas(16) std::uint8_t g_scratchpad[1024];
 bool is_ram(std::uint32_t p) { return p < 0x00800000u; }
 bool is_scratchpad(std::uint32_t p) { return (p & ~0x3FFu) == 0x1F800000u; }
 
+// PS2_WATCH_IOP=<first>:<last> (hex, IOP RAM addresses): porting work, prints every store of the IOP's own code into that range with
+// the time (seconds of IOP time), the program counter, the return address and the value. Stores of the emulator itself (the disc
+// reads, the DMA) are not seen here.
+std::uint32_t g_watch_lo = 0, g_watch_hi = 0;
+
+void watch_store(std::uint32_t p, unsigned size, std::uint32_t v) {
+    if (p + size <= g_watch_lo || p >= g_watch_hi) return;
+    std::fprintf(stderr, "[watch] %.5f s pc 0x%08X ra 0x%08X store%u 0x%06X = 0x%X\n", static_cast<double>(kernel::now()) / 36864000.0, g_cpu.pc, g_cpu.r[31], size * 8, p, v);
+}
+
+}
+
+void watch_copy(const char *what, std::uint32_t dst, std::uint32_t src, std::uint32_t bytes, std::uint32_t caller) {
+    if (!g_watch_hi) return;
+    const std::uint32_t p = phys(dst);
+    if (p + bytes <= g_watch_lo || p >= g_watch_hi) return;
+    std::fprintf(stderr, "[watch] %.5f s %s of %u bytes to 0x%06X from 0x%06X, called from 0x%08X (pc 0x%08X)\n", static_cast<double>(kernel::now()) / 36864000.0, what, bytes, p,
+                 phys(src), caller, g_cpu.pc);
 }
 
 std::uint8_t read8(std::uint32_t a) {
@@ -47,6 +66,7 @@ std::uint32_t read32(std::uint32_t a) {
 
 void write8(std::uint32_t a, std::uint8_t v) {
     const std::uint32_t p = phys(a);
+    if (g_watch_hi) watch_store(p, 1, v);
     if (is_ram(p)) { g_ram[p & (kRamSize - 1)] = v; return; }
     if (is_scratchpad(p)) { g_scratchpad[p & 0x3FFu] = v; return; }
     hw::write(p, v, 1);
@@ -54,6 +74,7 @@ void write8(std::uint32_t a, std::uint8_t v) {
 
 void write16(std::uint32_t a, std::uint16_t v) {
     const std::uint32_t p = phys(a);
+    if (g_watch_hi) watch_store(p, 2, v);
     if (is_ram(p)) { std::memcpy(g_ram + (p & (kRamSize - 1)), &v, 2); return; }
     if (is_scratchpad(p)) { std::memcpy(g_scratchpad + (p & 0x3FEu), &v, 2); return; }
     hw::write(p, v, 2);
@@ -61,6 +82,7 @@ void write16(std::uint32_t a, std::uint16_t v) {
 
 void write32(std::uint32_t a, std::uint32_t v) {
     const std::uint32_t p = phys(a);
+    if (g_watch_hi) watch_store(p, 4, v);
     if (is_ram(p)) { std::memcpy(g_ram + (p & (kRamSize - 1)), &v, 4); return; }
     if (is_scratchpad(p)) { std::memcpy(g_scratchpad + (p & 0x3FCu), &v, 4); return; }
     hw::write(p, v, 4);
@@ -126,6 +148,13 @@ void reset() {
     g_regs.clear();
     std::memset(g_dma, 0, sizeof g_dma);
     std::memset(g_scratchpad, 0, sizeof g_scratchpad);
+    if (const char *w = std::getenv("PS2_WATCH_IOP")) {
+        unsigned lo = 0, hi = 0;
+        if (std::sscanf(w, "%x:%x", &lo, &hi) == 2 && hi > lo) {
+            g_watch_lo = lo;
+            g_watch_hi = hi;
+        }
+    }
     spu2::reset();
     sio2::reset();
     std::memset(g_ohci, 0, sizeof g_ohci);
@@ -224,6 +253,14 @@ std::uint32_t read(std::uint32_t a, unsigned size) {
     const int ch = dma_channel(a, reg);
     if (ch >= 0) {
         const Dma &d = g_dma[ch];
+        static const bool trace_regs = std::getenv("PS2_TRACE_DMA_REGS") != nullptr;  // porting work: reads of the sound DMA channels' registers
+        static std::uint32_t last_madr = 0, last_bcr = 0;
+        if (trace_regs && (ch == 4 || ch == 7) && (d.madr != last_madr || d.bcr != last_bcr)) {  // only when the value changed since the last read
+            last_madr = d.madr;
+            last_bcr = d.bcr;
+            std::fprintf(stderr, "[dma-reg] %.5f s ch %d reg %u read at pc 0x%08X ra 0x%08X: madr %08X bcr %08X chcr %08X\n", static_cast<double>(kernel::now()) / 36864000.0, ch, reg,
+                         g_cpu.pc, g_cpu.r[31], d.madr, d.bcr, d.chcr);
+        }
         return (reg == 0 ? d.madr : reg == 1 ? d.bcr : reg == 2 ? d.chcr : d.tadr) >> ((a & 3u) * 8);
     }
     if ((a >= 0x1F801100u && a < 0x1F801130u) || (a >= 0x1F801480u && a < 0x1F8014B0u)) {
@@ -254,11 +291,21 @@ void write(std::uint32_t a, std::uint32_t v, unsigned size) {
     const int ch = dma_channel(a, reg);
     if (ch >= 0) {
         Dma &d = g_dma[ch];
+        static const bool trace_write_regs = std::getenv("PS2_TRACE_DMA_REGS") != nullptr;  // ... and the writes
+        if (trace_write_regs && (ch == 4 || ch == 7))
+            std::fprintf(stderr, "[dma-reg] %.5f s ch %d reg %u WRITE 0x%08X at pc 0x%08X ra 0x%08X\n", static_cast<double>(kernel::now()) / 36864000.0, ch, reg, v, g_cpu.pc,
+                         g_cpu.r[31]);
         std::uint32_t &target = reg == 0 ? d.madr : reg == 1 ? d.bcr : reg == 2 ? d.chcr : d.tadr;
         const unsigned shift = (a & 3u) * 8;
         const std::uint32_t mask = size >= 4 ? 0xFFFFFFFFu : ((1u << (size * 8)) - 1u) << shift;
+        const bool was_running = (d.chcr & 0x01000000u) != 0;
         target = (target & ~mask) | ((v << shift) & mask);
-        if (reg == 2 && (d.chcr & 0x01000000u) && (mask & 0x01000000u)) start_dma(static_cast<unsigned>(ch));
+        if (reg == 2 && (mask & 0x01000000u)) {
+            if (d.chcr & 0x01000000u) start_dma(static_cast<unsigned>(ch));
+            // the start bit written as 0 on a running channel stops it (libsd does that to stop a block transfer); the sound chip must
+            // drop what it still had queued, or the old blocks play before the ones the game sends next
+            else if (was_running && (ch == 4 || ch == 7)) spu2::dma_stop(ch == 4 ? 0 : 1);
+        }
         return;
     }
     report("write", a, v);

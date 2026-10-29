@@ -836,9 +836,10 @@ void install_sysclib() {
         else if (dst < src) for (std::uint32_t i = 0; i < n; ++i) write8(dst + i, read8(src + i));
         else for (std::uint32_t i = n; i-- > 0;) write8(dst + i, read8(src + i));
     };
-    def("sysclib", 12, "memcpy", [copy](Cpu &c) { copy(arg(c, 0), arg(c, 1), arg(c, 2)); c.r[2] = arg(c, 0); });
-    def("sysclib", 13, "memmove", [copy](Cpu &c) { copy(arg(c, 0), arg(c, 1), arg(c, 2)); c.r[2] = arg(c, 0); });
+    def("sysclib", 12, "memcpy", [copy](Cpu &c) { watch_copy("memcpy", arg(c, 0), arg(c, 1), arg(c, 2), c.r[31]); copy(arg(c, 0), arg(c, 1), arg(c, 2)); c.r[2] = arg(c, 0); });
+    def("sysclib", 13, "memmove", [copy](Cpu &c) { watch_copy("memmove", arg(c, 0), arg(c, 1), arg(c, 2), c.r[31]); copy(arg(c, 0), arg(c, 1), arg(c, 2)); c.r[2] = arg(c, 0); });
     def("sysclib", 14, "memset", [](Cpu &c) {
+        watch_copy("memset", arg(c, 0), arg(c, 1), arg(c, 2), c.r[31]);
         if (phys(arg(c, 0)) + arg(c, 2) <= kRamSize) std::memset(ram_ptr(arg(c, 0)), static_cast<int>(arg(c, 1) & 0xFF), arg(c, 2));
         else for (std::uint32_t i = 0; i < arg(c, 2); ++i) write8(arg(c, 0) + i, static_cast<std::uint8_t>(arg(c, 1)));
         c.r[2] = arg(c, 0);

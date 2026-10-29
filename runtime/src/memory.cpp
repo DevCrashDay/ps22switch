@@ -109,8 +109,33 @@ Target resolve(std::uint32_t a) {
     return {Region::None, nullptr, p};
 }
 
+// PS2_TRAP_UNMAPPED=1 (porting work): the first access to an address that is not memory also prints the main registers and the
+// return addresses found on the stack (a word that points just behind a jal/jalr counts), the guest's call chain, so one can see
+// who handed the function its bad pointer. The scan is a guess: a left-over value on the stack can look like a return address.
+void trap_unmapped(const char *what, std::uint32_t a) {
+    static const bool on = std::getenv("PS2_TRAP_UNMAPPED") != nullptr;
+    static int shown = 0;
+    if (!on || shown++ >= 3) return;
+    std::fprintf(stderr, "[trap] %s at 0x%08X, frame %llu, pc 0x%08X\n", what, a, static_cast<unsigned long long>(frame_count()), g_cpu.pc);
+    static const char *const names[32] = {"zero", "at", "v0", "v1", "a0", "a1", "a2", "a3", "t0", "t1", "t2", "t3", "t4", "t5", "t6", "t7",
+                                          "s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7", "t8", "t9", "k0", "k1", "gp", "sp", "fp", "ra"};
+    for (int i = 1; i < 32; ++i) std::fprintf(stderr, "%s=%08X%s", names[i], g_cpu.r[i].w[0], (i % 8 == 7) ? "\n" : " ");
+    std::fprintf(stderr, "\n[trap] return addresses on the stack:");
+    const std::uint32_t sp = g_cpu.r[29].w[0];
+    for (std::uint32_t off = 0; off < 0x800 && (sp & (kRamSize - 1)) + off + 4 <= kRamSize; off += 4) {
+        std::uint32_t v, before;
+        std::memcpy(&v, g_ram + ((sp + off) & (kRamSize - 1)), 4);
+        if (v < 0x100000u || v >= 0x800000u || (v & 3u)) continue;
+        std::memcpy(&before, g_ram + (v - 8), 4);
+        const bool jal = (before >> 26) == 3u, jalr = (before >> 26) == 0u && (before & 0x3Fu) == 9u;
+        if (jal || jalr) std::fprintf(stderr, " [sp+%X]=%08X%s", off, v, jal ? "" : "(jalr)");
+    }
+    std::fprintf(stderr, "\n");
+}
+
 void unmapped(const char *what, std::uint32_t a) {
     std::fprintf(stderr, "[mem] %s at unmapped 0x%08X (pc 0x%08X)\n", what, a, g_cpu.pc);
+    trap_unmapped(what, a);
 }
 
 template <typename T>

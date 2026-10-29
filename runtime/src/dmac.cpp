@@ -274,6 +274,11 @@ void run_chain(int ch) {
             std::memcpy(q, tagp, 16);
             std::memset(q, 0, 8);
             vif::transfer(ch, q, 1);
+        } else if (tte && ch == 9) {
+            // toSPR with the tag transfer enabled copies the whole 16-byte tag into the scratchpad ahead of its data (the game
+            // reads its list at SADR+16). The tag goes to the SPR address the transfer is at, which then moves on by one quadword.
+            std::memcpy(g_spr + (c.sadr & (kScratchpadSize - 1)), tagp, 16);
+            c.sadr = (c.sadr + 16) & (kScratchpadSize - 1);
         }
         bool end = false;
         const std::uint32_t tag_at = c.tadr;

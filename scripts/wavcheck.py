@@ -183,6 +183,20 @@ def check(path, args):
                 continue
             clicks.append({'channel': c, 'at': round((i + lo) / rate, 4), 'jump': round(float(d[i]), 3)})
     report['clicks'] = sorted(clicks, key=lambda e: e['at'])
+    # Clicks that come back at the same spot of a regular block (the sound chip's streamed music arrives in blocks of 64 ms or half or a
+    # quarter of that): the sign of a stream whose blocks do not join, not of a sound in the music. GTA III's film had it (2784 and 3040
+    # samples into every 3072-sample block, about 30 % of the blocks) until the queued blocks were dropped when the game stops the DMA.
+    report['click_repeat'] = None
+    for period in (0.064, 0.032, 0.016):
+        if len(clicks) < 8:
+            break
+        phase = np.array([c['at'] % period for c in clicks])
+        for centre in phase:
+            near = np.flatnonzero(np.minimum((phase - centre) % period, (centre - phase) % period) < 0.0006)
+            if len(near) >= 8 and len(near) >= 0.3 * len(clicks) and (not report['click_repeat'] or len(near) > report['click_repeat']['count']):
+                report['click_repeat'] = {'period_ms': round(period * 1000), 'at_ms': round(float(centre) * 1000, 1), 'count': int(len(near)), 'of': len(clicks)}
+        if report['click_repeat']:
+            break
 
     mono = x.mean(axis=1)
     freqs, power, used = spectrum(mono, rate)
@@ -234,6 +248,10 @@ def verdicts(r):
                 + ''.join(f'\n        at {g["at"]:.3f} s, {g["ms"]} ms' for g in r['gaps'][:10]) + (' ...' if len(r['gaps']) > 10 else '')))
     out.append(('ok' if len(r['clicks']) <= max(1, r['seconds'] / 10) else 'CHECK', f'{len(r["clicks"])} clicks (sudden jumps)'
                 + ''.join(f'\n        at {c["at"]:.4f} s, channel {c["channel"]}, jump {c["jump"]}' for c in r['clicks'][:10]) + (' ...' if len(r['clicks']) > 10 else '')))
+    if r['click_repeat']:
+        q = r['click_repeat']
+        out.append(('CHECK', f'{q["count"]} of the {q["of"]} clicks come back every {q["period_ms"]} ms at the same spot ({q["at_ms"]} ms into every {q["period_ms"]} ms stretch of the recording): '
+                    'a streamed block that does not join its neighbours'))
     sp = r['spectrum']
     if sp:
         bands = ', '.join(f'{k} {100 * v:.0f} %' for k, v in sp['bands'].items())

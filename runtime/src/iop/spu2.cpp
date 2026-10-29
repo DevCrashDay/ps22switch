@@ -301,6 +301,18 @@ void feed_input(int core) {
         const std::uint32_t chunk = std::min<std::uint32_t>(t.bytes, 1024);
         const std::uint32_t frames = std::max<std::uint32_t>(chunk / 4, 1);
         const std::uint8_t *src = ram_ptr(t.madr);
+        static const char *const trace_pieces = std::getenv("PS2_TRACE_ADMA");  // "2": every piece the chip takes in, with the time (see dma())
+        if (trace_pieces && trace_pieces[0] == '2')
+            std::fprintf(stderr, "[adma-piece] %.5f s core %d reads 0x%06X (%u bytes), %u bytes of the block left, %u frames waiting\n",
+                         static_cast<double>(kernel::now()) / 36864000.0, core, t.madr, chunk, t.bytes, k.input_count);
+        // PS2_DUMP_ADMA=file (porting work): the sound exactly as the chip takes it in, piece by piece, at the moment it takes it
+        static const char *const dump_adma = std::getenv("PS2_DUMP_ADMA");
+        if (dump_adma) {
+            if (std::FILE *f = std::fopen(dump_adma, "ab")) {
+                std::fwrite(src, 1, chunk, f);
+                std::fclose(f);
+            }
+        }
         for (std::uint32_t i = 0; i < frames; ++i) {
             std::int16_t l, r;
             std::memcpy(&l, src + i * 2, 2);
@@ -728,6 +740,9 @@ void dma(int core, std::uint32_t madr, std::uint32_t words, bool to_spu, int cha
     keep_ticking();
     Core &k = g_cores[core];
     if (to_spu && (k.admas & (1u << core))) {
+        static const bool trace_adma = std::getenv("PS2_TRACE_ADMA") != nullptr;  // porting work: when each ADMA block starts, and the blocks
+        if (trace_adma) std::fprintf(stderr, "[adma] core %d dma of %u bytes from 0x%06X at %.4f s, %u frames already waiting, %zu transfers queued\n", core, words * 4, madr,
+                                                        g_first_tick ? static_cast<double>(kernel::now() - g_first_tick) / 36864000.0 : 0.0, k.input_count, k.transfers.size());
         k.transfers.push_back(Transfer{madr, words * 4, channel});
         feed_input(core);
         return;
@@ -742,6 +757,18 @@ void dma(int core, std::uint32_t madr, std::uint32_t words, bool to_spu, int cha
     }
     k.tsa = (k.tsa + halfwords) & kRamMask;
     if (channel >= 0) kernel::schedule(kernel::now() + 64 + words / 4, kernel::Job{kernel::kJobDmaDone, static_cast<std::uint32_t>(channel)});
+}
+
+// The game stopped the DMA channel of the core (the start bit written as 0): the auto-DMA blocks that were still waiting to go into the
+// input buffer are dropped, as the stopped channel would not have sent them. Without this the old blocks stay in the queue, play ahead of
+// the blocks of the next transfer and keep the stream one block off for as long as the game streams.
+void dma_stop(int core) {
+    Core &k = g_cores[core];
+    static const bool trace_adma = std::getenv("PS2_TRACE_ADMA") != nullptr;
+    if (trace_adma && !k.transfers.empty())
+        std::fprintf(stderr, "[adma] core %d dma stopped at %.4f s, %zu transfers dropped, %u frames waiting\n", core,
+                     g_first_tick ? static_cast<double>(kernel::now() - g_first_tick) / 36864000.0 : 0.0, k.transfers.size(), k.input_count);
+    k.transfers.clear();
 }
 
 void set_sink(std::function<void(const std::int16_t *, std::size_t)> sink) { g_sink = std::move(sink); }
