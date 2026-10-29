@@ -99,7 +99,10 @@ EOF
       command -v "$sevenzip" > /dev/null || { echo "7z not found: install 7-Zip" >&2; exit 1; }
       "$sevenzip" e -so -r "$source_path" '*.iso' > "$iso" ;;
     *)
-      image="$(cd "$(dirname "$source_path")" && pwd)/$(basename "$source_path")"  # no realpath in MinGit or old macOS
+      # No realpath in MinGit or old macOS. On Windows pwd -W gives D:/...: Git's shell leaves /d/... as it is for native
+      # programs (ln is BusyBox's, Python, ps2run) when the name has [ ] ' * or ? in it, as in "Game [NTSC].iso"
+      if [ "$windows" = 0 ]; then dir=$(cd "$(dirname "$source_path")" && pwd); else dir=$(cd "$(dirname "$source_path")" && pwd -W); fi
+      image="$dir/$(basename "$source_path")"
       if [ "$windows" = 0 ]; then ln -s "$image" "$iso"; else ln "$image" "$iso" 2> /dev/null || iso=$image; fi ;;
   esac
 fi
