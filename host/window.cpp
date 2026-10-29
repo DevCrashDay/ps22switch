@@ -102,7 +102,7 @@ int g_look = keymap::kDefaultLook;
 bool g_look_forced = false;
 
 // The title shows the speed; for a few seconds after F5, F8 or F9 a message is put in front of it.
-std::string g_speed_title = "ps2-web-recomp";
+std::string g_speed_title = "ps2-native-recomp";
 std::string g_notice_text;
 Uint32 g_notice_until = 0;
 // A short tone mixed into the game's sound says that a key worked, which the title cannot do in full screen. 0 none, else the kind of
@@ -861,7 +861,7 @@ void show_speed() {
     const double queued = queued_ms();
     char stretched[40] = "";  // "audio 62 ms" is the game's sound waiting; when it is played slower, by how much
     if (g_pipe && g_pipe->tempo() < 0.995) std::snprintf(stretched, sizeof stretched, ", stretched x%.1f", 1.0 / g_pipe->tempo());
-    std::snprintf(title, sizeof title, "ps2-web-recomp  %.1f fps  CPU %.0f%%  GPU %.0f%%  RAM %.0f MB  audio %.0f ms%s", static_cast<double>(frames) / seconds,
+    std::snprintf(title, sizeof title, "ps2-native-recomp  %.1f fps  CPU %.0f%%  GPU %.0f%%  RAM %.0f MB  audio %.0f ms%s", static_cast<double>(frames) / seconds,
                   (cpu - cpu_start) / seconds * 100.0, (gpu - gpu_start) / (seconds * 10.0), resident_mb(), queued, stretched);
     g_speed_title = title;
     refresh_title();
@@ -1140,7 +1140,7 @@ bool open_window(bool fullscreen) {
     }
     load_keys();
     const Uint32 flags = SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI | (fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0u);
-    g_window = SDL_CreateWindow("ps2-web-recomp", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, ps2::g_options.widescreen ? 1280 : 960, 720, flags);
+    g_window = SDL_CreateWindow("ps2-native-recomp", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, ps2::g_options.widescreen ? 1280 : 960, 720, flags);
     if (!g_window) {
         std::fprintf(stderr, "SDL: %s\n", SDL_GetError());
         return false;
