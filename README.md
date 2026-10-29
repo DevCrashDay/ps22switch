@@ -12,7 +12,7 @@ Based on [ps2-native-recomp](https://github.com/exoteric33/ps2-native-recomp) an
    The game's MIPS R5900 machine code is analyzed and statically translated once into portable modern C++20 units via `eerecomp`. These units are cross-compiled directly for the Nintendo Switch ARMv8-A Cortex-A57 64-bit CPU cores using `devkitA64` (`aarch64-none-elf-gcc`). There is **zero CPU emulation overhead** at runtime.
 
 2. **Vector Units (VU0 / VU1):**
-   VU0 and VU1 microcode is either statically translated or interpreted with ARM NEON vector instructions (`<arm_neon.h>`), providing accelerated 128-bit vector arithmetic on the Switch CPU.
+   The VU1 programs the exploring runs on the PC recorded are statically translated to C++ (vector code that GCC turns into ARM NEON). A program the build does not know is interpreted: the Switch has no compiler to translate it while the game runs, so the more of the game the PC runs saw, the faster it plays.
 
 3. **Graphics Synthesizer (GS):**
    Rendered through the built-in PS2 GS software rasterizer and presented onto the Switch display using hardware-accelerated SDL2 streaming textures (`SDL_PIXELFORMAT_ABGR8888`), running in native Switch docked (1080p) or handheld (720p) mode.
@@ -28,8 +28,10 @@ Based on [ps2-native-recomp](https://github.com/exoteric33/ps2-native-recomp) an
 ## Quick Start for Nintendo Switch
 
 ### Prerequisites
-- Windows 10/11 with WSL2 (installed automatically or `wsl --install`)
-- Official `devkitpro/devkita64` toolchain (installed in WSL)
+- Windows 10/11 with WSL2 and a distribution named `devkita64` holding devkitPro's devkitA64, libnx and `switch-sdl2`,
+  with `switch-cmake` / `switch-ninja` wrappers in `/usr/local/bin` (`--wsl-distro` picks another name). On Linux,
+  devkitPro installed directly (`$DEVKITPRO`) is used instead.
+- What the native build needs on the PC (Git Bash and the translator tools: run `Start.cmd` once, or `scripts/setup.sh --native-only`).
 - Python 3
 
 ### Building with One Command
@@ -43,11 +45,16 @@ Based on [ps2-native-recomp](https://github.com/exoteric33/ps2-native-recomp) an
    python scripts/switch_port.py "Tekken 4 (USA).iso" --title "Tekken 4"
    ```
 3. The build pipeline automatically:
-   - Extracts `SYSTEM.CNF` and the game executable from the ISO.
-   - Translates all MIPS R5900 code to C++ units.
-   - Cross-compiles `ps2runtime` and game code for AArch64 Switch.
-   - Packages the `.nro` binary with NACP title and metadata.
-   - Creates a ready-to-use SD card directory under `build/switch/<GameName>/package/`.
+   - Runs `scripts/port.sh --native-only` on the PC: extracts the boot program, translates its MIPS R5900 code to C++,
+     runs the game headless to find the code the static pass missed and compiles the VU1 programs those runs recorded.
+     This step matters more than on the PC: the Switch build cannot compile code it meets while the game runs, so code
+     the PC runs never reached stops the game there. `--pnach`, `--widescreen`, `--frames` and `--rounds` are passed on.
+   - Cross-compiles `ps2runtime` and the game's C++ for AArch64 with devkitA64 (`-ffp-contract=off`, so the PS2's
+     floating point results come out the same as on the PC).
+   - Packages the `.nro` with its NACP title and metadata.
+   - Creates a ready-to-use SD card folder under `build/switch/<GameName>/package/`, with the disc image copied in
+     (`--no-disc-copy` leaves that to you) and `launch.txt`, the command line the `.nro` starts the game with.
+   - `--skip-port` rebuilds the `.nro` from what an earlier run left in `generated/<GameName>`.
 
 ### Installing to your Switch
 Copy the `switch` folder from `build/switch/<GameName>/package/` to the root of your Switch SD card:
@@ -57,11 +64,16 @@ sdmc:/
       └── ps22switch/
           └── <GameName>/
               ├── <GameName>.nro
-              ├── disc/
-              ├── app.json
+              ├── launch.txt       the program, disc image and options, one argument to a line
+              ├── disc/<boot program>
+              ├── disc.iso         the game reads its files from the disc image while it runs
+              ├── patches.txt      when PCSX2 patches were applied
               └── keys.ini
 ```
-Launch the game from the **Homebrew Menu (hbmenu)** on your Nintendo Switch or load the `.nro` in Ryujinx / Yuzu!
+Launch the game from the **Homebrew Menu (hbmenu)**, preferably started by holding R while starting a game (title
+takeover gives homebrew all of the memory and processor time; the album applet gives less). The game runs on three of
+the Switch's cores (emulation, vector units, drawing), its log goes to `ps2run.log` and its saves to `<GameName>.ps2`,
+both next to the `.nro`. Without `launch.txt` the `.nro` looks for a boot program and an `.iso` in its folder and in `disc/`.
 
 ---
 

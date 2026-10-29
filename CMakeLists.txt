@@ -16,6 +16,12 @@ if(EMSCRIPTEN)
     add_link_options(-msimd128 -mtail-call -fwasm-exceptions -sWASM_LEGACY_EXCEPTIONS=0 -pthread)
 endif()
 
+if(NINTENDO_SWITCH)
+    # The Switch's processor has fused multiply-add and GCC fuses a * b + c into it by default: one rounding instead of the two the
+    # PS2 does changes the results of the FPU and the vector units (scripts/cxx.sh adds the same flag to the AVX2 builds for this).
+    add_compile_options(-ffp-contract=off)
+endif()
+
 if(NOT EMSCRIPTEN AND NOT NINTENDO_SWITCH)
     add_executable(eerecomp
         recomp/main.cpp

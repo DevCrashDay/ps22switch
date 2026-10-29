@@ -2,6 +2,7 @@
 #include "ps2/system.hpp"
 #include "ps2/ee_live.hpp"
 #include "ps2/vu_live.hpp"
+#include "thread.hpp"
 
 #ifdef PS2_WINDOW
 #include "window.hpp"
@@ -11,6 +12,7 @@
 #endif
 
 #include <algorithm>
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -452,11 +454,11 @@ static int run_threads_headless(const std::function<int()> &emulate) {
     ps2::start_render_thread();
     if (!std::getenv("PS2_NO_VU_THREAD")) {
         ps2::start_vu_thread();
-        std::thread(ps2::run_vu_thread).detach();
+        HostThread(ps2::run_vu_thread).detach();
     }
     std::atomic<bool> done{false};
     int result = 0;
-    std::thread emulation([&] {
+    HostThread emulation([&] {
         result = emulate();
         done.store(true);
         ps2::wake_render_thread();
@@ -482,67 +484,76 @@ static int run_threads_headless(const std::function<int()> &emulate) {
 }
 
 #ifdef __SWITCH__
-bool find_switch_target(std::string &elf_path, std::string &disc_path) {
-    std::error_code ec;
-    const std::vector<std::string> search_dirs = {"romfs:/", "./", "disc/", "games/Tekken-4/", "games/Tekken-4/disc/"};
-    for (const auto &dir : search_dirs) {
-        std::string json_path = dir + "app.json";
-        if (std::filesystem::exists(json_path, ec)) {
-            if (std::FILE *f = std::fopen(json_path.c_str(), "rb")) {
-                std::fseek(f, 0, SEEK_END);
-                long sz = std::ftell(f);
-                std::fseek(f, 0, SEEK_SET);
-                std::string content(sz, '\0');
-                if (std::fread(content.data(), 1, sz, f) == static_cast<std::size_t>(sz)) {
-                    auto pos = content.find("\"elf\"");
-                    if (pos != std::string::npos) {
-                        auto q1 = content.find('"', pos + 5);
-                        auto q2 = q1 != std::string::npos ? content.find('"', q1 + 1) : std::string::npos;
-                        if (q1 != std::string::npos && q2 != std::string::npos) {
-                            elf_path = content.substr(q1 + 1, q2 - q1 - 1);
-                            std::replace(elf_path.begin(), elf_path.end(), '\\', '/');
-                        }
-                    }
-                    pos = content.find("\"iso\"");
-                    if (pos != std::string::npos) {
-                        auto q1 = content.find('"', pos + 5);
-                        auto q2 = q1 != std::string::npos ? content.find('"', q1 + 1) : std::string::npos;
-                        if (q1 != std::string::npos && q2 != std::string::npos) {
-                            disc_path = content.substr(q1 + 1, q2 - q1 - 1);
-                            std::replace(disc_path.begin(), disc_path.end(), '\\', '/');
-                        }
-                    }
-                }
-                std::fclose(f);
-                if (!elf_path.empty()) return true;
-            }
+// The homebrew menu starts an .nro with no arguments: what a command line gives ps2run elsewhere (the program, --disc, --patches,
+// --widescreen and the rest) comes from launch.txt next to the .nro (or in its RomFS), one argument to a line, with paths relative to
+// the folder of the file. scripts/switch_port.py writes it. Without one, the folder is searched for a program and a disc image.
+std::vector<std::string> switch_arguments() {
+    std::error_code error;
+    const auto read_lines = [](const std::string &path, std::vector<std::string> &lines) {
+        std::FILE *f = std::fopen(path.c_str(), "rb");
+        if (!f) return false;
+        std::string text;
+        char buffer[4096];
+        for (std::size_t n; (n = std::fread(buffer, 1, sizeof buffer, f)) > 0;) text.append(buffer, n);
+        std::fclose(f);
+        std::size_t start = 0;
+        while (start <= text.size()) {
+            std::size_t end = text.find('\n', start);
+            if (end == std::string::npos) end = text.size();
+            std::string line = text.substr(start, end - start);
+            while (!line.empty() && (line.back() == '\r' || line.back() == ' ' || line.back() == '\t')) line.pop_back();
+            const std::size_t first = line.find_first_not_of(" \t");
+            if (first != std::string::npos && line[first] != '#') lines.push_back(line.substr(first));
+            start = end + 1;
+        }
+        return true;
+    };
+    for (const std::string dir : {"./", "romfs:/"}) {
+        std::vector<std::string> lines;
+        if (!read_lines(dir + "launch.txt", lines) || lines.empty()) continue;
+        if (dir != "./") chdir(dir.c_str());  // the paths in it are relative to its folder
+        std::fprintf(stderr, "[switch] arguments from %slaunch.txt\n", dir.c_str());
+        return lines;
+    }
+    // No launch.txt: the first PS2 program and the first disc image here or in disc/
+    const auto ends_with = [](std::string name, const char *suffix) {
+        std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        const std::size_t n = std::strlen(suffix);
+        return name.size() > n && name.compare(name.size() - n, n, suffix) == 0;
+    };
+    std::string program, disc;
+    for (const std::string dir : {".", "disc"}) {
+        if (!std::filesystem::is_directory(dir, error)) continue;
+        for (const auto &entry : std::filesystem::directory_iterator(dir, error)) {
+            if (!entry.is_regular_file(error)) continue;
+            const std::string name = entry.path().filename().string();
+            const bool boot_program = name.size() == 11 && name[4] == '_' && name[8] == '.';  // SLUS_203.28, SCES_501.48, ...
+            if (program.empty() && (boot_program || name == "core.elf" || ends_with(name, ".elf"))) program = (std::filesystem::path(dir) / name).string();
+            if (disc.empty() && ends_with(name, ".iso")) disc = (std::filesystem::path(dir) / name).string();
         }
     }
-    for (const auto &dir : search_dirs) {
-        if (!std::filesystem::is_directory(dir, ec)) continue;
-        for (const auto &entry : std::filesystem::directory_iterator(dir, ec)) {
-            std::string name = entry.path().filename().string();
-            if (name.rfind("SLUS_", 0) == 0 || name.rfind("SLES_", 0) == 0 || 
-                name.rfind("SCES_", 0) == 0 || name.rfind("SLPS_", 0) == 0 || 
-                name == "core.elf" || (name.size() > 4 && (name.compare(name.size() - 4, 4, ".elf") == 0 || name.compare(name.size() - 4, 4, ".ELF") == 0))) {
-                elf_path = entry.path().string();
-                break;
-            }
-        }
-        if (!elf_path.empty()) break;
+    if (program.empty()) return {};
+    std::vector<std::string> args{program};
+    if (!disc.empty()) args.insert(args.end(), {"--disc", disc});
+    args.insert(args.end(), {"--memcard", "memcard.ps2"});  // the game's saves are kept next to the .nro
+    return args;
+}
+
+// Without a console to print to, a start that cannot go on says why on the screen until + is pressed.
+int switch_error(const char *text) {
+    std::fprintf(stderr, "[switch] %s\n", text);
+    consoleInit(nullptr);
+    padConfigureInput(1, HidNpadStyleSet_NpadStandard);
+    PadState pad;
+    padInitializeDefault(&pad);
+    std::printf("ps2run\n\n%s\n\nThe log is ps2run.log next to the .nro.\n\nPress + to return to the homebrew menu.\n", text);
+    while (appletMainLoop()) {
+        padUpdate(&pad);
+        if (padGetButtonsDown(&pad) & HidNpadButton_Plus) break;
+        consoleUpdate(nullptr);
     }
-    for (const auto &dir : search_dirs) {
-        if (!std::filesystem::is_directory(dir, ec)) continue;
-        for (const auto &entry : std::filesystem::directory_iterator(dir, ec)) {
-            std::string name = entry.path().filename().string();
-            if (name.size() > 4 && (name.compare(name.size() - 4, 4, ".iso") == 0 || name.compare(name.size() - 4, 4, ".ISO") == 0)) {
-                disc_path = entry.path().string();
-                break;
-            }
-        }
-        if (!disc_path.empty()) break;
-    }
-    return !elf_path.empty();
+    consoleExit(nullptr);
+    return 1;
 }
 #endif
 
@@ -567,29 +578,27 @@ int main(int argc, char **argv) {
     }
 #endif
 #ifdef __SWITCH__
-    std::string auto_elf, auto_disc;
-    std::string program_target;
-    std::vector<char *> switch_argv;
-    if (argc >= 2) {
-        program_target = argv[1];
-    } else if (find_switch_target(auto_elf, auto_disc)) {
-        program_target = auto_elf;
-        if (!auto_disc.empty() && ps2::g_options.disc_path.empty()) {
-            ps2::g_options.disc_path = auto_disc;
-        }
-        switch_argv.push_back(argv[0]);
-        switch_argv.push_back(const_cast<char *>(program_target.c_str()));
-        switch_argv.push_back(nullptr);
-        argc = 2;
-        argv = switch_argv.data();
-    } else {
-        std::fprintf(stderr, "[switch] No PS2 game ELF found in romfs:/, disc/ or current directory!\n");
-        return usage();
+    // The folder of the .nro (the homebrew menu gives its path as argv[0]) is where launch.txt, the program, the disc image, the
+    // memory card and the log are.
+    if (argc >= 1 && argv[0]) {
+        const std::string self = argv[0];
+        const std::size_t slash = self.find_last_of('/');
+        if (slash != std::string::npos) chdir(self.substr(0, slash + 1).c_str());
     }
-#else
-    if (argc < 2) return usage();
-    std::string program_target = argv[1];
+    if (std::FILE *log = std::freopen("ps2run.log", "w", stderr)) std::setvbuf(log, nullptr, _IOLBF, 0);
+    std::vector<std::string> switch_args;
+    std::vector<char *> switch_argv;
+    if (argc < 2) {
+        switch_args = switch_arguments();
+        if (switch_args.empty()) return switch_error("No PS2 program found: put launch.txt (scripts/switch_port.py writes one) or the game's ELF next to the .nro.");
+        switch_argv.push_back(argv[0]);
+        for (std::string &a : switch_args) switch_argv.push_back(a.data());
+        switch_argv.push_back(nullptr);
+        argc = static_cast<int>(switch_argv.size()) - 1;
+        argv = switch_argv.data();
+    }
 #endif
+    if (argc < 2) return usage();
 #ifdef _WIN32
     SetConsoleCtrlHandler(on_console_event, TRUE);
     SetUnhandledExceptionFilter(on_crash);
@@ -597,7 +606,7 @@ int main(int argc, char **argv) {
     install_signal_handlers();
 #endif
     std::atexit([] { ps2::flush_memory_card(); });  // whatever way the program ends through exit()
-    std::vector<std::string> args{program_target};
+    std::vector<std::string> args{argv[1]};
     [[maybe_unused]] bool window = false, fullscreen = false;
 #ifdef __SWITCH__
     window = true;
@@ -605,7 +614,7 @@ int main(int argc, char **argv) {
 #endif
     std::string load_path;
     bool no_record = false;
-    ps2::g_options.program_path = program_target;
+    ps2::g_options.program_path = argv[1];
     for (int i = 0; i < argc; ++i) {
         const std::string a = argv[i];
         ps2::g_options.command_line += (i ? " " : "") + (a.find_first_of(" \t") == std::string::npos ? a : "\"" + a + "\"");

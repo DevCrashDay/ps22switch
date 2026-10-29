@@ -1,4 +1,5 @@
 #include "window.hpp"
+#include "thread.hpp"
 
 #include "ps2/system.hpp"
 
@@ -1434,27 +1435,20 @@ int run_window(const std::function<int()> &emulate) {
     ps2::start_render_thread();
     if (!std::getenv("PS2_NO_VU_THREAD")) {
         ps2::start_vu_thread();
-        std::thread(ps2::run_vu_thread).detach();
+        HostThread(ps2::run_vu_thread).detach();
     }
 #ifdef __linux__
     if (!std::getenv("PS2_NO_WATCHDOG")) std::thread(watchdog).detach();
 #endif
     std::atomic<bool> done{false};
     int result = 0;
-    std::thread emulation([&] {
+    HostThread emulation([&] {
         result = emulate();
         done.store(true);
         ps2::wake_render_thread();
     });
     const std::function<void(const std::uint32_t *, std::uint32_t, std::uint32_t)> copy = show_pixels, none;
     while (!done.load()) {
-#ifdef __SWITCH__
-        if (!appletMainLoop()) {
-            ps2::flush_memory_card();
-            ps2::halt("switch applet exit");
-            break;
-        }
-#endif
         if (ps2::hitch::on()) {  // PS2_HITCH_LOG=<ms>: the window's own event handling
             const auto p0 = WaitLog::Clock::now();
             poll();

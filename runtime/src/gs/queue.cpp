@@ -56,6 +56,17 @@ void futex_wait(std::atomic<std::uint32_t> &word, std::uint32_t seen, int timeou
 }
 
 void futex_wake(std::atomic<std::uint32_t> &word) { WakeByAddressAll(&word); }
+#elif defined(__SWITCH__)
+// Horizon's address arbiter is a futex: libnx's own declarations (switch.h is left out, its names would meet the runtime's).
+// Without it the consumer slept 1 ms at a time and missed most hand-overs between the vector-unit and the window threads.
+extern "C" std::uint32_t svcWaitForAddress(void *address, std::uint32_t arb_type, std::int64_t value, std::int64_t timeout);
+extern "C" std::uint32_t svcSignalToAddress(void *address, std::uint32_t signal_type, std::int32_t value, std::int32_t count);
+void futex_wait(std::atomic<std::uint32_t> &word, std::uint32_t seen, int timeout_ms) {
+    // ArbitrationType_WaitIfEqual (2); a timeout of -1 waits for good
+    svcWaitForAddress(&word, 2, static_cast<std::int32_t>(seen), timeout_ms < 0 ? -1 : static_cast<std::int64_t>(timeout_ms) * 1000000);
+}
+
+void futex_wake(std::atomic<std::uint32_t> &word) { svcSignalToAddress(&word, 0 /* SignalType_Signal */, 0, -1); }
 #endif
 
 }
@@ -70,7 +81,7 @@ EM_ASYNC_JS(void, ps2_wait_async, (std::atomic<std::uint32_t> *word, std::uint32
 void wait(std::atomic<std::uint32_t> &value, std::uint32_t seen) {
 #ifdef __EMSCRIPTEN__
     emscripten_futex_wait(&value, seen, INFINITY);
-#elif defined(__linux__) || defined(_WIN32)
+#elif defined(__linux__) || defined(_WIN32) || defined(__SWITCH__)
     futex_wait(value, seen, -1);
 #else
     value.wait(seen);
@@ -80,7 +91,7 @@ void wait(std::atomic<std::uint32_t> &value, std::uint32_t seen) {
 void notify(std::atomic<std::uint32_t> &value) {
 #ifdef __EMSCRIPTEN__
     emscripten_futex_wake(&value, INT_MAX);
-#elif defined(__linux__) || defined(_WIN32)
+#elif defined(__linux__) || defined(_WIN32) || defined(__SWITCH__)
     futex_wake(value);
 #else
     value.notify_all();
@@ -203,7 +214,7 @@ void Ring::wait_for_work(int timeout_ms) {
 #ifdef __EMSCRIPTEN__
     if (emscripten_is_main_browser_thread()) ps2_wait_async(&posted_, seen, timeout_ms);
     else emscripten_futex_wait(&posted_, seen, timeout_ms);
-#elif defined(__linux__) || defined(_WIN32)
+#elif defined(__linux__) || defined(_WIN32) || defined(__SWITCH__)
     if (qs_on()) {
         QStats &q = g_qs[this == &g_render ? 0 : 1];
         const std::uint64_t t0 = now_us();
