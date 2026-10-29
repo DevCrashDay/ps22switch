@@ -41,6 +41,7 @@ Tried with real discs (mine are US releases), as far as each was played (no know
 | Silent Hill 2 | plays well, not played through yet: the opening at the rest stop and about 20 minutes of play from there but works fine| me |
 | Shadow of the Colossus | plays well, not played through yet: played like 30 minutes that went very well | me |
 | The Super Dimension Fortress Macross | plays well, not played through yet: menus and gameplay at about 60 fps (Windows 11, a laptop with Intel graphics, a game controller; [#3](https://github.com/exoteric33/ps2-native-recomp/issues/3)) | omegakatana92 |
+| The King of Fighters XI | plays well, not played through yet: works perfectly | TsimpleD |
 
 54 of the 55 programs of the free [ps2autotests](https://github.com/unknownbrackets/ps2autotests) suite print exactly
 what the console prints (`python scripts/autotests.py`).
