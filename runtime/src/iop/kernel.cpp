@@ -4,6 +4,7 @@
 #include "io.hpp"
 #include "sio2.hpp"
 #include "spu2.hpp"
+#include "../load_stats.hpp"
 
 #include "ps2/state.hpp"
 
@@ -584,6 +585,7 @@ std::uint64_t cycles() { return kernel::g_now; }
 
 void run(std::uint64_t ee_cycles) {
     using namespace kernel;
+    const cost::Timer whole(cost::kIopRun);
     g_ee_remainder += ee_cycles;
     g_target += g_ee_remainder / kClockDivider;
     g_ee_remainder %= kClockDivider;
@@ -608,6 +610,7 @@ void run(std::uint64_t ee_cycles) {
                 continue;
             }
             g_events.pop();
+            const cost::Timer job_time(cost::kIopJobs);
             if (due.job.kind) g_jobs[due.job.kind](due.job);
             else due.action();
         }
@@ -626,7 +629,11 @@ void run(std::uint64_t ee_cycles) {
             budget = std::min<std::int64_t>(budget, static_cast<std::int64_t>(g_events.top().at - g_now));
         if (budget <= 0) budget = 1;
         const std::int64_t given = budget;
-        execute(g_cpu, budget);
+        {
+            const cost::Timer exec_time(cost::kIopExec);
+            execute(g_cpu, budget);
+        }
+        if (cost::g_on) cost::g_exec_cycles += static_cast<std::uint64_t>(given - std::max<std::int64_t>(0, budget));
         g_now += static_cast<std::uint64_t>(std::max<std::int64_t>(1, given - std::max<std::int64_t>(0, budget)));
     }
 }

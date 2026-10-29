@@ -3,6 +3,7 @@
 #include "hw.hpp"
 
 #include "ps2/state.hpp"
+#include "ps2/system.hpp"
 
 #include <algorithm>
 #include <cstdio>
@@ -67,11 +68,14 @@ std::string format(Cpu &c, std::uint32_t fmt_address, int first) {
     return out;
 }
 
+// PS2_TTY_FRAME=1 writes the frame number in front of every line the IOP modules print, to find out when in the game they speak.
 void print(const std::string &text) {
     static std::string line;
+    static const bool with_frame = std::getenv("PS2_TTY_FRAME") != nullptr;
     for (char ch : text) {
         if (ch == '\n') {
-            std::fprintf(stderr, "[iop-tty] %s\n", line.c_str());
+            if (with_frame) std::fprintf(stderr, "[iop-tty f%llu] %s\n", static_cast<unsigned long long>(ps2::frames_run()), line.c_str());
+            else std::fprintf(stderr, "[iop-tty] %s\n", line.c_str());
             line.clear();
         } else if (ch != '\r') {
             line += ch;

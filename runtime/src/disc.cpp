@@ -1,6 +1,7 @@
 #include "ps2/disc.hpp"
 #include "ps2/hitch.hpp"
 #include "ps2/os.hpp"
+#include "load_stats.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -117,7 +118,9 @@ bool is_open() { return static_cast<bool>(g_reader); }
 
 bool read(std::uint32_t sector, std::uint32_t count, void *out) {
     if (!g_reader) return false;
+    const cost::Timer time_it(cost::kDisc);
     const std::size_t want = static_cast<std::size_t>(count) * kSector;
+    if (cost::g_on) cost::g_disc_bytes += want;
     const auto started = hitch::on() ? hitch::Clock::now() : hitch::Clock::time_point{};
     const std::size_t got = g_reader(static_cast<std::uint64_t>(sector) * kSector, out, want);
     if (hitch::on()) {  // PS2_HITCH_LOG=<ms>: a disc read that held the game up (one third of the limit, since a frame has other work too)

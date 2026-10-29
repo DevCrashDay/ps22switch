@@ -13,6 +13,7 @@
 #include "ps2/disc.hpp"
 #include "ps2/ee_live.hpp"
 #include "kernel.hpp"
+#include "load_stats.hpp"
 #include "ps2/generated.hpp"
 #include "ps2/memory.hpp"
 #include "ps2/os.hpp"
@@ -263,8 +264,31 @@ void track_words() {
     }
 }
 
+// PS2_IOP_LOAD=1: every 100 frames, the real time per frame the emulation thread spent on the IOP side (see load_stats.hpp)
+void report_load() {
+    if (!cost::g_on || g_frames % 100 != 0) return;
+    static std::uint64_t last_ns[cost::kParts] = {}, last_count[cost::kParts] = {}, last_cycles = 0, last_bytes = 0, last_frame = 0;
+    const double frames = static_cast<double>(g_frames - last_frame);
+    if (frames <= 0) return;
+    auto ms = [&](int p) { return static_cast<double>(cost::g_ns[p] - last_ns[p]) / 1e6 / frames; };
+    auto calls = [&](int p) { return static_cast<double>(cost::g_count[p] - last_count[p]) / frames; };
+    std::fprintf(stderr,
+                 "[load] frames %llu-%llu, ms per frame: sync_iop %.2f (%.0f calls) = iop run %.2f [interpreter %.2f for %.0f k cycles, jobs %.2f of which sound chip %.2f (%.0f ticks)] + sif pump %.2f; disc %.3f (%.2f reads, %.1f KB)\n",
+                 static_cast<unsigned long long>(last_frame), static_cast<unsigned long long>(g_frames), ms(cost::kSync), calls(cost::kSync), ms(cost::kIopRun), ms(cost::kIopExec),
+                 static_cast<double>(cost::g_exec_cycles - last_cycles) / 1000.0 / frames, ms(cost::kIopJobs), ms(cost::kSpuTick), calls(cost::kSpuTick), ms(cost::kSifPump), ms(cost::kDisc),
+                 calls(cost::kDisc), static_cast<double>(cost::g_disc_bytes - last_bytes) / 1024.0 / frames);
+    for (int p = 0; p < cost::kParts; ++p) {
+        last_ns[p] = cost::g_ns[p];
+        last_count[p] = cost::g_count[p];
+    }
+    last_cycles = cost::g_exec_cycles;
+    last_bytes = cost::g_disc_bytes;
+    last_frame = g_frames;
+}
+
 void vblank() {
     ++g_frames;
+    report_load();
     time_frames();
     apply_presses();
     latch_pads();
@@ -525,11 +549,13 @@ bool load_elf(const std::string &path, std::uint32_t &entry) {
 }
 
 void sync_iop() {
+    const cost::Timer whole(cost::kSync);
     const std::uint64_t t = now();
     if (t > g_iop_synced) {
         iop::run(t - g_iop_synced);
         g_iop_synced = t;
     }
+    const cost::Timer pump_time(cost::kSifPump);
     sif::pump();
 }
 

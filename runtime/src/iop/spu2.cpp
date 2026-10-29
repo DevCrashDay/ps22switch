@@ -3,6 +3,7 @@
 #include "hw.hpp"
 #include "iop.hpp"
 #include "kernel.hpp"
+#include "../load_stats.hpp"
 #include "ps2/os.hpp"
 
 #include "ps2/state.hpp"
@@ -434,6 +435,7 @@ void write_rings(int core, const std::int16_t (*rings)[kBatch]) {
 }
 
 void tick() {
+    const cost::Timer time_it(cost::kSpuTick);
     std::int16_t out[kBatch * 2];
     std::int32_t sum[2][kBatch][2] = {}, wet[2][kBatch][2] = {}, echo[2][kBatch][2] = {};
     std::int16_t rings[2][8][kBatch] = {};
