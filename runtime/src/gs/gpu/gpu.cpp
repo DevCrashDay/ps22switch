@@ -883,6 +883,20 @@ bool batch_conflict(const Range &r, bool clut) {
 
 void emit_pre() {
     for (const PreOp &op : g_pre) hw_touch(op.range, !op.clut);
+    // Uploads and CLUT loads usually alternate (a texture, its palette, the next texture...), and every switch between the two kinds is
+    // one more dispatch with a barrier behind it: about 60 microseconds each on the Switch. When no CLUT load reads memory that a later
+    // upload of the queue writes, every upload can go first and every CLUT load after them, in their own order: the same memory is read
+    // and written as before, in two dispatches (fewer when uploads overlap each other). PS2_PRE_REORDER=0 keeps the queue's order.
+    static const bool reorder = os::env("PS2_PRE_REORDER") != "0";
+    if (reorder && g_pre.size() > 2) {
+        bool safe = true;
+        for (std::size_t a = 0; a < g_pre.size() && safe; ++a) {
+            if (!g_pre[a].clut) continue;
+            for (std::size_t z = a + 1; z < g_pre.size() && safe; ++z)
+                if (!g_pre[z].clut && g_pre[z].range.overlaps(g_pre[a].range.lo, g_pre[a].range.hi)) safe = false;
+        }
+        if (safe) std::stable_partition(g_pre.begin(), g_pre.end(), [](const PreOp &op) { return !op.clut; });
+    }
     std::size_t i = 0;
     while (i < g_pre.size()) {
         const bool clut = g_pre[i].clut;
