@@ -100,8 +100,9 @@ bool g_hw = false;
 constexpr std::uint32_t kHwSize = 2048;
 WGPUTexture g_hw_color = nullptr, g_hw_depth = nullptr;
 WGPUTextureView g_hw_color_view = nullptr, g_hw_depth_view = nullptr;
-WGPUBindGroupLayout g_hw_layout0 = nullptr, g_hw_layout1 = nullptr, g_hw_layout2 = nullptr, g_hw_layout_none = nullptr;
+WGPUBindGroupLayout g_hw_layout0 = nullptr, g_hw_layout1 = nullptr, g_hw_layout2 = nullptr, g_hw_layout_none = nullptr, g_hw_layout_draw = nullptr;
 WGPUBindGroup g_hw_group0 = nullptr, g_hw_group1 = nullptr, g_hw_group2 = nullptr, g_hw_group_none = nullptr;
+WGPUBindGroup g_hw_group_draw = nullptr;  // the render passes' buffers: video memory read-only (binding 5) instead of binding 0
 WGPUPipelineLayout g_hw_load_layout = nullptr, g_hw_back_layout = nullptr, g_hw_render_layout = nullptr;
 WGPUComputePipeline g_hw_load = nullptr, g_hw_back = nullptr;
 WGPURenderPipeline g_hw_load_depth = nullptr;
@@ -1040,6 +1041,23 @@ WGPUBindGroup make_group(WGPUBuffer params, WGPUBuffer data) {
     return wgpuDeviceCreateBindGroup(g_device, &d);
 }
 
+WGPUBindGroup make_hw_draw_group() {
+    WGPUBindGroupEntry e[5] = {};
+    WGPUBuffer buffers[5] = {g_tables, g_params, g_data, g_clut, g_vram};
+    const std::uint32_t bindings[5] = {1, 2, 3, 4, 5};
+    for (int i = 0; i < 5; ++i) {
+        e[i] = WGPU_BIND_GROUP_ENTRY_INIT;
+        e[i].binding = bindings[i];
+        e[i].buffer = buffers[i];
+        e[i].size = bindings[i] == 2 ? kParamStride : WGPU_WHOLE_SIZE;
+    }
+    WGPUBindGroupDescriptor d = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
+    d.layout = g_hw_layout_draw;
+    d.entryCount = 5;
+    d.entries = e;
+    return wgpuDeviceCreateBindGroup(g_device, &d);
+}
+
 WGPUBindGroup make_hw_group() {
     WGPUBindGroupEntry e[5] = {};
     WGPUBuffer buffers[5] = {g_vram, g_tables, g_params, g_data, g_clut};
@@ -1062,6 +1080,8 @@ void rebuild_group() {
     if (g_hw) {
         if (g_hw_group0) wgpuBindGroupRelease(g_hw_group0);
         g_hw_group0 = make_hw_group();
+        if (g_hw_group_draw) wgpuBindGroupRelease(g_hw_group_draw);
+        g_hw_group_draw = make_hw_draw_group();
     }
 }
 
@@ -1252,13 +1272,13 @@ void submit(WGPUTextureView present_view = nullptr) {
                 wgpuRenderPassEncoderSetScissorRect(rp, static_cast<std::uint32_t>(hp.lx0), static_cast<std::uint32_t>(hp.ly0), static_cast<std::uint32_t>(hp.lx1 - hp.lx0 + 1),
                                                     static_cast<std::uint32_t>(hp.ly1 - hp.ly0 + 1));
                 wgpuRenderPassEncoderSetPipeline(rp, g_hw_load_depth);
-                wgpuRenderPassEncoderSetBindGroup(rp, 0, g_hw_group0, 1, &load_offset);
+                wgpuRenderPassEncoderSetBindGroup(rp, 0, g_hw_group_draw, 1, &load_offset);
                 wgpuRenderPassEncoderDraw(rp, 3, 1, 0, 0);
                 wgpuRenderPassEncoderSetScissorRect(rp, static_cast<std::uint32_t>(hp.x0), static_cast<std::uint32_t>(hp.y0), static_cast<std::uint32_t>(hp.x1 - hp.x0 + 1),
                                                     static_cast<std::uint32_t>(hp.y1 - hp.y0 + 1));
             }
             const std::uint32_t draw_offset = hp.draw_param * kParamStride;
-            wgpuRenderPassEncoderSetBindGroup(rp, 0, g_hw_group0, 1, &draw_offset);
+            wgpuRenderPassEncoderSetBindGroup(rp, 0, g_hw_group_draw, 1, &draw_offset);
             for (const HwRun &run : hp.runs) {
                 WGPURenderPipeline pipeline = hw_pipeline(run.key);
                 if (!pipeline) continue;
@@ -2079,6 +2099,18 @@ bool hw_init() {
     ld.entryCount = 5;
     ld.entries = le;
     g_hw_layout0 = wgpuDeviceCreateBindGroupLayout(g_device, &ld);
+    // the render passes': bindings 1 to 4 as above, video memory read-only as 5
+    WGPUBindGroupLayoutEntry dle[5] = {};
+    for (int i = 0; i < 5; ++i) {
+        dle[i] = WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
+        dle[i].binding = static_cast<std::uint32_t>(i + 1);
+        dle[i].visibility = WGPUShaderStage_Vertex | WGPUShaderStage_Fragment;
+        dle[i].buffer.type = i == 1 ? WGPUBufferBindingType_Uniform : WGPUBufferBindingType_ReadOnlyStorage;
+        dle[i].buffer.hasDynamicOffset = i == 1;
+        dle[i].buffer.minBindingSize = i == 1 ? kParamStride : 0;
+    }
+    ld.entries = dle;
+    g_hw_layout_draw = wgpuDeviceCreateBindGroupLayout(g_device, &ld);
 
     WGPUBindGroupLayoutEntry storage = WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
     storage.binding = 0;
@@ -2138,7 +2170,7 @@ bool hw_init() {
     pld.bindGroupLayouts = back_layouts;
     g_hw_back_layout = wgpuDeviceCreatePipelineLayout(g_device, &pld);
     pld.bindGroupLayoutCount = 1;
-    pld.bindGroupLayouts = &g_hw_layout0;
+    pld.bindGroupLayouts = &g_hw_layout_draw;
     g_hw_render_layout = wgpuDeviceCreatePipelineLayout(g_device, &pld);
 
     WGPUShaderSourceWGSL source = WGPU_SHADER_SOURCE_WGSL_INIT;

@@ -19,6 +19,9 @@ struct Params {
 @group(0) @binding(2) var<uniform> params: Params;
 @group(0) @binding(3) var<storage, read> data: array<u32>;
 @group(0) @binding(4) var<storage, read> clut: array<u32>;
+// Video memory again, read-only and without atomics, for the drawing (the render passes bind it instead of binding 0): an atomic load
+// skips the GPU's first-level cache, which on the Switch made every texel of every pixel a trip to the second-level cache.
+@group(0) @binding(5) var<storage, read> vram_ro: array<u32>;
 
 @group(1) @binding(0) var color_out: texture_storage_2d<rgba8unorm, write>;
 @group(2) @binding(0) var color_in: texture_2d<f32>;
@@ -222,7 +225,8 @@ fn hw_load_depth(in: FullOut) -> @builtin(frag_depth) f32 {
     let x = u32(in.position.x);
     let y = u32(in.position.y);
     let zmax = prm(7u);
-    let z = read_pixel(prm(4u), prm(3u), prm(1u), x, y) & zmax;
+    let l = locate(prm(4u), prm(3u), prm(1u), x, y);
+    let z = (vram_ro[l.word] >> l.shift) & l.mask & zmax;
     return f32(z) / f32(zmax);
 }
 
@@ -377,7 +381,7 @@ fn fetch(t: Tex, xi: i32, yi: i32) -> u32 {
     let x = u32(wrap_coord(xi, 1 << t.tw, mode(t, 24u, 2u), t.minu, t.maxu));
     let y = u32(wrap_coord(yi, 1 << t.th, mode(t, 26u, 2u), t.minv, t.maxv));
     let l = addr(t.tf, x, y);
-    return convert(t, (atomicLoad(&vram[l.word]) >> l.shift) & l.mask);
+    return convert(t, (vram_ro[l.word] >> l.shift) & l.mask);
 }
 
 fn rgba(c: u32) -> vec4<f32> {
