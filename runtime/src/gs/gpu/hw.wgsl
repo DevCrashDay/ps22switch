@@ -22,6 +22,8 @@ struct Params {
 // Video memory again, read-only and without atomics, for the drawing (the render passes bind it instead of binding 0): an atomic load
 // skips the GPU's first-level cache, which on the Switch made every texel of every pixel a trip to the second-level cache.
 @group(0) @binding(5) var<storage, read> vram_ro: array<u32>;
+// Textures decoded ahead of the draw (PS2_HW_DECODE), at the offset in setup word 24 (none: 0xFFFFFFFF)
+@group(0) @binding(6) var<storage, read> decoded: array<u32>;
 
 @group(1) @binding(0) var color_out: texture_storage_2d<rgba8unorm, write>;
 @group(2) @binding(0) var color_in: texture_2d<f32>;
@@ -270,6 +272,7 @@ struct Tex {
     clut: u32,
     tpsm: u32,
     tf: Fmt,
+    dec: u32,
 }
 
 fn load_tex(at: u32) -> Tex {
@@ -291,6 +294,7 @@ fn load_tex(at: u32) -> Tex {
     t.fogcol = data[at + 21u];
     t.clut = data[at + 22u];
     t.tf = Fmt(data[at + 25u], data[at + 26u], data[at + 27u], data[at + 28u], data[at + 29u]);
+    t.dec = data[at + 24u];
     return t;
 }
 
@@ -380,6 +384,9 @@ fn wrap_coord(v: i32, size: i32, m: u32, mn: u32, mx: u32) -> i32 {
 fn fetch(t: Tex, xi: i32, yi: i32) -> u32 {
     let x = u32(wrap_coord(xi, 1 << t.tw, mode(t, 24u, 2u), t.minu, t.maxu));
     let y = u32(wrap_coord(yi, 1 << t.th, mode(t, 26u, 2u), t.minv, t.maxv));
+    if (t.dec != 0xFFFFFFFFu) {
+        return decoded[t.dec + (y << t.tw) + x];
+    }
     let l = addr(t.tf, x, y);
     return convert(t, (vram_ro[l.word] >> l.shift) & l.mask);
 }
@@ -415,6 +422,7 @@ struct DrawOut {
     @location(3) @interpolate(flat) t1: vec4<u32>,
     @location(4) @interpolate(flat) t2: vec4<u32>,
     @location(5) @interpolate(flat) t3: vec4<u32>,
+    @location(6) @interpolate(flat) dec: u32,
 }
 
 fn pack_tex(at: u32, out: ptr<function, DrawOut>) {
@@ -422,6 +430,7 @@ fn pack_tex(at: u32, out: ptr<function, DrawOut>) {
     (*out).t1 = vec4<u32>(data[at + 16u] | (data[at + 17u] << 8u), data[at + 18u], data[at + 19u], data[at + 20u]);
     (*out).t2 = vec4<u32>(data[at + 21u], data[at + 22u], data[at + 14u], data[at + 25u]);
     (*out).t3 = vec4<u32>(data[at + 26u], data[at + 27u], data[at + 28u], data[at + 29u]);
+    (*out).dec = data[at + 24u];
 }
 
 fn unpack_tex(in: DrawOut) -> Tex {
@@ -443,6 +452,7 @@ fn unpack_tex(in: DrawOut) -> Tex {
     t.clut = in.t2.y;
     t.tpsm = in.t2.z;
     t.tf = Fmt(in.t2.w, in.t3.x, in.t3.y, in.t3.z, in.t3.w);
+    t.dec = in.dec;
     return t;
 }
 

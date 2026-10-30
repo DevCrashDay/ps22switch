@@ -581,6 +581,70 @@ void plan_decodes(std::uint32_t prims) {
     }
 }
 
+// PS2_HW_DECODE=1: the hardware path decodes a batch's textures once into g_decoded (texels as colours, CLUT applied) and the fragment
+// shader reads them there with one load instead of a swizzle table load, a video memory load and a CLUT load per texel. A decoded
+// texture is kept for the later batches of the submit until video memory under it is written (an upload, a write-back of the images,
+// anything behind flush_all). Only textures the batch covers with at least half as many pixels as they have texels are decoded the first
+// time, so a big texture drawn small is still read in place.
+struct HwDecoded {
+    std::uint32_t key[10];
+    Range range;
+    std::uint32_t offset;
+};
+std::vector<HwDecoded> g_hw_decoded;
+bool g_hw_decode = false;
+
+void hw_forget(const Range &r) {
+    if (g_hw_decoded.empty()) return;
+    std::erase_if(g_hw_decoded, [&](const HwDecoded &d) { return d.range.overlaps(r.lo, r.hi); });
+}
+
+// After the batch's textures are in video memory: decide, write the offsets into the setups in the arena and dispatch the decodes.
+void hw_plan_decodes(const Batch &b, std::uint32_t setup_offset, std::uint32_t prims) {
+    if (!g_hw_decode) return;
+    const std::uint32_t setups = static_cast<std::uint32_t>(b.setups.size() / kSetupWords);
+    static std::vector<std::uint64_t> covered;
+    covered.assign(setups, 0);
+    for (std::uint32_t i = 0; i < prims; ++i) {
+        const std::uint32_t setup = b.prims[static_cast<std::size_t>(i) * kPrimWords];
+        const std::uint32_t lo = b.boxes[i * 2], hi = b.boxes[i * 2 + 1];
+        const std::int64_t w = static_cast<std::int64_t>(hi & 0xFFFFu) - static_cast<std::int64_t>(lo & 0xFFFFu) + 1, h = static_cast<std::int64_t>(hi >> 16) - static_cast<std::int64_t>(lo >> 16) + 1;
+        if (setup < setups && w > 0 && h > 0) covered[setup] += static_cast<std::uint64_t>(w * h);
+    }
+    static const int kKey[] = {12, 13, 14, 15, 16, 17, 18, 19, 20, 22};
+    for (std::uint32_t i = 0; i < setups; ++i) {
+        const std::uint32_t *w = b.setups.data() + static_cast<std::size_t>(i) * kSetupWords;
+        if (!(w[0] & 2u) || !covered[i]) continue;
+        std::uint32_t key[10];
+        for (int k = 0; k < 10; ++k) key[k] = w[kKey[k]];
+        key[9] ^= (w[0] & 32768u) << 16;  // AEM
+        std::uint32_t offset = ~0u;
+        for (const HwDecoded &d : g_hw_decoded)
+            if (std::equal(std::begin(key), std::end(key), d.key)) {
+                offset = d.offset;
+                break;
+            }
+        if (offset == ~0u) {
+            const std::uint32_t tw = w[15] & 0xFFu, th = w[15] >> 8;
+            if (tw > 10 || th > 10) continue;
+            const std::uint32_t mu = (w[7] >> 24) & 3u, mv = (w[7] >> 26) & 3u;
+            const auto inside = [](std::uint32_t mode, std::uint32_t region, std::uint32_t size) { return mode < 2 || ((region & 0x3FFu) < (1u << size) && (region >> 16) < (1u << size)); };
+            if (!inside(mu, w[18], tw) || !inside(mv, w[19], th)) continue;
+            const std::uint32_t words = 1u << (tw + th);
+            if (words > covered[i] * 2 || g_decoded_used + words > kDecodedWords) continue;
+            offset = g_decoded_used;
+            g_decoded_used += words;
+            HwDecoded d;
+            std::copy(std::begin(key), std::end(key), d.key);
+            d.range = region(w[12], w[13], w[14], 0, 0, (1 << tw) - 1, (1 << th) - 1);
+            d.offset = offset;
+            g_hw_decoded.push_back(d);
+            dispatch_linear(kDecode, words, push_params({setup_offset + i * kSetupWords, offset, words}));
+        }
+        g_arena.data()[setup_offset + i * kSetupWords + 24] = offset;
+    }
+}
+
 std::uint32_t snapshot_batch(std::uint32_t prims, std::uint32_t &lo, std::uint32_t &hi) {
     Batch &b = g_batch;
     lo = hi = 0;
@@ -670,6 +734,7 @@ Range hw_valid_range() {
 void hw_write_back() {
     HwImages &h = g_hw_images;
     if (!g_hw || !h.valid || (!h.dirty && !h.zdirty)) return;
+    hw_forget(hw_drawn_range());
     const std::uint32_t param = push_params({h.fbp, h.fbw, h.fpsm, h.zbp, h.zpsm, static_cast<std::uint32_t>(h.dx0) | (static_cast<std::uint32_t>(h.dy0) << 16),
                                              static_cast<std::uint32_t>(h.dx1) | (static_cast<std::uint32_t>(h.dy1) << 16), z_max(h.zpsm), h.fbmsk, h.zdirty ? 1u : 0u});
     Command back{kRaster, static_cast<std::uint32_t>(h.dx1 - h.dx0 + 8) / 8, static_cast<std::uint32_t>(h.dy1 - h.dy0 + 8) / 8, param};
@@ -684,6 +749,7 @@ void hw_write_back() {
 // it changes there
 void hw_touch(const Range &r, bool write) {
     HwImages &h = g_hw_images;
+    if (write) hw_forget(r);
     if (!g_hw || !h.valid) return;
     if ((h.dirty || h.zdirty) && hw_drawn_range().overlaps(r.lo, r.hi)) hw_write_back();
     if (write && hw_valid_range().overlaps(r.lo, r.hi)) h.valid = false;
@@ -702,6 +768,7 @@ void hw_emit(const Batch &b, std::uint32_t prim_offset, std::uint32_t setup_offs
     HwImages &h = g_hw_images;
     // textures of this batch drawn into the images: to video memory first, the fragment shader reads them there
     for (const Range &t : g_batch_reads) hw_touch(t, false);
+    hw_plan_decodes(b, setup_offset, prims);
     const bool same = h.valid && h.fbp == b.fbp && h.fbw == b.fbw && h.fpsm == b.fpsm && h.zbp == b.zbp && h.zpsm == b.zpsm;
     if (!same) hw_sync_all();
     const bool inside = h.valid && x0 >= h.rx0 && y0 >= h.ry0 && x1 <= h.rx1 && y1 <= h.ry1;
@@ -1035,6 +1102,7 @@ void flush_all() {
     flush_image();
     emit_all();
     hw_sync_all();  // what follows (the display, a download, a copy, a save state) reads or changes video memory
+    g_hw_decoded.clear();
 }
 
 void on_error(WGPUDevice const *, WGPUErrorType type, WGPUStringView message, void *, void *) {
@@ -1079,10 +1147,10 @@ WGPUBindGroup make_group(WGPUBuffer params, WGPUBuffer data) {
 }
 
 WGPUBindGroup make_hw_draw_group() {
-    WGPUBindGroupEntry e[5] = {};
-    WGPUBuffer buffers[5] = {g_tables, g_params, g_data, g_clut, g_vram};
-    const std::uint32_t bindings[5] = {1, 2, 3, 4, 5};
-    for (int i = 0; i < 5; ++i) {
+    WGPUBindGroupEntry e[6] = {};
+    WGPUBuffer buffers[6] = {g_tables, g_params, g_data, g_clut, g_vram, g_decoded};
+    const std::uint32_t bindings[6] = {1, 2, 3, 4, 5, 6};
+    for (int i = 0; i < 6; ++i) {
         e[i] = WGPU_BIND_GROUP_ENTRY_INIT;
         e[i].binding = bindings[i];
         e[i].buffer = buffers[i];
@@ -1090,7 +1158,7 @@ WGPUBindGroup make_hw_draw_group() {
     }
     WGPUBindGroupDescriptor d = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
     d.layout = g_hw_layout_draw;
-    d.entryCount = 5;
+    d.entryCount = 6;
     d.entries = e;
     return wgpuDeviceCreateBindGroup(g_device, &d);
 }
@@ -1208,6 +1276,7 @@ void profile_submit() {
     g_param_records.clear();
     g_arena.clear();
     g_decoded_used = 0;
+    g_hw_decoded.clear();
     g_clut_loads = 0;
 }
 
@@ -1233,7 +1302,7 @@ void hw_merge_passes() {
     std::vector<Command> held;
     std::ptrdiff_t last = -1;  // the last render pass in out, while only CLUT loads followed it
     for (const Command &c : g_commands) {
-        if (last >= 0 && !c.hw && c.pipeline == kLoadClut) {
+        if (last >= 0 && !c.hw && (c.pipeline == kLoadClut || c.pipeline == kDecode)) {
             held.push_back(c);
             continue;
         }
@@ -1441,6 +1510,7 @@ void submit(WGPUTextureView present_view = nullptr) {
     g_param_records.clear();
     g_arena.clear();
     g_decoded_used = 0;
+    g_hw_decoded.clear();
     g_clut_loads = 0;
 }
 
@@ -2066,6 +2136,7 @@ bool init(Mode m) {
     g_cache = make_buffer(static_cast<std::uint64_t>(kCacheWords) * 4, WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst);
     g_decoded = make_buffer(static_cast<std::uint64_t>(kDecodedWords) * 4, WGPUBufferUsage_Storage);
     if (const char *decode = std::getenv("PS2_DECODE")) g_decode = std::atoi(decode) != 0;
+    g_hw_decode = os::env("PS2_HW_DECODE") == "1";
     g_cache_copy.assign(kCacheWords, 0);
     g_readback = make_buffer(static_cast<std::uint64_t>(g_copy_words) * 4, WGPUBufferUsage_MapRead | WGPUBufferUsage_CopyDst);
     if (g_timestamps) {
@@ -2184,9 +2255,9 @@ bool hw_init() {
     ld.entryCount = 5;
     ld.entries = le;
     g_hw_layout0 = wgpuDeviceCreateBindGroupLayout(g_device, &ld);
-    // the render passes': bindings 1 to 4 as above, video memory read-only as 5
-    WGPUBindGroupLayoutEntry dle[5] = {};
-    for (int i = 0; i < 5; ++i) {
+    // the render passes': bindings 1 to 4 as above, video memory read-only as 5, the decoded textures as 6
+    WGPUBindGroupLayoutEntry dle[6] = {};
+    for (int i = 0; i < 6; ++i) {
         dle[i] = WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
         dle[i].binding = static_cast<std::uint32_t>(i + 1);
         dle[i].visibility = WGPUShaderStage_Vertex | WGPUShaderStage_Fragment;
@@ -2194,6 +2265,7 @@ bool hw_init() {
         dle[i].buffer.hasDynamicOffset = i == 1;
         dle[i].buffer.minBindingSize = i == 1 ? kParamStride : 0;
     }
+    ld.entryCount = 6;
     ld.entries = dle;
     g_hw_layout_draw = wgpuDeviceCreateBindGroupLayout(g_device, &ld);
 
