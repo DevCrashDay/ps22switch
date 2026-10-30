@@ -674,8 +674,16 @@ void thread_tune(Who who) {
     // Horizon never moves a thread to another core by itself: every thread libnx starts stays on the core of the process (core 0),
     // so the three would share one core. A game gets cores 0 to 2: the window thread (drawing, SDL) keeps core 0, the emulation
     // takes core 1 and the vector units core 2.
-    static constexpr std::int32_t kCore[3] = {1, 2, 0};
-    const std::int32_t core = kCore[static_cast<int>(who)];
+    // PS2_SWITCH_CORES=e,v,w picks other cores for the emulation, vector-unit and window threads (0 to 2), for trying placements
+    static const auto cores = [] {
+        std::array<std::int32_t, 3> c{1, 2, 0};
+        const std::string spec = os::env("PS2_SWITCH_CORES");
+        if (spec.size() == 5 && spec[1] == ',' && spec[3] == ',')
+            for (int i = 0; i < 3; ++i)
+                if (spec[i * 2] >= '0' && spec[i * 2] <= '2') c[i] = spec[i * 2] - '0';
+        return c;
+    }();
+    const std::int32_t core = cores[static_cast<std::size_t>(who)];
     if (svcSetThreadCoreMask(0xFFFF8000u /* CUR_THREAD_HANDLE */, core, 1u << core) != 0)
         std::fprintf(stderr, "[switch] cannot move a thread to core %d\n", static_cast<int>(core));
 #else
