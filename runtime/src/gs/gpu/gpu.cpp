@@ -787,7 +787,27 @@ void emit_pre() {
                 total += g_pre[k].rec[7];
             }
         }
-        if (clut) g_commands.push_back({kLoadClut, count * 2, 1, push_params({offset, count})});  // two workgroups per load (gs.wgsl)
+        if (clut) {
+            // which load last wrote each block of 16 entries, up to every load (gs.wgsl load_clut)
+            std::uint32_t *owners = g_arena.grow(count * 32u);
+            const std::uint32_t table = static_cast<std::uint32_t>(owners - g_arena.data());
+            std::uint32_t now[32];
+            std::fill(std::begin(now), std::end(now), 0xFFFFFFFFu);
+            for (std::uint32_t n = 0; n < count; ++n) {
+                const std::uint32_t *r = g_pre[i + n].rec;
+                const std::uint32_t csm = r[4], csa = r[5];
+                const bool eight = r[6] != 0;
+                if (csm) {
+                    for (std::uint32_t k = 0; k < (eight ? 16u : 1u); ++k) now[(csa + k) & 31u] = n;
+                } else if (eight) {
+                    for (std::uint32_t k = 0; k < 16u; ++k) now[k] = n;
+                } else {
+                    now[csa & 15u] = n;
+                }
+                std::memcpy(g_arena.data() + table + n * 32u, now, sizeof now);
+            }
+            g_commands.push_back({kLoadClut, count * 2, 1, push_params({offset, count, table})});  // two workgroups per load
+        }
         else dispatch_linear(kUpload, total, push_params({offset, count, total}));
         i = j;
     }

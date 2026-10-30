@@ -343,8 +343,10 @@ fn copy_write(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 // CLUT loads (gpu.cpp load_clut): load n makes slot dst(n) from slot src(n) = dst(n - 1) and the palette entries it reads from video
 // memory. Every entry of every slot is worked out on its own, in parallel: it is the value of the latest load up to n that writes that
-// entry, or the entry of the slot before the first load. Workgroup 2n + h makes entries h * 256 to h * 256 + 255 of slot dst(n).
-// (One workgroup doing the loads in turn, with barriers between, took 0.6 ms per batch of loads on the Switch.)
+// entry, or the entry of the slot before the first load. Loads write whole blocks of 16 entries, and which load last wrote each of the
+// 32 blocks of slot n comes worked out by the processor (prm(2): 32 words per load, 0xFFFFFFFF for the slot before). Workgroup 2n + h
+// makes entries h * 256 to h * 256 + 255 of slot dst(n). (One workgroup doing the loads in turn, with barriers between, took 0.6 ms per
+// batch of loads on the Switch.)
 fn clut_entry(r: u32, e: u32, value: ptr<function, u32>) -> bool {
     let cbp = data[r + 2u];
     let cpsm = data[r + 3u];
@@ -387,13 +389,10 @@ fn load_clut(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_in
         return;
     }
     let first = prm(0u);
-    var value = clut[data[first] * CLUT_ENTRIES + e];
-    for (var m = n + 1u; m > 0u; m = m - 1u) {
-        var v = 0u;
-        if (clut_entry(first + (m - 1u) * 12u, e, &v)) {
-            value = v;
-            break;
-        }
+    let m = data[prm(2u) + n * 32u + e / 16u];
+    var value = 0u;
+    if (m == 0xFFFFFFFFu || !clut_entry(first + m * 12u, e, &value)) {
+        value = clut[data[first] * CLUT_ENTRIES + e];
     }
     clut[data[first + n * 12u + 1u] * CLUT_ENTRIES + e] = value;
 }
