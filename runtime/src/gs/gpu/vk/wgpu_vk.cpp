@@ -57,7 +57,8 @@ extern "C" void *__stdcall GetProcAddress(void *module, const char *name);
 #define PS2_VK_GLOBAL(X) X(vkCreateInstance) X(vkEnumerateInstanceVersion)
 #define PS2_VK_INSTANCE(X)                                                                                                              \
     X(vkDestroyInstance) X(vkEnumeratePhysicalDevices) X(vkGetPhysicalDeviceProperties) X(vkGetPhysicalDeviceQueueFamilyProperties)       \
-    X(vkGetPhysicalDeviceMemoryProperties) X(vkGetPhysicalDeviceFeatures) X(vkCreateDevice) X(vkGetDeviceProcAddr)
+    X(vkGetPhysicalDeviceMemoryProperties) X(vkGetPhysicalDeviceFeatures) X(vkCreateDevice) X(vkGetDeviceProcAddr)     \
+    X(vkEnumerateDeviceExtensionProperties)
 #define PS2_VK_DEVICE(X)                                                                                                                \
     X(vkDestroyDevice) X(vkGetDeviceQueue) X(vkQueueSubmit) X(vkDeviceWaitIdle) X(vkCreateBuffer) X(vkDestroyBuffer)                    \
     X(vkGetBufferMemoryRequirements) X(vkAllocateMemory) X(vkFreeMemory) X(vkBindBufferMemory) X(vkMapMemory)                          \
@@ -208,6 +209,11 @@ struct WGPUDeviceImpl {
     std::uint64_t profile_submits = 0, most_in_flight = 0, waits = 0;
     double waited_ms = 0;
     std::chrono::steady_clock::time_point profile_start = std::chrono::steady_clock::now();
+    // PS2_VK_STATS=1: the driver's statistics of every compiled program (registers, spills, instructions) in the log, and its machine code
+    // in vk_<program>.txt next to the program, through VK_KHR_pipeline_executable_properties
+    PFN_vkGetPipelineExecutablePropertiesKHR executables = nullptr;
+    PFN_vkGetPipelineExecutableStatisticsKHR statistics = nullptr;
+    PFN_vkGetPipelineExecutableInternalRepresentationsKHR representations = nullptr;
 };
 
 struct WGPUQueueImpl {
@@ -609,6 +615,53 @@ void on_big_stack(const std::function<void()> &work) {
 #endif
 }
 
+void report_executables(WGPUDevice d, VkPipeline pipeline, const std::string &name) {
+    VkPipelineInfoKHR pi{VK_STRUCTURE_TYPE_PIPELINE_INFO_KHR};
+    pi.pipeline = pipeline;
+    std::uint32_t count = 0;
+    if (d->executables(d->device, &pi, &count, nullptr) != VK_SUCCESS) return;
+    for (std::uint32_t e = 0; e < count; ++e) {
+        VkPipelineExecutableInfoKHR ei{VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INFO_KHR};
+        ei.pipeline = pipeline;
+        ei.executableIndex = e;
+        std::uint32_t n = 0;
+        d->statistics(d->device, &ei, &n, nullptr);
+        std::vector<VkPipelineExecutableStatisticKHR> st(n, VkPipelineExecutableStatisticKHR{VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_STATISTIC_KHR});
+        d->statistics(d->device, &ei, &n, st.data());
+        std::string line = "[vk-stats] " + name + ":";
+        for (const VkPipelineExecutableStatisticKHR &x : st) {
+            char value[64];
+            switch (x.format) {
+            case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_BOOL32_KHR: std::snprintf(value, sizeof value, "%s", x.value.b32 ? "yes" : "no"); break;
+            case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_INT64_KHR: std::snprintf(value, sizeof value, "%lld", static_cast<long long>(x.value.i64)); break;
+            case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_UINT64_KHR: std::snprintf(value, sizeof value, "%llu", static_cast<unsigned long long>(x.value.u64)); break;
+            default: std::snprintf(value, sizeof value, "%g", x.value.f64); break;
+            }
+            line += std::string(" ") + x.name + "=" + value + ";";
+        }
+        std::fprintf(stderr, "%s\n", line.c_str());
+        if (!d->representations) continue;
+        std::uint32_t m = 0;
+        d->representations(d->device, &ei, &m, nullptr);
+        std::vector<VkPipelineExecutableInternalRepresentationKHR> reps(m, VkPipelineExecutableInternalRepresentationKHR{VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INTERNAL_REPRESENTATION_KHR});
+        d->representations(d->device, &ei, &m, reps.data());
+        std::vector<std::vector<char>> data(m);
+        for (std::uint32_t i = 0; i < m; ++i) {
+            data[i].resize(reps[i].dataSize);
+            reps[i].pData = data[i].data();
+        }
+        d->representations(d->device, &ei, &m, reps.data());
+        if (std::FILE *f = std::fopen(("vk_" + name + ".txt").c_str(), "w")) {
+            for (std::uint32_t i = 0; i < m; ++i) {
+                std::fprintf(f, "==== %s: %s\n", reps[i].name, reps[i].description);
+                if (reps[i].isText && !data[i].empty()) std::fwrite(data[i].data(), 1, std::strlen(data[i].data()), f);
+                std::fprintf(f, "\n");
+            }
+            std::fclose(f);
+        }
+    }
+}
+
 WGPUDevice g_device = nullptr;  // the one device (gpu.cpp makes one); wgpuInstanceProcessEvents polls it
 
 const ps2::gs::gpu::vk::SpirvVariant *find_variant(std::uint64_t hash, const WGPUConstantEntry *constants, std::size_t count) {
@@ -792,7 +845,24 @@ WGPUFuture wgpuAdapterRequestDevice(WGPUAdapter adapter, WGPUDeviceDescriptor co
     qi.queueFamilyIndex = adapter->family;
     qi.queueCount = 1;
     qi.pQueuePriorities = &priority;
+    VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR fexe{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR};
+    std::vector<const char *> extensions;
+    if (const char *st = std::getenv("PS2_VK_STATS"); st && st[0] == '1') {
+        std::uint32_t n = 0;
+        vkEnumerateDeviceExtensionProperties(adapter->phys, nullptr, &n, nullptr);
+        std::vector<VkExtensionProperties> ext(n);
+        vkEnumerateDeviceExtensionProperties(adapter->phys, nullptr, &n, ext.data());
+        for (const VkExtensionProperties &e : ext)
+            if (!std::strcmp(e.extensionName, VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME)) {
+                extensions.push_back(VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME);
+                fexe.pipelineExecutableInfo = VK_TRUE;
+                f12.pNext = &fexe;
+            }
+        if (extensions.empty()) std::fprintf(stderr, "[vk-stats] the driver has no VK_KHR_pipeline_executable_properties\n");
+    }
     VkDeviceCreateInfo ci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
+    ci.enabledExtensionCount = static_cast<std::uint32_t>(extensions.size());
+    ci.ppEnabledExtensionNames = extensions.data();
     ci.pNext = &f12;
     ci.queueCreateInfoCount = 1;
     ci.pQueueCreateInfos = &qi;
@@ -804,6 +874,11 @@ WGPUFuture wgpuAdapterRequestDevice(WGPUAdapter adapter, WGPUDeviceDescriptor co
     }
     load_device(device);
     auto *d = new WGPUDeviceImpl;
+    if (!extensions.empty()) {
+        d->executables = reinterpret_cast<PFN_vkGetPipelineExecutablePropertiesKHR>(vkGetDeviceProcAddr(device, "vkGetPipelineExecutablePropertiesKHR"));
+        d->statistics = reinterpret_cast<PFN_vkGetPipelineExecutableStatisticsKHR>(vkGetDeviceProcAddr(device, "vkGetPipelineExecutableStatisticsKHR"));
+        d->representations = reinterpret_cast<PFN_vkGetPipelineExecutableInternalRepresentationsKHR>(vkGetDeviceProcAddr(device, "vkGetPipelineExecutableInternalRepresentationsKHR"));
+    }
     d->adapter = adapter;
     d->device = device;
     vkGetDeviceQueue(device, adapter->family, 0, &d->queue);
@@ -1147,6 +1222,7 @@ WGPUComputePipeline wgpuDeviceCreateComputePipeline(WGPUDevice d, WGPUComputePip
     ci.stage.module = module;
     ci.stage.pName = entry.c_str();
     ci.layout = descriptor->layout->layout;
+    if (d->executables) ci.flags = VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR | VK_PIPELINE_CREATE_CAPTURE_INTERNAL_REPRESENTATIONS_BIT_KHR;
     auto *p = new WGPUComputePipelineImpl;
     p->device = d;
     p->layout = descriptor->layout->layout;
@@ -1159,6 +1235,7 @@ WGPUComputePipeline wgpuDeviceCreateComputePipeline(WGPUDevice d, WGPUComputePip
         delete p;
         return nullptr;
     }
+    if (d->executables) report_executables(d, p->pipeline, entry);
     return p;
 }
 
