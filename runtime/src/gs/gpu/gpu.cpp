@@ -115,10 +115,22 @@ struct HwRun {
 struct HwPass {
     std::uint32_t load_param, draw_param;
     bool load_depth;
-    int x0, y0, x1, y1;
+    int x0, y0, x1, y1;      // the batch's box: the scissor of its shapes
+    int lx0, ly0, lx1, ly1;  // the box the depth image is loaded in
     std::vector<HwRun> runs;
 };
 std::vector<HwPass> g_hw_passes;
+
+// What the images hold: the frame and depth buffer of the last batch, valid in the box loaded from video memory or drawn since (R),
+// and drawn but not written back yet in D. Video memory is brought up to date only when something reads it (a texture the image covers,
+// a CLUT load, the display, a download, a copy) or the image moves to other buffers; it is reloaded only when video memory changed
+// under it. Consecutive batches on the same buffers then cost no copies at all.
+struct HwImages {
+    bool valid = false, dirty = false, zdirty = false;
+    std::uint32_t fbp = 0, fbw = 0, fpsm = 0, zbp = 0, zpsm = 0, fbmsk = 0;
+    int rx0 = 0, ry0 = 0, rx1 = -1, ry1 = -1;  // valid
+    int dx0 = 0, dy0 = 0, dx1 = -1, dy1 = -1;  // drawn, not written back
+} g_hw_images;
 
 struct CommandInfo {
     std::size_t index;
@@ -633,19 +645,92 @@ void note_raster(std::uint32_t prims, std::uint32_t tiles, std::uint32_t entries
     g_command_info.push_back({g_commands.size(), {prims, tiles, entries, snapshot, b.prims[1], first[3] | (first[14] << 8) | (first[6] << 16), first[0], textured}});
 }
 
-// The batch on the hardware path: fill the images inside its box, draw its shapes in runs of the same depth mode, write back.
+Range hw_drawn_range() {
+    const HwImages &h = g_hw_images;
+    Range r = region(h.fbp, h.fbw, h.fpsm, h.dx0, h.dy0, h.dx1, h.dy1);
+    if (h.zdirty) {
+        const Range z = region(h.zbp, h.fbw, h.zpsm, h.dx0, h.dy0, h.dx1, h.dy1);
+        r.add(z.lo, z.hi);
+    }
+    return r;
+}
+
+Range hw_valid_range() {
+    const HwImages &h = g_hw_images;
+    Range r = region(h.fbp, h.fbw, h.fpsm, h.rx0, h.ry0, h.rx1, h.ry1);
+    const Range z = region(h.zbp, h.fbw, h.zpsm, h.rx0, h.ry0, h.rx1, h.ry1);
+    r.add(z.lo, z.hi);
+    return r;
+}
+
+// Video memory takes what was drawn into the images and not written back yet
+void hw_write_back() {
+    HwImages &h = g_hw_images;
+    if (!g_hw || !h.valid || (!h.dirty && !h.zdirty)) return;
+    const std::uint32_t param = push_params({h.fbp, h.fbw, h.fpsm, h.zbp, h.zpsm, static_cast<std::uint32_t>(h.dx0) | (static_cast<std::uint32_t>(h.dy0) << 16),
+                                             static_cast<std::uint32_t>(h.dx1) | (static_cast<std::uint32_t>(h.dy1) << 16), z_max(h.zpsm), h.fbmsk, h.zdirty ? 1u : 0u});
+    Command back{kRaster, static_cast<std::uint32_t>(h.dx1 - h.dx0 + 8) / 8, static_cast<std::uint32_t>(h.dy1 - h.dy0 + 8) / 8, param};
+    back.hw = 2;
+    g_commands.push_back(back);
+    h.dirty = h.zdirty = false;
+    h.dx0 = h.dy0 = 0;
+    h.dx1 = h.dy1 = -1;
+}
+
+// Something is about to read (and, with write, change) video memory in r: write back first when the images drew there, forget them when
+// it changes there
+void hw_touch(const Range &r, bool write) {
+    HwImages &h = g_hw_images;
+    if (!g_hw || !h.valid) return;
+    if ((h.dirty || h.zdirty) && hw_drawn_range().overlaps(r.lo, r.hi)) hw_write_back();
+    if (write && hw_valid_range().overlaps(r.lo, r.hi)) h.valid = false;
+}
+
+void hw_sync_all() {
+    hw_write_back();
+    g_hw_images.valid = false;
+}
+
+// The batch on the hardware path: make the images hold its buffers in its box, draw its shapes in runs of the same depth and blend mode.
 void hw_emit(const Batch &b, std::uint32_t prim_offset, std::uint32_t setup_offset, std::uint32_t prims) {
     const int x0 = std::clamp(b.minx, 0, static_cast<int>(kHwSize) - 1), y0 = std::clamp(b.miny, 0, static_cast<int>(kHwSize) - 1);
     const int x1 = std::clamp(b.maxx, 0, static_cast<int>(kHwSize) - 1), y1 = std::clamp(b.maxy, 0, static_cast<int>(kHwSize) - 1);
     if (x0 > x1 || y0 > y1 || !prims) return;
+    HwImages &h = g_hw_images;
+    // textures of this batch drawn into the images: to video memory first, the fragment shader reads them there
+    for (const Range &t : g_batch_reads) hw_touch(t, false);
+    const bool same = h.valid && h.fbp == b.fbp && h.fbw == b.fbw && h.fpsm == b.fpsm && h.zbp == b.zbp && h.zpsm == b.zpsm;
+    if (!same) hw_sync_all();
+    const bool inside = h.valid && x0 >= h.rx0 && y0 >= h.ry0 && x1 <= h.rx1 && y1 <= h.ry1;
     const std::uint32_t fbmsk = b.setups.size() > 4 ? b.setups[4] : 0u;
-    const std::uint32_t load = push_params({b.fbp, b.fbw, b.fpsm, b.zbp, b.zpsm, static_cast<std::uint32_t>(x0) | (static_cast<std::uint32_t>(y0) << 16),
-                                            static_cast<std::uint32_t>(x1) | (static_cast<std::uint32_t>(y1) << 16), z_max(b.zpsm), fbmsk, b.zwrite ? 1u : 0u});
-    const std::uint32_t gx = static_cast<std::uint32_t>(x1 - x0 + 8) / 8, gy = static_cast<std::uint32_t>(y1 - y0 + 8) / 8;
-    Command fill{kRaster, gx, gy, load};
-    fill.hw = 1;
-    g_commands.push_back(fill);
-    HwPass pass{load, push_params({prim_offset, setup_offset, kHwSize, kHwSize}), b.zte, x0, y0, x1, y1, {}};
+    std::uint32_t load = 0;
+    if (!inside) {
+        // the images take the box again from video memory (with what they drew written back first), colour and depth
+        hw_write_back();
+        int lx0 = x0, ly0 = y0, lx1 = x1, ly1 = y1;
+        if (h.valid) {
+            lx0 = std::min(lx0, h.rx0);
+            ly0 = std::min(ly0, h.ry0);
+            lx1 = std::max(lx1, h.rx1);
+            ly1 = std::max(ly1, h.ry1);
+        }
+        load = push_params({b.fbp, b.fbw, b.fpsm, b.zbp, b.zpsm, static_cast<std::uint32_t>(lx0) | (static_cast<std::uint32_t>(ly0) << 16),
+                            static_cast<std::uint32_t>(lx1) | (static_cast<std::uint32_t>(ly1) << 16), z_max(b.zpsm), fbmsk, 0u});
+        Command fill{kRaster, static_cast<std::uint32_t>(lx1 - lx0 + 8) / 8, static_cast<std::uint32_t>(ly1 - ly0 + 8) / 8, load};
+        fill.hw = 1;
+        g_commands.push_back(fill);
+        h.valid = true;
+        h.fbp = b.fbp;
+        h.fbw = b.fbw;
+        h.fpsm = b.fpsm;
+        h.zbp = b.zbp;
+        h.zpsm = b.zpsm;
+        h.rx0 = lx0;
+        h.ry0 = ly0;
+        h.rx1 = lx1;
+        h.ry1 = ly1;
+    }
+    HwPass pass{load, push_params({prim_offset, setup_offset, kHwSize, kHwSize}), !inside, x0, y0, x1, y1, h.rx0, h.ry0, h.rx1, h.ry1, {}};
     for (std::uint32_t i = 0; i < prims; ++i) {
         const std::uint32_t *rec = b.prims.data() + static_cast<std::size_t>(i) * kPrimWords;
         const std::uint32_t *s = b.setups.data() + static_cast<std::size_t>(rec[0]) * kSetupWords;
@@ -660,9 +745,20 @@ void hw_emit(const Batch &b, std::uint32_t prim_offset, std::uint32_t setup_offs
     draw.hw = 3;
     g_hw_passes.push_back(std::move(pass));
     g_commands.push_back(draw);
-    Command back{kRaster, gx, gy, load};
-    back.hw = 2;
-    g_commands.push_back(back);
+    if (!h.dirty && !h.zdirty) {
+        h.dx0 = x0;
+        h.dy0 = y0;
+        h.dx1 = x1;
+        h.dy1 = y1;
+    } else {
+        h.dx0 = std::min(h.dx0, x0);
+        h.dy0 = std::min(h.dy0, y0);
+        h.dx1 = std::max(h.dx1, x1);
+        h.dy1 = std::max(h.dy1, y1);
+    }
+    h.dirty = true;
+    h.zdirty = h.zdirty || b.zwrite;
+    h.fbmsk = fbmsk;
 }
 
 void flush_batch() {
@@ -765,6 +861,7 @@ bool batch_conflict(const Range &r, bool clut) {
 }
 
 void emit_pre() {
+    for (const PreOp &op : g_pre) hw_touch(op.range, !op.clut);
     std::size_t i = 0;
     while (i < g_pre.size()) {
         const bool clut = g_pre[i].clut;
@@ -899,6 +996,7 @@ void flush_image() {
 void flush_all() {
     flush_image();
     emit_all();
+    hw_sync_all();  // what follows (the display, a download, a copy, a save state) reads or changes video memory
 }
 
 void on_error(WGPUDevice const *, WGPUErrorType type, WGPUStringView message, void *, void *) {
@@ -1151,9 +1249,13 @@ void submit(WGPUTextureView present_view = nullptr) {
                                                 static_cast<std::uint32_t>(hp.y1 - hp.y0 + 1));
             if (hp.load_depth) {
                 const std::uint32_t load_offset = hp.load_param * kParamStride;
+                wgpuRenderPassEncoderSetScissorRect(rp, static_cast<std::uint32_t>(hp.lx0), static_cast<std::uint32_t>(hp.ly0), static_cast<std::uint32_t>(hp.lx1 - hp.lx0 + 1),
+                                                    static_cast<std::uint32_t>(hp.ly1 - hp.ly0 + 1));
                 wgpuRenderPassEncoderSetPipeline(rp, g_hw_load_depth);
                 wgpuRenderPassEncoderSetBindGroup(rp, 0, g_hw_group0, 1, &load_offset);
                 wgpuRenderPassEncoderDraw(rp, 3, 1, 0, 0);
+                wgpuRenderPassEncoderSetScissorRect(rp, static_cast<std::uint32_t>(hp.x0), static_cast<std::uint32_t>(hp.y0), static_cast<std::uint32_t>(hp.x1 - hp.x0 + 1),
+                                                    static_cast<std::uint32_t>(hp.y1 - hp.y0 + 1));
             }
             const std::uint32_t draw_offset = hp.draw_param * kParamStride;
             wgpuRenderPassEncoderSetBindGroup(rp, 0, g_hw_group0, 1, &draw_offset);
