@@ -402,11 +402,44 @@ fn sample(t: Tex, uin: f32, vin: f32) -> vec4<i32> {
 // --- drawing ----------------------------------------------------------------------------------------------------------------------
 // params: 0 first shape (word offset in data), 1 setups (word offset), 2 target width, 3 target height
 
+// The setup's fields the fragment shader needs travel with the vertices (flat): read once per vertex instead of once per pixel
 struct DrawOut {
     @builtin(position) position: vec4<f32>,
     @location(0) color: vec4<f32>,       // 0 to 255
     @location(1) stqf: vec4<f32>,        // S, T, Q (or U, V in 16ths of a texel, and 1), fog
-    @location(2) @interpolate(flat) setup: u32,
+    @location(2) @interpolate(flat) t0: vec4<u32>,
+    @location(3) @interpolate(flat) t1: vec4<u32>,
+    @location(4) @interpolate(flat) t2: vec4<u32>,
+    @location(5) @interpolate(flat) t3: vec4<u32>,
+}
+
+fn pack_tex(at: u32, out: ptr<function, DrawOut>) {
+    (*out).t0 = vec4<u32>(data[at], data[at + 7u], data[at + 8u], data[at + 15u]);
+    (*out).t1 = vec4<u32>(data[at + 16u] | (data[at + 17u] << 8u), data[at + 18u], data[at + 19u], data[at + 20u]);
+    (*out).t2 = vec4<u32>(data[at + 21u], data[at + 22u], data[at + 14u], data[at + 25u]);
+    (*out).t3 = vec4<u32>(data[at + 26u], data[at + 27u], data[at + 28u], data[at + 29u]);
+}
+
+fn unpack_tex(in: DrawOut) -> Tex {
+    var t: Tex;
+    t.flags = in.t0.x;
+    t.modes = in.t0.y;
+    t.aref = in.t0.z;
+    t.tw = in.t0.w & 0xFFu;
+    t.th = in.t0.w >> 8u;
+    t.cpsm = in.t1.x & 0xFFu;
+    t.csa = in.t1.x >> 8u;
+    t.minu = in.t1.y & 0xFFFFu;
+    t.maxu = in.t1.y >> 16u;
+    t.minv = in.t1.z & 0xFFFFu;
+    t.maxv = in.t1.z >> 16u;
+    t.ta0 = in.t1.w & 0xFFu;
+    t.ta1 = (in.t1.w >> 8u) & 0xFFu;
+    t.fogcol = in.t2.x;
+    t.clut = in.t2.y;
+    t.tpsm = in.t2.z;
+    t.tf = Fmt(in.t2.w, in.t3.x, in.t3.y, in.t3.z, in.t3.w);
+    return t;
 }
 
 fn f(i: u32) -> f32 {
@@ -434,7 +467,7 @@ fn hw_vs(@builtin(vertex_index) vi: u32) -> DrawOut {
     var y = 0.0;
     var z = 0.0;
     var out: DrawOut;
-    out.setup = setup;
+    pack_tex(setup, &out);
     if (kind == 0u) {
         let n = min(corner, 2u);
         x = f(p + 4u + n * 2u);
@@ -495,7 +528,7 @@ fn hw_fs_single(in: DrawOut) -> @location(0) vec4<f32> {
 }
 
 fn shade(in: DrawOut) -> Shaded {
-    let t = load_tex(in.setup);
+    let t = unpack_tex(in);
     var c = vec4<i32>(in.color);
     if (has(t, F_TME)) {
         var u: f32;
