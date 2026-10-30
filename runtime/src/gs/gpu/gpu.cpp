@@ -25,12 +25,17 @@
 
 extern const char kGsShader[];
 extern const char kBlitShader[];
+extern const char kHwShader[];
 
 namespace ps2::gs {
 void swizzle_tables(std::vector<std::uint32_t> &out);
 }
 
 namespace ps2::gs::gpu {
+
+bool hw_init();
+WGPURenderPipeline hw_pipeline(std::uint32_t key);
+WGPURenderPipeline hw_render_pipeline(const char *vs, const char *fs, bool write_color, bool depth_write, WGPUCompareFunction compare, const WGPUBlendState *blend);
 
 namespace {
 
@@ -65,6 +70,7 @@ std::uint32_t g_scale = 1, g_copy_words = 1u << 20, g_field_words = 1u << 19;
 std::uint32_t field_base(std::uint32_t field) { return g_copy_words + (field & 1u) * g_field_words; }
 
 bool g_timestamps = false;
+bool g_dual_source = false;  // dual-source blending: the hardware path's blend factor comes as a second fragment output
 WGPUQuerySet g_queries = nullptr;
 WGPUBuffer g_query_resolve = nullptr, g_query_read = nullptr;
 bool g_query_pending = false, g_query_ready = false;
@@ -85,7 +91,34 @@ struct Command {
     Pipeline pipeline;
     std::uint32_t x, y;
     std::uint32_t param;
+    std::uint32_t hw = 0;  // the hardware path (g_hw): 1 fill the colour image, 2 write it back, 3 a render pass (param: g_hw_passes index)
 };
+
+// PS2_GS_HW=1: the hardware-rasterizer path (hw.wgsl, docs/switch-hw-renderer.md). A batch is drawn by the GPU's rasterizer into a
+// colour and a depth image of kHwSize pixels square, filled from video memory before it and written back after it, in its box.
+bool g_hw = false;
+constexpr std::uint32_t kHwSize = 2048;
+WGPUTexture g_hw_color = nullptr, g_hw_depth = nullptr;
+WGPUTextureView g_hw_color_view = nullptr, g_hw_depth_view = nullptr;
+WGPUBindGroupLayout g_hw_layout0 = nullptr, g_hw_layout1 = nullptr, g_hw_layout2 = nullptr, g_hw_layout_none = nullptr;
+WGPUBindGroup g_hw_group0 = nullptr, g_hw_group1 = nullptr, g_hw_group2 = nullptr, g_hw_group_none = nullptr;
+WGPUPipelineLayout g_hw_load_layout = nullptr, g_hw_back_layout = nullptr, g_hw_render_layout = nullptr;
+WGPUComputePipeline g_hw_load = nullptr, g_hw_back = nullptr;
+WGPURenderPipeline g_hw_load_depth = nullptr;
+// draw pipelines by key: depth mode (bits 0-3: 0 no test, 1 + ZTST, + 4 when depth is written) and blend (bits 4-12: 0 off, 1 + ALPHA's
+// A, B, C, D)
+std::unordered_map<std::uint32_t, WGPURenderPipeline> g_hw_draw;
+WGPUShaderModule g_hw_module = nullptr;
+struct HwRun {
+    std::uint32_t key, fix, first, count;
+};
+struct HwPass {
+    std::uint32_t load_param, draw_param;
+    bool load_depth;
+    int x0, y0, x1, y1;
+    std::vector<HwRun> runs;
+};
+std::vector<HwPass> g_hw_passes;
 
 struct CommandInfo {
     std::size_t index;
@@ -600,6 +633,38 @@ void note_raster(std::uint32_t prims, std::uint32_t tiles, std::uint32_t entries
     g_command_info.push_back({g_commands.size(), {prims, tiles, entries, snapshot, b.prims[1], first[3] | (first[14] << 8) | (first[6] << 16), first[0], textured}});
 }
 
+// The batch on the hardware path: fill the images inside its box, draw its shapes in runs of the same depth mode, write back.
+void hw_emit(const Batch &b, std::uint32_t prim_offset, std::uint32_t setup_offset, std::uint32_t prims) {
+    const int x0 = std::clamp(b.minx, 0, static_cast<int>(kHwSize) - 1), y0 = std::clamp(b.miny, 0, static_cast<int>(kHwSize) - 1);
+    const int x1 = std::clamp(b.maxx, 0, static_cast<int>(kHwSize) - 1), y1 = std::clamp(b.maxy, 0, static_cast<int>(kHwSize) - 1);
+    if (x0 > x1 || y0 > y1 || !prims) return;
+    const std::uint32_t fbmsk = b.setups.size() > 4 ? b.setups[4] : 0u;
+    const std::uint32_t load = push_params({b.fbp, b.fbw, b.fpsm, b.zbp, b.zpsm, static_cast<std::uint32_t>(x0) | (static_cast<std::uint32_t>(y0) << 16),
+                                            static_cast<std::uint32_t>(x1) | (static_cast<std::uint32_t>(y1) << 16), z_max(b.zpsm), fbmsk, b.zwrite ? 1u : 0u});
+    const std::uint32_t gx = static_cast<std::uint32_t>(x1 - x0 + 8) / 8, gy = static_cast<std::uint32_t>(y1 - y0 + 8) / 8;
+    Command fill{kRaster, gx, gy, load};
+    fill.hw = 1;
+    g_commands.push_back(fill);
+    HwPass pass{load, push_params({prim_offset, setup_offset, kHwSize, kHwSize}), b.zte, x0, y0, x1, y1, {}};
+    for (std::uint32_t i = 0; i < prims; ++i) {
+        const std::uint32_t *rec = b.prims.data() + static_cast<std::size_t>(i) * kPrimWords;
+        const std::uint32_t *s = b.setups.data() + static_cast<std::size_t>(rec[0]) * kSetupWords;
+        std::uint32_t key = 0;
+        if (s[0] & 512u) key = 1 + ((s[7] >> 8) & 3u) + ((s[0] & 32u) ? 0u : 4u);
+        if (s[0] & 8u) key |= (1u + ((s[7] >> 12) & 0xFFu)) << 4;
+        const std::uint32_t fix = s[9];
+        if (!pass.runs.empty() && pass.runs.back().key == key && pass.runs.back().fix == fix) ++pass.runs.back().count;
+        else pass.runs.push_back({key, fix, i, 1});
+    }
+    Command draw{kRaster, 0, 0, static_cast<std::uint32_t>(g_hw_passes.size())};
+    draw.hw = 3;
+    g_hw_passes.push_back(std::move(pass));
+    g_commands.push_back(draw);
+    Command back{kRaster, gx, gy, load};
+    back.hw = 2;
+    g_commands.push_back(back);
+}
+
 void flush_batch() {
     Batch &b = g_batch;
     if (b.prims.empty()) {
@@ -663,7 +728,8 @@ void flush_batch() {
         g_why_prims[g_why] += prims;
         g_why = kWhyFlush;
     }
-    g_commands.push_back({kRaster, std::min(tiles, 1024u), (tiles + 1023) / 1024, param});
+    if (g_hw) hw_emit(b, prim_offset, setup_offset, prims);
+    else g_commands.push_back({kRaster, std::min(tiles, 1024u), (tiles + 1023) / 1024, param});
     mark_rendered(pages(b.fbp, b.fbw, b.fpsm, b.minx, b.miny, b.maxx, b.maxy));
     if (b.zwrite) mark_rendered(pages(b.zbp, b.fbw, b.zpsm, b.minx, b.miny, b.maxx, b.maxy));
     b.prims.clear();
@@ -856,10 +922,31 @@ WGPUBindGroup make_group(WGPUBuffer params, WGPUBuffer data) {
     return wgpuDeviceCreateBindGroup(g_device, &d);
 }
 
+WGPUBindGroup make_hw_group() {
+    WGPUBindGroupEntry e[5] = {};
+    WGPUBuffer buffers[5] = {g_vram, g_tables, g_params, g_data, g_clut};
+    for (int i = 0; i < 5; ++i) {
+        e[i] = WGPU_BIND_GROUP_ENTRY_INIT;
+        e[i].binding = static_cast<std::uint32_t>(i);
+        e[i].buffer = buffers[i];
+        e[i].size = i == 2 ? kParamStride : WGPU_WHOLE_SIZE;
+    }
+    WGPUBindGroupDescriptor d = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
+    d.layout = g_hw_layout0;
+    d.entryCount = 5;
+    d.entries = e;
+    return wgpuDeviceCreateBindGroup(g_device, &d);
+}
+
 void rebuild_group() {
     if (g_group) wgpuBindGroupRelease(g_group);
     g_group = make_group(g_params, g_data);
+    if (g_hw) {
+        if (g_hw_group0) wgpuBindGroupRelease(g_hw_group0);
+        g_hw_group0 = make_hw_group();
+    }
 }
+
 
 void ensure_capacity() {
     bool changed = false;
@@ -940,6 +1027,7 @@ void profile_submit() {
         wgpuBufferUnmap(g_profile_read);
     }
     g_commands.clear();
+    g_hw_passes.clear();
     g_command_info.clear();
     ++g_serial;
     g_param_records.clear();
@@ -1010,6 +1098,60 @@ void submit(WGPUTextureView present_view = nullptr) {
         return mask;
     }();
     for (const Command &c : g_commands) {
+        if (c.hw) {
+            current = kPipelines;  // the next ordinary command sets its pipeline again
+            const std::uint32_t offset = c.param * kParamStride;
+            if (c.hw == 1 || c.hw == 2) {
+                wgpuComputePassEncoderSetPipeline(pass, c.hw == 1 ? g_hw_load : g_hw_back);
+                wgpuComputePassEncoderSetBindGroup(pass, 0, g_hw_group0, 1, &offset);
+                wgpuComputePassEncoderSetBindGroup(pass, 1, c.hw == 1 ? g_hw_group1 : g_hw_group_none, 0, nullptr);
+                if (c.hw == 2) wgpuComputePassEncoderSetBindGroup(pass, 2, g_hw_group2, 0, nullptr);
+                wgpuComputePassEncoderDispatchWorkgroups(pass, c.x, c.y, 1);
+                continue;
+            }
+            // a render pass between two compute passes
+            wgpuComputePassEncoderEnd(pass);
+            wgpuComputePassEncoderRelease(pass);
+            const HwPass &hp = g_hw_passes[c.param];
+            WGPURenderPassColorAttachment color = WGPU_RENDER_PASS_COLOR_ATTACHMENT_INIT;
+            color.view = g_hw_color_view;
+            color.loadOp = WGPULoadOp_Load;
+            color.storeOp = WGPUStoreOp_Store;
+            WGPURenderPassDepthStencilAttachment depth = WGPU_RENDER_PASS_DEPTH_STENCIL_ATTACHMENT_INIT;
+            depth.view = g_hw_depth_view;
+            depth.depthLoadOp = WGPULoadOp_Load;
+            depth.depthStoreOp = WGPUStoreOp_Store;
+            WGPURenderPassDescriptor rd = WGPU_RENDER_PASS_DESCRIPTOR_INIT;
+            rd.colorAttachmentCount = 1;
+            rd.colorAttachments = &color;
+            rd.depthStencilAttachment = &depth;
+            WGPURenderPassEncoder rp = wgpuCommandEncoderBeginRenderPass(enc, &rd);
+            wgpuRenderPassEncoderSetViewport(rp, 0.0f, 0.0f, static_cast<float>(kHwSize), static_cast<float>(kHwSize), 0.0f, 1.0f);
+            wgpuRenderPassEncoderSetScissorRect(rp, static_cast<std::uint32_t>(hp.x0), static_cast<std::uint32_t>(hp.y0), static_cast<std::uint32_t>(hp.x1 - hp.x0 + 1),
+                                                static_cast<std::uint32_t>(hp.y1 - hp.y0 + 1));
+            if (hp.load_depth) {
+                const std::uint32_t load_offset = hp.load_param * kParamStride;
+                wgpuRenderPassEncoderSetPipeline(rp, g_hw_load_depth);
+                wgpuRenderPassEncoderSetBindGroup(rp, 0, g_hw_group0, 1, &load_offset);
+                wgpuRenderPassEncoderDraw(rp, 3, 1, 0, 0);
+            }
+            const std::uint32_t draw_offset = hp.draw_param * kParamStride;
+            wgpuRenderPassEncoderSetBindGroup(rp, 0, g_hw_group0, 1, &draw_offset);
+            for (const HwRun &run : hp.runs) {
+                WGPURenderPipeline pipeline = hw_pipeline(run.key);
+                if (!pipeline) continue;
+                wgpuRenderPassEncoderSetPipeline(rp, pipeline);
+                const double fix = static_cast<double>(run.fix) / 128.0;
+                const WGPUColor constant{fix, fix, fix, fix};
+                wgpuRenderPassEncoderSetBlendConstant(rp, &constant);
+                wgpuRenderPassEncoderDraw(rp, run.count * 6, 1, run.first * 6, 0);
+            }
+            wgpuRenderPassEncoderEnd(rp);
+            wgpuRenderPassEncoderRelease(rp);
+            WGPUComputePassDescriptor next = WGPU_COMPUTE_PASS_DESCRIPTOR_INIT;
+            pass = wgpuCommandEncoderBeginComputePass(enc, &next);
+            continue;
+        }
         ++g_dispatches[c.pipeline];
         if (skip & (1u << c.pipeline)) continue;
         if (c.pipeline != current) {
@@ -1066,6 +1208,7 @@ void submit(WGPUTextureView present_view = nullptr) {
     wgpuDevicePoll(g_device, false, nullptr);
 #endif
     g_commands.clear();
+    g_hw_passes.clear();
     g_command_info.clear();
     ++g_serial;
     g_param_records.clear();
@@ -1572,12 +1715,14 @@ static bool open_backend([[maybe_unused]] std::uint32_t backends, const char *na
     limits.maxBufferSize = supported.maxBufferSize;
     WGPUDeviceDescriptor dd = WGPU_DEVICE_DESCRIPTOR_INIT;
     dd.requiredLimits = &limits;
-    const WGPUFeatureName timestamp_feature = WGPUFeatureName_TimestampQuery;
+    WGPUFeatureName features[2];
+    std::size_t feature_count = 0;
     g_timestamps = wgpuAdapterHasFeature(adapter, WGPUFeatureName_TimestampQuery);
-    if (g_timestamps) {
-        dd.requiredFeatureCount = 1;
-        dd.requiredFeatures = &timestamp_feature;
-    }
+    if (g_timestamps) features[feature_count++] = WGPUFeatureName_TimestampQuery;
+    g_dual_source = wgpuAdapterHasFeature(adapter, WGPUFeatureName_DualSourceBlending);
+    if (g_dual_source) features[feature_count++] = WGPUFeatureName_DualSourceBlending;
+    dd.requiredFeatureCount = feature_count;
+    dd.requiredFeatures = features;
     dd.uncapturedErrorCallbackInfo.callback = on_error;
     bool device_done = false;
     WGPURequestDeviceCallbackInfo dcb = WGPU_REQUEST_DEVICE_CALLBACK_INFO_INIT;
@@ -1769,9 +1914,203 @@ bool init(Mode m) {
     }
     std::fprintf(stderr, "[gpu] %d shaders compiled in %.0f ms\n", kPipelines, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - compile_start).count());
     wgpuShaderModuleRelease(module);
+    if (const char *hw = std::getenv("PS2_GS_HW"); hw && hw[0] == '1') {
+        g_hw = hw_init();
+        std::fprintf(stderr, "[gpu] hardware rasterizer path %s\n", g_hw ? "on (PS2_GS_HW=1)" : "could not start: the compute path draws");
+    }
     ensure_capacity();
     g_mode = m;
     return true;
+}
+
+// The images, layouts and pipelines of the hardware path
+bool hw_init() {
+    const auto texture = [](WGPUTextureFormat format, WGPUTextureUsage usage) {
+        WGPUTextureDescriptor td = WGPU_TEXTURE_DESCRIPTOR_INIT;
+        td.usage = usage;
+        td.dimension = WGPUTextureDimension_2D;
+        td.size = WGPUExtent3D{kHwSize, kHwSize, 1};
+        td.format = format;
+        td.mipLevelCount = 1;
+        td.sampleCount = 1;
+        return wgpuDeviceCreateTexture(g_device, &td);
+    };
+    g_hw_color = texture(WGPUTextureFormat_RGBA8Unorm, WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_StorageBinding | WGPUTextureUsage_TextureBinding);
+    g_hw_depth = texture(WGPUTextureFormat_Depth32Float, WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_TextureBinding);
+    if (!g_hw_color || !g_hw_depth) return false;
+    g_hw_color_view = wgpuTextureCreateView(g_hw_color, nullptr);
+    g_hw_depth_view = wgpuTextureCreateView(g_hw_depth, nullptr);
+
+    const WGPUShaderStage all = WGPUShaderStage_Vertex | WGPUShaderStage_Fragment | WGPUShaderStage_Compute;
+    WGPUBindGroupLayoutEntry le[5] = {};
+    const WGPUBufferBindingType types[5] = {WGPUBufferBindingType_Storage, WGPUBufferBindingType_ReadOnlyStorage, WGPUBufferBindingType_Uniform,
+                                            WGPUBufferBindingType_ReadOnlyStorage, WGPUBufferBindingType_ReadOnlyStorage};
+    for (int i = 0; i < 5; ++i) {
+        le[i] = WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
+        le[i].binding = static_cast<std::uint32_t>(i);
+        le[i].visibility = i == 0 || i == 4 ? (WGPUShaderStage_Fragment | WGPUShaderStage_Compute) : all;  // writable storage: not in vertex shaders
+        le[i].buffer.type = types[i];
+        le[i].buffer.hasDynamicOffset = i == 2;
+        le[i].buffer.minBindingSize = i == 2 ? kParamStride : 0;
+    }
+    WGPUBindGroupLayoutDescriptor ld = WGPU_BIND_GROUP_LAYOUT_DESCRIPTOR_INIT;
+    ld.entryCount = 5;
+    ld.entries = le;
+    g_hw_layout0 = wgpuDeviceCreateBindGroupLayout(g_device, &ld);
+
+    WGPUBindGroupLayoutEntry storage = WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
+    storage.binding = 0;
+    storage.visibility = WGPUShaderStage_Compute;
+    storage.storageTexture.access = WGPUStorageTextureAccess_WriteOnly;
+    storage.storageTexture.format = WGPUTextureFormat_RGBA8Unorm;
+    storage.storageTexture.viewDimension = WGPUTextureViewDimension_2D;
+    ld.entryCount = 1;
+    ld.entries = &storage;
+    g_hw_layout1 = wgpuDeviceCreateBindGroupLayout(g_device, &ld);
+
+    WGPUBindGroupLayoutEntry read[2] = {WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT, WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT};
+    read[0].binding = 0;
+    read[0].visibility = WGPUShaderStage_Compute;
+    read[0].texture.sampleType = WGPUTextureSampleType_UnfilterableFloat;
+    read[0].texture.viewDimension = WGPUTextureViewDimension_2D;
+    read[1].binding = 1;
+    read[1].visibility = WGPUShaderStage_Compute;
+    read[1].texture.sampleType = WGPUTextureSampleType_Depth;
+    read[1].texture.viewDimension = WGPUTextureViewDimension_2D;
+    ld.entryCount = 2;
+    ld.entries = read;
+    g_hw_layout2 = wgpuDeviceCreateBindGroupLayout(g_device, &ld);
+    ld.entryCount = 0;
+    ld.entries = nullptr;
+    g_hw_layout_none = wgpuDeviceCreateBindGroupLayout(g_device, &ld);
+
+    WGPUBindGroupEntry ge = WGPU_BIND_GROUP_ENTRY_INIT;
+    WGPUBindGroupDescriptor gd = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
+    ge.binding = 0;
+    ge.textureView = g_hw_color_view;
+    gd.layout = g_hw_layout1;
+    gd.entryCount = 1;
+    gd.entries = &ge;
+    g_hw_group1 = wgpuDeviceCreateBindGroup(g_device, &gd);
+    WGPUBindGroupEntry ge2[2] = {WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT};
+    ge2[0].binding = 0;
+    ge2[0].textureView = g_hw_color_view;
+    ge2[1].binding = 1;
+    ge2[1].textureView = g_hw_depth_view;
+    gd.layout = g_hw_layout2;
+    gd.entryCount = 2;
+    gd.entries = ge2;
+    g_hw_group2 = wgpuDeviceCreateBindGroup(g_device, &gd);
+    gd.layout = g_hw_layout_none;
+    gd.entryCount = 0;
+    gd.entries = nullptr;
+    g_hw_group_none = wgpuDeviceCreateBindGroup(g_device, &gd);
+
+    WGPUPipelineLayoutDescriptor pld = WGPU_PIPELINE_LAYOUT_DESCRIPTOR_INIT;
+    const WGPUBindGroupLayout load_layouts[2] = {g_hw_layout0, g_hw_layout1};
+    pld.bindGroupLayoutCount = 2;
+    pld.bindGroupLayouts = load_layouts;
+    g_hw_load_layout = wgpuDeviceCreatePipelineLayout(g_device, &pld);
+    const WGPUBindGroupLayout back_layouts[3] = {g_hw_layout0, g_hw_layout_none, g_hw_layout2};
+    pld.bindGroupLayoutCount = 3;
+    pld.bindGroupLayouts = back_layouts;
+    g_hw_back_layout = wgpuDeviceCreatePipelineLayout(g_device, &pld);
+    pld.bindGroupLayoutCount = 1;
+    pld.bindGroupLayouts = &g_hw_layout0;
+    g_hw_render_layout = wgpuDeviceCreatePipelineLayout(g_device, &pld);
+
+    WGPUShaderSourceWGSL source = WGPU_SHADER_SOURCE_WGSL_INIT;
+    source.code = view(kHwShader);
+    WGPUShaderModuleDescriptor md = WGPU_SHADER_MODULE_DESCRIPTOR_INIT;
+    md.nextInChain = &source.chain;
+    g_hw_module = wgpuDeviceCreateShaderModule(g_device, &md);
+    if (!g_hw_module) return false;
+
+    WGPUComputePipelineDescriptor cd = WGPU_COMPUTE_PIPELINE_DESCRIPTOR_INIT;
+    cd.layout = g_hw_load_layout;
+    cd.compute.module = g_hw_module;
+    cd.compute.entryPoint = view("hw_load_color");
+    g_hw_load = wgpuDeviceCreateComputePipeline(g_device, &cd);
+    cd.layout = g_hw_back_layout;
+    cd.compute.entryPoint = view("hw_writeback");
+    g_hw_back = wgpuDeviceCreateComputePipeline(g_device, &cd);
+    if (!g_hw_load || !g_hw_back) return false;
+
+    g_hw_load_depth = hw_render_pipeline("hw_full_vs", "hw_load_depth", false, true, WGPUCompareFunction_Always, nullptr);
+    if (!g_hw_load_depth) return false;
+    if (!g_dual_source) std::fprintf(stderr, "[gpu] no dual-source blending on this device: the hardware path blends with a constant factor\n");
+    return hw_pipeline(0) != nullptr;
+}
+
+WGPURenderPipeline hw_render_pipeline(const char *vs, const char *fs, bool write_color, bool depth_write, WGPUCompareFunction compare, const WGPUBlendState *blend) {
+        WGPUDepthStencilState ds = WGPU_DEPTH_STENCIL_STATE_INIT;
+        ds.format = WGPUTextureFormat_Depth32Float;
+        ds.depthWriteEnabled = depth_write ? WGPUOptionalBool_True : WGPUOptionalBool_False;
+        ds.depthCompare = compare;
+        WGPUColorTargetState target = WGPU_COLOR_TARGET_STATE_INIT;
+        target.format = WGPUTextureFormat_RGBA8Unorm;
+        target.writeMask = write_color ? WGPUColorWriteMask_All : WGPUColorWriteMask_None;
+        target.blend = blend;
+        WGPUFragmentState fragment = WGPU_FRAGMENT_STATE_INIT;
+        fragment.module = g_hw_module;
+        fragment.entryPoint = view(fs);
+        fragment.targetCount = 1;
+        fragment.targets = &target;
+        WGPURenderPipelineDescriptor rd = WGPU_RENDER_PIPELINE_DESCRIPTOR_INIT;
+        rd.layout = g_hw_render_layout;
+        rd.vertex.module = g_hw_module;
+        rd.vertex.entryPoint = view(vs);
+        rd.primitive.topology = WGPUPrimitiveTopology_TriangleList;
+        rd.primitive.cullMode = WGPUCullMode_None;
+        rd.depthStencil = &ds;
+        rd.multisample.count = 1;
+        rd.multisample.mask = 0xFFFFFFFFu;
+        rd.fragment = &fragment;
+        return wgpuDeviceCreateRenderPipeline(g_device, &rd);
+}
+
+// The PS2's blend ((A - B) * C >> 7) + D as the GPU's: the colour's coefficient and the frame's are each 0, 1, F, -F or 1 - F, where F
+// is C / 128 (the source alpha as the second output, the destination alpha, or FIX as the blend constant). 1 + F, or both negative,
+// have no fixed-function form; they are drawn with the nearest one.
+WGPUBlendState hw_blend(std::uint32_t alpha) {
+    const std::uint32_t a = alpha & 3u, b = (alpha >> 2) & 3u, c = (alpha >> 4) & 3u, d = (alpha >> 6) & 3u;
+    const WGPUBlendFactor F = c == 0 ? (g_dual_source ? WGPUBlendFactor_Src1Alpha : WGPUBlendFactor_SrcAlpha) : c == 1 ? WGPUBlendFactor_DstAlpha : WGPUBlendFactor_Constant;
+    const WGPUBlendFactor G = c == 0 ? (g_dual_source ? WGPUBlendFactor_OneMinusSrc1Alpha : WGPUBlendFactor_OneMinusSrcAlpha) : c == 1 ? WGPUBlendFactor_OneMinusDstAlpha : WGPUBlendFactor_OneMinusConstant;
+    const auto coefficient = [&](std::uint32_t who, WGPUBlendFactor &factor, int &sign) {
+        const int f = (a == who ? 1 : 0) - (b == who ? 1 : 0), k = d == who ? 1 : 0;
+        sign = 1;
+        if (f == 0) factor = k ? WGPUBlendFactor_One : WGPUBlendFactor_Zero;
+        else if (k == 0) {
+            factor = F;
+            sign = f;
+        } else factor = f < 0 ? G : WGPUBlendFactor_One;  // 1 - F, or 1 + F drawn as 1
+    };
+    WGPUBlendFactor src, dst;
+    int ss, ds;
+    coefficient(0, src, ss);
+    coefficient(1, dst, ds);
+    WGPUBlendState state = WGPU_BLEND_STATE_INIT;
+    state.color.srcFactor = src;
+    state.color.dstFactor = dst;
+    state.color.operation = ss > 0 && ds < 0 ? WGPUBlendOperation_Subtract : ss < 0 && ds > 0 ? WGPUBlendOperation_ReverseSubtract : WGPUBlendOperation_Add;
+    state.alpha.srcFactor = WGPUBlendFactor_One;  // the frame's alpha is the colour's, not blended
+    state.alpha.dstFactor = WGPUBlendFactor_Zero;
+    state.alpha.operation = WGPUBlendOperation_Add;
+    return state;
+}
+
+WGPURenderPipeline hw_pipeline(std::uint32_t key) {
+    if (const auto it = g_hw_draw.find(key); it != g_hw_draw.end()) return it->second;
+    static const WGPUCompareFunction tests[4] = {WGPUCompareFunction_Never, WGPUCompareFunction_Always, WGPUCompareFunction_GreaterEqual, WGPUCompareFunction_Greater};
+    const std::uint32_t depth = key & 15u, blend = key >> 4;
+    const bool test = depth != 0;
+    WGPUBlendState state;
+    if (blend) state = hw_blend(blend - 1);
+    WGPURenderPipeline p = hw_render_pipeline("hw_vs", g_dual_source ? "hw_fs" : "hw_fs_single", true, test && depth >= 5,
+                                              test ? tests[(depth - 1) & 3u] : WGPUCompareFunction_Always, blend ? &state : nullptr);
+    if (!p) std::fprintf(stderr, "[gpu] hardware path: no pipeline for key %X\n", key);
+    g_hw_draw[key] = p;
+    return p;
 }
 
 void draw(const State &st, const Vertex *v, int count) {

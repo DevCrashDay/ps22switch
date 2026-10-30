@@ -139,7 +139,7 @@ if(PS2_VULKAN AND NOT EMSCRIPTEN)
         message(FATAL_ERROR "runtime/src/gs/gpu/vk/spirv_table.cpp was not made from this gs.wgsl: run python scripts/wgsl_spirv.py (needs naga-cli)")
     endif()
     set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS runtime/src/gs/gpu/gs.wgsl runtime/src/gs/gpu/vk/spirv_table.cpp)
-    foreach(shader gs:kGsShader blit:kBlitShader)
+    foreach(shader gs:kGsShader blit:kBlitShader hw:kHwShader)
         string(REPLACE ":" ";" pair "${shader}")
         list(GET pair 0 name)
         list(GET pair 1 sym)
@@ -147,7 +147,7 @@ if(PS2_VULKAN AND NOT EMSCRIPTEN)
             COMMAND ${CMAKE_COMMAND} -DSRC=${CMAKE_SOURCE_DIR}/runtime/src/gs/gpu/${name}.wgsl -DOUT=${CMAKE_BINARY_DIR}/${name}_wgsl.cpp -DNAME=${sym} -P ${CMAKE_SOURCE_DIR}/cmake/embed.cmake
             DEPENDS runtime/src/gs/gpu/${name}.wgsl cmake/embed.cmake)
     endforeach()
-    target_sources(ps2runtime PRIVATE runtime/src/gs/gpu/gpu.cpp "${CMAKE_BINARY_DIR}/gs_wgsl.cpp" "${CMAKE_BINARY_DIR}/blit_wgsl.cpp"
+    target_sources(ps2runtime PRIVATE runtime/src/gs/gpu/gpu.cpp "${CMAKE_BINARY_DIR}/gs_wgsl.cpp" "${CMAKE_BINARY_DIR}/blit_wgsl.cpp" "${CMAKE_BINARY_DIR}/hw_wgsl.cpp"
         runtime/src/gs/gpu/vk/wgpu_vk.cpp runtime/src/gs/gpu/vk/spirv_table.cpp)
     target_include_directories(ps2runtime PRIVATE runtime/src/gs/gpu/vk/include runtime/src/gs/gpu/vk)
     set_source_files_properties(runtime/src/gs/gpu/vk/wgpu_vk.cpp PROPERTIES COMPILE_OPTIONS -Wno-missing-field-initializers)  # { VK_STRUCTURE_TYPE_... } leaves the rest zero
@@ -182,8 +182,12 @@ elseif(EMSCRIPTEN OR EXISTS "${PS2_WGPU_DIR}/lib/libwgpu_native.a")
     add_custom_command(OUTPUT "${PS2_BLIT_WGSL}"
         COMMAND ${CMAKE_COMMAND} -DSRC=${CMAKE_SOURCE_DIR}/runtime/src/gs/gpu/blit.wgsl -DOUT=${PS2_BLIT_WGSL} -DNAME=kBlitShader -P ${CMAKE_SOURCE_DIR}/cmake/embed.cmake
         DEPENDS runtime/src/gs/gpu/blit.wgsl cmake/embed.cmake)
+    set(PS2_HW_WGSL "${CMAKE_BINARY_DIR}/hw_wgsl.cpp")
+    add_custom_command(OUTPUT "${PS2_HW_WGSL}"
+        COMMAND ${CMAKE_COMMAND} -DSRC=${CMAKE_SOURCE_DIR}/runtime/src/gs/gpu/hw.wgsl -DOUT=${PS2_HW_WGSL} -DNAME=kHwShader -P ${CMAKE_SOURCE_DIR}/cmake/embed.cmake
+        DEPENDS runtime/src/gs/gpu/hw.wgsl cmake/embed.cmake)
     if(NOT PS2_PREBUILT)
-        target_sources(ps2runtime PRIVATE runtime/src/gs/gpu/gpu.cpp "${PS2_GS_WGSL}" "${PS2_BLIT_WGSL}")
+        target_sources(ps2runtime PRIVATE runtime/src/gs/gpu/gpu.cpp "${PS2_GS_WGSL}" "${PS2_BLIT_WGSL}" "${PS2_HW_WGSL}")
     endif()
     target_compile_definitions(ps2runtime ${PS2_API} PS2_GPU)
     if(EMSCRIPTEN)
