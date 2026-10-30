@@ -535,7 +535,7 @@ std::vector<Decode> g_decodes;
 void plan_decodes(std::uint32_t prims) {
     Batch &b = g_batch;
     g_decodes.clear();
-    if (!g_decode || prims <= kDecodePrims) return;
+    if (!g_decode || g_hw || prims <= kDecodePrims) return;  // the hardware path reads textures from video memory itself
     const std::uint32_t setups = static_cast<std::uint32_t>(b.setups.size() / kSetupWords);
     static const int kKey[] = {12, 13, 14, 15, 16, 17, 20, 22};
     for (std::uint32_t i = 0; i < setups; ++i) {
@@ -787,7 +787,7 @@ void emit_pre() {
                 total += g_pre[k].rec[7];
             }
         }
-        if (clut) g_commands.push_back({kLoadClut, 1, 1, push_params({offset, count})});
+        if (clut) g_commands.push_back({kLoadClut, count * 2, 1, push_params({offset, count})});  // two workgroups per load (gs.wgsl)
         else dispatch_linear(kUpload, total, push_params({offset, count, total}));
         i = j;
     }
@@ -946,7 +946,7 @@ void rebuild_group() {
         g_hw_group0 = make_hw_group();
     }
 }
-
+
 
 void ensure_capacity() {
     bool changed = false;

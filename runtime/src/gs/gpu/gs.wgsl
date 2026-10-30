@@ -341,43 +341,61 @@ fn copy_write(@builtin(global_invocation_id) gid: vec3<u32>) {
     write_sample(prm(2u), prm(0u), prm(1u), (prm(3u) + x) & 0x7FFu, (prm(4u) + y) & 0x7FFu, k, scratch[(sy * w + sx) * n + k]);
 }
 
-@compute @workgroup_size(256)
-fn load_clut(@builtin(local_invocation_index) k: u32) {
-    let count = prm(1u);
-    for (var n = 0u; n < count; n = n + 1u) {
-        let r = prm(0u) + n * 12u;
-        let src = data[r] * CLUT_ENTRIES;
-        let dst = data[r + 1u] * CLUT_ENTRIES;
-        clut[dst + k] = clut[src + k];
-        clut[dst + k + 256u] = clut[src + k + 256u];
-        storageBarrier();
-        let cbp = data[r + 2u];
-        let cpsm = data[r + 3u];
-        let csm = data[r + 4u];
-        let csa = data[r + 5u];
-        let eight = data[r + 6u] != 0u;
-        var entries = 16u;
-        if (eight) {
-            entries = 256u;
-        }
-        if (k < entries) {
-            if (csm != 0u) {
-                clut[dst + ((csa * 16u + k) & 511u)] = read_pixel(cpsm, cbp, data[r + 7u], data[r + 8u] * 16u + k, data[r + 9u]);
-            } else {
-                var x = k & 7u;
-                var y = k >> 3u;
-                var slot = ((csa & 15u) * 16u + k) & 255u;
-                if (eight) {
-                    let j = (k & ~0x18u) | ((k & 0x08u) << 1u) | ((k & 0x10u) >> 1u);
-                    x = j & 15u;
-                    y = j >> 4u;
-                    slot = k;
-                }
-                clut[dst + slot] = read_pixel(cpsm, cbp, 1u, x, y);
-            }
-        }
-        storageBarrier();
+// CLUT loads (gpu.cpp load_clut): load n makes slot dst(n) from slot src(n) = dst(n - 1) and the palette entries it reads from video
+// memory. Every entry of every slot is worked out on its own, in parallel: it is the value of the latest load up to n that writes that
+// entry, or the entry of the slot before the first load. Workgroup 2n + h makes entries h * 256 to h * 256 + 255 of slot dst(n).
+// (One workgroup doing the loads in turn, with barriers between, took 0.6 ms per batch of loads on the Switch.)
+fn clut_entry(r: u32, e: u32, value: ptr<function, u32>) -> bool {
+    let cbp = data[r + 2u];
+    let cpsm = data[r + 3u];
+    let csm = data[r + 4u];
+    let csa = data[r + 5u];
+    let eight = data[r + 6u] != 0u;
+    var entries = 16u;
+    if (eight) {
+        entries = 256u;
     }
+    if (csm != 0u) {
+        let k = (e + 512u - (csa * 16u) % 512u) & 511u;
+        if (k >= entries) {
+            return false;
+        }
+        *value = read_pixel(cpsm, cbp, data[r + 7u], data[r + 8u] * 16u + k, data[r + 9u]);
+        return true;
+    }
+    if (e >= 256u) {
+        return false;
+    }
+    if (eight) {
+        let j = (e & ~0x18u) | ((e & 0x08u) << 1u) | ((e & 0x10u) >> 1u);
+        *value = read_pixel(cpsm, cbp, 1u, j & 15u, j >> 4u);
+        return true;
+    }
+    let k = (e + 256u - (csa & 15u) * 16u) & 255u;
+    if (k >= 16u) {
+        return false;
+    }
+    *value = read_pixel(cpsm, cbp, 1u, k & 7u, k >> 3u);
+    return true;
+}
+
+@compute @workgroup_size(256)
+fn load_clut(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) lid: u32) {
+    let n = wid.x / 2u;
+    let e = (wid.x % 2u) * 256u + lid;
+    if (n >= prm(1u)) {
+        return;
+    }
+    let first = prm(0u);
+    var value = clut[data[first] * CLUT_ENTRIES + e];
+    for (var m = n + 1u; m > 0u; m = m - 1u) {
+        var v = 0u;
+        if (clut_entry(first + (m - 1u) * 12u, e, &v)) {
+            value = v;
+            break;
+        }
+    }
+    clut[data[first + n * 12u + 1u] * CLUT_ENTRIES + e] = value;
 }
 
 @compute @workgroup_size(8, 8)
