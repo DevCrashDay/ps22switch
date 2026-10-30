@@ -513,7 +513,20 @@ std::vector<std::string> switch_arguments() {
         if (!read_lines(dir + "launch.txt", lines) || lines.empty()) continue;
         if (dir != "./") chdir(dir.c_str());  // the paths in it are relative to its folder
         std::fprintf(stderr, "[switch] arguments from %slaunch.txt\n", dir.c_str());
-        return lines;
+        // A line NAME=value sets an environment variable instead (PS2_VK_PROFILE=1 and the other switches the PC takes from the shell)
+        std::vector<std::string> args;
+        for (const std::string &line : lines) {
+            const std::size_t eq = line.find('=');
+            const bool setting = eq != std::string::npos && eq > 0 &&
+                                 std::all_of(line.begin(), line.begin() + static_cast<std::ptrdiff_t>(eq), [](char c) { return std::isupper(static_cast<unsigned char>(c)) || std::isdigit(static_cast<unsigned char>(c)) || c == '_'; });
+            if (setting) {
+                setenv(line.substr(0, eq).c_str(), line.substr(eq + 1).c_str(), 1);
+                std::fprintf(stderr, "[switch] %s\n", line.c_str());
+            } else {
+                args.push_back(line);
+            }
+        }
+        return args;
     }
     // No launch.txt: the first PS2 program and the first disc image here or in disc/
     const auto ends_with = [](std::string name, const char *suffix) {

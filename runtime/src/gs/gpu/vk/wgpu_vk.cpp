@@ -27,6 +27,8 @@
 #include <vulkan/vulkan.h>
 
 #include <algorithm>
+#include <chrono>
+#include <map>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -64,7 +66,8 @@ extern "C" void *__stdcall GetProcAddress(void *module, const char *name);
     X(vkCmdBindPipeline) X(vkCmdBindDescriptorSets) X(vkCmdDispatch) X(vkCreateSemaphore) X(vkDestroySemaphore)                         \
     X(vkGetSemaphoreCounterValue) X(vkWaitSemaphores) X(vkCreateDescriptorSetLayout) X(vkDestroyDescriptorSetLayout)                    \
     X(vkCreatePipelineLayout) X(vkDestroyPipelineLayout) X(vkCreateDescriptorPool) X(vkDestroyDescriptorPool) X(vkAllocateDescriptorSets) X(vkFreeDescriptorSets)  \
-    X(vkUpdateDescriptorSets) X(vkCreateShaderModule) X(vkDestroyShaderModule) X(vkCreateComputePipelines) X(vkDestroyPipeline)
+    X(vkUpdateDescriptorSets) X(vkCreateShaderModule) X(vkDestroyShaderModule) X(vkCreateComputePipelines) X(vkDestroyPipeline)                        \
+    X(vkCreateQueryPool) X(vkDestroyQueryPool) X(vkCmdResetQueryPool) X(vkCmdWriteTimestamp) X(vkGetQueryPoolResults)
 
 #ifndef __SWITCH__
 #define PS2_VK_POINTER(name) static PFN_##name name = nullptr;
@@ -189,6 +192,22 @@ struct WGPUDeviceImpl {
     std::vector<VkDescriptorPool> pools;
     WGPUUncapturedErrorCallbackInfo errors{};
     WGPUQueue queue_object = nullptr;
+    std::uint64_t max_in_flight = 8;  // submissions the CPU may be ahead of the GPU (PS2_VK_IN_FLIGHT)
+    // PS2_VK_PROFILE=1: GPU time of every dispatch from timestamps, summed by program and written to the log every 2 seconds
+    struct Timed {
+        VkCommandBuffer cmd;
+        std::uint64_t serial;
+        std::uint32_t first, count;
+        std::vector<const char *> names;
+    };
+    VkQueryPool queries = VK_NULL_HANDLE;
+    std::uint32_t query_next = 0;
+    double tick_ns = 1.0;
+    std::vector<Timed> recording, timed;  // being recorded or submitted, waiting for the GPU
+    std::map<std::string, std::pair<double, std::uint64_t>> spent;  // program -> ns, dispatches
+    std::uint64_t profile_submits = 0, most_in_flight = 0, waits = 0;
+    double waited_ms = 0;
+    std::chrono::steady_clock::time_point profile_start = std::chrono::steady_clock::now();
 };
 
 struct WGPUQueueImpl {
@@ -229,6 +248,7 @@ struct WGPUComputePipelineImpl {
     WGPUDevice device = nullptr;
     VkPipeline pipeline = VK_NULL_HANDLE;
     VkPipelineLayout layout = VK_NULL_HANDLE;
+    std::string name;
 };
 
 struct WGPUCommandEncoderImpl {
@@ -244,6 +264,7 @@ struct WGPUCommandBufferImpl {
 struct WGPUComputePassEncoderImpl {
     WGPUCommandEncoder encoder = nullptr;
     VkPipelineLayout layout = VK_NULL_HANDLE;
+    const char *name = "";
 };
 
 namespace {
@@ -400,6 +421,66 @@ VkCommandBuffer upload_commands(WGPUDevice d) {
     return d->uploads;
 }
 
+void wait_for(WGPUDevice d, std::uint64_t serial);
+
+constexpr std::uint32_t kQueries = 1u << 16, kQueriesPerBuffer = 4096;
+
+WGPUDeviceImpl::Timed *timing_of(WGPUDevice d, VkCommandBuffer cmd) {
+    for (WGPUDeviceImpl::Timed &t : d->recording)
+        if (t.cmd == cmd) return &t;
+    return nullptr;
+}
+
+// A command buffer of an encoder starts its slice of timestamps
+void time_begin(WGPUDevice d, VkCommandBuffer cmd) {
+    if (!d->queries) return;
+    if (d->query_next + kQueriesPerBuffer > kQueries) d->query_next = 0;
+    WGPUDeviceImpl::Timed t{cmd, 0, d->query_next, 1, {}};
+    d->query_next += kQueriesPerBuffer;
+    vkCmdResetQueryPool(cmd, d->queries, t.first, kQueriesPerBuffer);
+    vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, d->queries, t.first);  // after the opening barrier: earlier work is not counted
+    d->recording.push_back(std::move(t));
+}
+
+void time_after(WGPUDevice d, VkCommandBuffer cmd, const char *name) {
+    WGPUDeviceImpl::Timed *t = d->queries ? timing_of(d, cmd) : nullptr;
+    if (!t || t->count >= kQueriesPerBuffer) return;
+    vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, d->queries, t->first + t->count);
+    ++t->count;
+    t->names.push_back(name);
+}
+
+void profile_collect(WGPUDevice d) {
+    for (auto it = d->timed.begin(); it != d->timed.end();) {
+        if (it->serial > d->completed) {
+            ++it;
+            continue;
+        }
+        std::vector<std::uint64_t> ticks(it->count);
+        if (vkGetQueryPoolResults(d->device, d->queries, it->first, it->count, ticks.size() * 8, ticks.data(), 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS)
+            for (std::uint32_t i = 1; i < it->count; ++i) {
+                auto &slot = d->spent[it->names[i - 1]];
+                slot.first += static_cast<double>(ticks[i] - ticks[i - 1]) * d->tick_ns;
+                ++slot.second;
+            }
+        it = d->timed.erase(it);
+    }
+    const auto now = std::chrono::steady_clock::now();
+    const double seconds = std::chrono::duration<double>(now - d->profile_start).count();
+    if (seconds < 2.0) return;
+    double busy = 0;
+    for (const auto &e : d->spent) busy += e.second.first;
+    std::fprintf(stderr, "[vk-profile] per second: %.0f submits, GPU busy %.1f ms, most in flight %llu, CPU waited %.1f ms (%.0f times) |",
+                 d->profile_submits / seconds, busy / 1e6 / seconds, static_cast<unsigned long long>(d->most_in_flight), d->waited_ms / seconds, d->waits / seconds);
+    for (const auto &e : d->spent)
+        std::fprintf(stderr, " %s %.1f ms (%.0f)", e.first.c_str(), e.second.first / 1e6 / seconds, e.second.second / seconds);
+    std::fprintf(stderr, "\n");
+    d->spent.clear();
+    d->profile_submits = d->most_in_flight = d->waits = 0;
+    d->waited_ms = 0;
+    d->profile_start = now;
+}
+
 // One submission: the pending queue writes first, then the given command buffers; it signals the timeline with its serial
 void submit(WGPUDevice d, const std::vector<VkCommandBuffer> &given) {
     std::vector<VkCommandBuffer> all;
@@ -427,6 +508,27 @@ void submit(WGPUDevice d, const std::vector<VkCommandBuffer> &given) {
     }
     d->submitted = serial;
     for (VkCommandBuffer c : all) d->spare.emplace_back(c, serial);
+    if (d->queries) {
+        for (VkCommandBuffer c : all)
+            for (auto it = d->recording.begin(); it != d->recording.end(); ++it)
+                if (it->cmd == c) {
+                    it->serial = serial;
+                    d->timed.push_back(std::move(*it));
+                    d->recording.erase(it);
+                    break;
+                }
+        ++d->profile_submits;
+        d->most_in_flight = std::max(d->most_in_flight, d->submitted - d->completed);
+    }
+    // The CPU stays at most max_in_flight submissions ahead: a backlog makes the picture late and, on the Switch, ran NVK out of room
+    // for submissions (VK_ERROR_DEVICE_LOST after about 240)
+    update_completed(d);
+    if (d->submitted - d->completed > d->max_in_flight) {
+        const auto t0 = std::chrono::steady_clock::now();
+        wait_for(d, d->submitted - d->max_in_flight);
+        d->waited_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        ++d->waits;
+    }
 }
 
 void bury(WGPUDevice d, std::function<void()> destroy) { d->graveyard.emplace_back(d->submitted + 1, std::move(destroy)); }
@@ -434,6 +536,7 @@ void bury(WGPUDevice d, std::function<void()> destroy) { d->graveyard.emplace_ba
 // Callbacks of finished maps and queue waits, and objects the GPU is done with
 void process(WGPUDevice d) {
     update_completed(d);
+    if (d->queries) profile_collect(d);
     while (!d->graveyard.empty() && d->graveyard.front().first <= d->completed) {
         auto destroy = std::move(d->graveyard.front().second);
         d->graveyard.pop_front();
@@ -667,6 +770,7 @@ WGPUFuture wgpuAdapterRequestDevice(WGPUAdapter adapter, WGPUDeviceDescriptor co
     vkGetPhysicalDeviceFeatures(adapter->phys, &supported);
     VkPhysicalDeviceFeatures features{};
     features.robustBufferAccess = supported.robustBufferAccess;  // WebGPU keeps out-of-range accesses harmless; the shader expects that
+    if (const char *r = std::getenv("PS2_VK_ROBUST"); r && r[0] == '0') features.robustBufferAccess = VK_FALSE;
     VkPhysicalDeviceVulkan12Features f12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
     f12.timelineSemaphore = VK_TRUE;
     const float priority = 1.0f;
@@ -706,6 +810,22 @@ WGPUFuture wgpuAdapterRequestDevice(WGPUAdapter adapter, WGPUDeviceDescriptor co
         return fail("no timeline semaphore");
     }
     if (descriptor) d->errors = descriptor->uncapturedErrorCallbackInfo;
+    if (const char *n = std::getenv("PS2_VK_IN_FLIGHT"); n && std::atoi(n) > 0) d->max_in_flight = static_cast<std::uint64_t>(std::atoi(n));
+    if (const char *p = std::getenv("PS2_VK_PROFILE"); p && p[0] == '1') {
+        std::uint32_t families = 0;
+        vkGetPhysicalDeviceQueueFamilyProperties(adapter->phys, &families, nullptr);
+        std::vector<VkQueueFamilyProperties> fp(families);
+        vkGetPhysicalDeviceQueueFamilyProperties(adapter->phys, &families, fp.data());
+        VkQueryPoolCreateInfo qi2{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+        qi2.queryType = VK_QUERY_TYPE_TIMESTAMP;
+        qi2.queryCount = kQueries;
+        if (fp[adapter->family].timestampValidBits && vkCreateQueryPool(device, &qi2, nullptr, &d->queries) == VK_SUCCESS) {
+            d->tick_ns = adapter->props.limits.timestampPeriod;
+            std::fprintf(stderr, "[vk-profile] timing every dispatch (%.3f ns per tick)\n", d->tick_ns);
+        } else {
+            std::fprintf(stderr, "[vk-profile] this queue has no timestamps\n");
+        }
+    }
     d->queue_object = new WGPUQueueImpl{d};
     g_device = d;
     if (!features.robustBufferAccess) std::fprintf(stderr, "[vulkan] no robust buffer access on this device\n");
@@ -724,6 +844,7 @@ void wgpuDeviceRelease(WGPUDevice d) {
         vkFreeMemory(d->device, s.memory, nullptr);
     }
     for (VkDescriptorPool p : d->pools) vkDestroyDescriptorPool(d->device, p, nullptr);
+    if (d->queries) vkDestroyQueryPool(d->device, d->queries, nullptr);
     vkDestroySemaphore(d->device, d->timeline, nullptr);
     vkDestroyCommandPool(d->device, d->pool, nullptr);
     vkDestroyDevice(d->device, nullptr);
@@ -1008,6 +1129,7 @@ WGPUComputePipeline wgpuDeviceCreateComputePipeline(WGPUDevice d, WGPUComputePip
     auto *p = new WGPUComputePipelineImpl;
     p->device = d;
     p->layout = descriptor->layout->layout;
+    p->name = entry;
     VkResult r = VK_ERROR_UNKNOWN;
     on_big_stack([&] { r = vkCreateComputePipelines(d->device, VK_NULL_HANDLE, 1, &ci, nullptr, &p->pipeline); });
     vkDestroyShaderModule(d->device, module, nullptr);
@@ -1036,6 +1158,7 @@ WGPUCommandEncoder wgpuDeviceCreateCommandEncoder(WGPUDevice d, WGPUCommandEncod
     auto *e = new WGPUCommandEncoderImpl;
     e->device = d;
     e->cmd = begin_commands(d);
+    time_begin(d, e->cmd);
     return e;
 }
 
@@ -1050,6 +1173,7 @@ WGPUComputePassEncoder wgpuCommandEncoderBeginComputePass(WGPUCommandEncoder e, 
 void wgpuComputePassEncoderSetPipeline(WGPUComputePassEncoder p, WGPUComputePipeline pipeline) {
     vkCmdBindPipeline(p->encoder->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline->pipeline);
     p->layout = pipeline->layout;
+    p->name = pipeline->name.c_str();
 }
 
 void wgpuComputePassEncoderSetBindGroup(WGPUComputePassEncoder p, std::uint32_t index, WGPUBindGroup group, std::size_t count, std::uint32_t const *offsets) {
@@ -1060,6 +1184,7 @@ void wgpuComputePassEncoderDispatchWorkgroups(WGPUComputePassEncoder p, std::uin
     if (!x || !y || !z) return;
     vkCmdDispatch(p->encoder->cmd, x, y, z);
     dispatch_barrier(p->encoder->cmd);  // WebGPU: each dispatch sees what the one before it wrote
+    time_after(p->encoder->device, p->encoder->cmd, p->name);
 }
 
 void wgpuComputePassEncoderEnd(WGPUComputePassEncoder) {}
@@ -1071,6 +1196,7 @@ void wgpuCommandEncoderCopyBufferToBuffer(WGPUCommandEncoder e, WGPUBuffer sourc
     VkBufferCopy region{source_offset, destination_offset, size};
     vkCmdCopyBuffer(e->cmd, source->buffer, destination->buffer, 1, &region);
     dispatch_barrier(e->cmd);
+    time_after(e->device, e->cmd, "copy");
 }
 
 WGPUCommandBuffer wgpuCommandEncoderFinish(WGPUCommandEncoder e, WGPUCommandBufferDescriptor const *) {
