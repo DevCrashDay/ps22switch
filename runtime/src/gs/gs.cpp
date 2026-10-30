@@ -1,3 +1,4 @@
+#include "ps2/part.hpp"
 #include "gs.hpp"
 
 #include "gif.hpp"
@@ -1197,6 +1198,7 @@ std::uint32_t g_present_frame = 0;
 std::uint32_t present_frame() { return g_present_frame; }
 
 void post_present() {
+    part::Scope mark(part::kWaitWindow);
     const DisplayRegs regs = display_regs();
     queue::post(queue::kPresent, static_cast<std::uint32_t>(frame_count()), 0, &regs, sizeof regs);
     ++g_posted_presents;

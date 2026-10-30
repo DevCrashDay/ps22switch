@@ -1,3 +1,4 @@
+#include "ps2/part.hpp"
 #include "window.hpp"
 #include "thread.hpp"
 
@@ -890,6 +891,7 @@ void write_audio_dumps();
 void note_audio();
 
 void pace() {
+    ps2::part::Scope mark(ps2::part::kWaitSound);
     static bool stuck = false;  // the device took no sound for a second; the clock paces the game until it takes some again
     if (g_audio && !(stuck && g_pipe->full())) {
         // The audio device clock paces emulation: wait while more than ~80 ms of sound is waiting. The pipe times the game between

@@ -1,3 +1,4 @@
+#include "ps2/part.hpp"
 #include "dmac.hpp"
 
 #include "kernel.hpp"
@@ -77,6 +78,7 @@ std::uint8_t *target(std::uint32_t address) {
 }
 
 void deliver(int ch, std::uint32_t address, std::uint32_t qwc) {
+    part::Scope mark(part::kDma);
     if (!qwc) return;
     static std::vector<std::uint8_t> buffer;
     const std::size_t bytes = static_cast<std::size_t>(qwc) * 16;

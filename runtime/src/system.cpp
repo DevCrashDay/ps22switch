@@ -1,3 +1,4 @@
+#include "ps2/part.hpp"
 #include "dmac.hpp"
 #include "gs/gif.hpp"
 #include "vif.hpp"
@@ -714,6 +715,7 @@ void core_sample(Who who) {
 
 int run() {
     thread_tune(Who::Emulation);
+    part::start();
     Cpu &c = g_cpu;
     const std::uint64_t started_at = now();  // for the share of waiting loops skipped (hw.cpp)
     if (!g_resumed) set_budget(c, kMaxSlice);
@@ -740,10 +742,14 @@ int run() {
             quick::service();
         }
         c.pc &= ~kUnwind;
-        run_due_events();
-        kernel::service(c);
+        {
+            part::Scope mark(part::kEvents);
+            run_due_events();
+            kernel::service(c);
+        }
         if (g_halted) break;
         if (c.pc == kIdle) {
+            part::Scope mark(part::kIdle);
             idle(c);
             continue;
         }

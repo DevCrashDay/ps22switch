@@ -484,6 +484,30 @@ static int run_threads_headless(const std::function<int()> &emulate) {
 }
 
 #ifdef __SWITCH__
+// The NAME=value lines of launch.txt set before any static object is made, so switches the runtime reads while starting up (PS2_IOP_LOAD
+// and the like) see them as they would see the shell's on the PC. libnx has the arguments and the SD card ready by then.
+extern "C" char **__system_argv __attribute__((weak));
+extern "C" int __system_argc __attribute__((weak));
+__attribute__((constructor(101))) void switch_early_environment() {
+    if (!&__system_argc || !&__system_argv || __system_argc < 1 || !__system_argv || !__system_argv[0]) return;
+    std::string path = __system_argv[0];
+    const std::size_t slash = path.find_last_of('/');
+    path = (slash == std::string::npos ? std::string() : path.substr(0, slash + 1)) + "launch.txt";
+    std::FILE *f = std::fopen(path.c_str(), "rb");
+    if (!f) return;
+    char line[512];
+    while (std::fgets(line, sizeof line, f)) {
+        std::string s = line;
+        while (!s.empty() && (s.back() == '\n' || s.back() == '\r' || s.back() == ' ')) s.pop_back();
+        const std::size_t eq = s.find('=');
+        if (eq == std::string::npos || eq == 0) continue;
+        if (!std::all_of(s.begin(), s.begin() + static_cast<std::ptrdiff_t>(eq), [](char c) { return std::isupper(static_cast<unsigned char>(c)) || std::isdigit(static_cast<unsigned char>(c)) || c == '_'; }))
+            continue;
+        setenv(s.substr(0, eq).c_str(), s.substr(eq + 1).c_str(), 1);
+    }
+    std::fclose(f);
+}
+
 // The homebrew menu starts an .nro with no arguments: what a command line gives ps2run elsewhere (the program, --disc, --patches,
 // --widescreen and the rest) comes from launch.txt next to the .nro (or in its RomFS), one argument to a line, with paths relative to
 // the folder of the file. scripts/switch_port.py writes it. Without one, the folder is searched for a program and a disc image.

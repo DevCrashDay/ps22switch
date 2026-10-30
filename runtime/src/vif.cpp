@@ -1,3 +1,4 @@
+#include "ps2/part.hpp"
 #include "vif.hpp"
 
 #include "dmac.hpp"
@@ -335,6 +336,7 @@ void stats() {
 }
 
 void transfer(int unit, const std::uint8_t *data, std::uint32_t qwc) {
+    part::Scope mark(part::kVif);
     if (shadow(unit)) gs::queue::vu().post(gs::queue::kVif1, qwc, 0, data, qwc * 16);
     Unit &u = state(unit);
     if (u.pending.empty() && !u.stalled) {

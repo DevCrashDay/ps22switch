@@ -51,6 +51,7 @@ else()
     set(PS2_API PUBLIC)
     add_library(ps2runtime STATIC
         runtime/src/memory.cpp
+        runtime/src/part.cpp
         runtime/src/dispatch.cpp
         runtime/src/system.cpp
         runtime/src/kernel.cpp

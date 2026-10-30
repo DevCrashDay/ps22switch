@@ -1,3 +1,4 @@
+#include "ps2/part.hpp"
 #include "ipu.hpp"
 
 #include "tables.hpp"
@@ -593,6 +594,7 @@ void drain() {
 }
 
 void step() {
+    part::Scope mark(part::kIpu);
     if (g_busy && g_decoding) {
         try {
             g_starved = !run_command();
@@ -709,12 +711,14 @@ void write32(std::uint32_t a, std::uint32_t v) {
 }
 
 void write_fifo(const std::uint8_t *qword) {
+    part::Scope mark(part::kIpu);
     dump_input(qword, 16);
     g_in.insert(g_in.end(), qword, qword + 16);
     step();
 }
 
 void read_fifo(std::uint8_t *qword) {
+    part::Scope mark(part::kIpu);
     if (g_out_pos + 16 <= g_out.size()) {
         std::memcpy(qword, g_out.data() + g_out_pos, 16);
         g_out_pos += 16;

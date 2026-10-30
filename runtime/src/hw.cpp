@@ -1,3 +1,4 @@
+#include "ps2/part.hpp"
 #include "hw.hpp"
 
 #include "dmac.hpp"
@@ -276,6 +277,7 @@ std::uint32_t read_intc_stat() {
 }
 
 std::uint32_t read32(std::uint32_t a) {
+    part::Scope mark(part::kHw);
     if (a == kIntcStat) return read_intc_stat();
     if (a == kIntcMask) return g_intc_mask;
     if (a == kDmacStat) return g_dmac_stat;
