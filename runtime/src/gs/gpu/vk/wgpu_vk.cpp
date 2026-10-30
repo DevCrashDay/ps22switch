@@ -274,10 +274,24 @@ void report(WGPUDevice d, const std::string &message) {
     if (d && d->errors.callback) d->errors.callback(&d, WGPUErrorType_Internal, WGPUStringView{message.data(), message.size()}, d->errors.userdata1, d->errors.userdata2);
 }
 
+// The type with all the wanted properties and the fewest others. That matters on the Switch, where every type is device local: one the
+// CPU can also see (and keep coherent) can be slower for the GPU, and the GPU's own buffers want the one without those properties.
 std::uint32_t memory_type(WGPUDevice d, std::uint32_t bits, VkMemoryPropertyFlags want, VkMemoryPropertyFlags fallback) {
-    for (const VkMemoryPropertyFlags flags : {want, fallback})
-        for (std::uint32_t i = 0; i < d->memory.memoryTypeCount; ++i)
-            if ((bits & (1u << i)) && (d->memory.memoryTypes[i].propertyFlags & flags) == flags) return i;
+    for (const VkMemoryPropertyFlags flags : {want, fallback}) {
+        std::uint32_t best = UINT32_MAX;
+        int best_extra = 64;
+        for (std::uint32_t i = 0; i < d->memory.memoryTypeCount; ++i) {
+            const VkMemoryPropertyFlags have = d->memory.memoryTypes[i].propertyFlags;
+            if (!(bits & (1u << i)) || (have & flags) != flags) continue;
+            int extra = 0;
+            for (VkMemoryPropertyFlags rest = have & ~flags; rest; rest &= rest - 1) ++extra;
+            if (extra < best_extra) {
+                best = i;
+                best_extra = extra;
+            }
+        }
+        if (best != UINT32_MAX) return best;
+    }
     return UINT32_MAX;
 }
 
@@ -794,6 +808,13 @@ WGPUFuture wgpuAdapterRequestDevice(WGPUAdapter adapter, WGPUDeviceDescriptor co
     d->device = device;
     vkGetDeviceQueue(device, adapter->family, 0, &d->queue);
     vkGetPhysicalDeviceMemoryProperties(adapter->phys, &d->memory);
+    for (std::uint32_t i = 0; i < d->memory.memoryTypeCount; ++i) {
+        const VkMemoryPropertyFlags f = d->memory.memoryTypes[i].propertyFlags;
+        std::fprintf(stderr, "[vulkan] memory type %u: heap %u (%llu MB)%s%s%s%s\n", i, d->memory.memoryTypes[i].heapIndex,
+                     static_cast<unsigned long long>(d->memory.memoryHeaps[d->memory.memoryTypes[i].heapIndex].size >> 20),
+                     f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT ? " device-local" : "", f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT ? " host-visible" : "",
+                     f & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT ? " coherent" : "", f & VK_MEMORY_PROPERTY_HOST_CACHED_BIT ? " cached" : "");
+    }
     VkCommandPoolCreateInfo pi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     pi.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
     pi.queueFamilyIndex = adapter->family;

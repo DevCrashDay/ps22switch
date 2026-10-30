@@ -23,8 +23,8 @@ ROOT = Path(__file__).resolve().parent.parent
 WGSL = ROOT / "runtime" / "src" / "gs" / "gpu" / "gs.wgsl"
 OUT = ROOT / "runtime" / "src" / "gs" / "gpu" / "vk" / "spirv_table.cpp"
 
-# (SCALE, TILE, EXPLICIT_FMA): gpu.cpp's defaults (PS2_SCALE unset, TILE 8), with and without the sums spelled out as fma()
-VARIANTS = [(1, 8, False), (1, 8, True)]
+# (SCALE, TILE, EXPLICIT_FMA): the tile sizes gpu.cpp takes (PS2_TILE=4, 8 or 16), with and without the sums spelled out as fma()
+VARIANTS = [(1, tile, fma) for tile in (4, 8, 16) for fma in (False, True)]
 
 
 def wgsl_hash(text: str) -> int:
