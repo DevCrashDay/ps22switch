@@ -623,6 +623,13 @@ int main(int argc, char **argv) {
         if (slash != std::string::npos) chdir(self.substr(0, slash + 1).c_str());
     }
     if (std::FILE *log = std::freopen("ps2run.log", "w", stderr)) std::setvbuf(log, nullptr, _IOLBF, 0);
+    // stdout too, and on descriptors 1 and 2 as well as the C streams: code that writes there directly (Mesa's shader compiler, in
+    // Rust, with NAK_DEBUG) stopped the program when nothing was behind them
+    if (std::FILE *out = std::freopen("ps2run.stdout.log", "w", stdout)) {
+        std::setvbuf(out, nullptr, _IOLBF, 0);
+        if (fileno(out) != 1) dup2(fileno(out), 1);
+    }
+    if (fileno(stderr) != 2) dup2(fileno(stderr), 2);
     std::vector<std::string> switch_args;
     std::vector<char *> switch_argv;
     if (argc < 2) {
