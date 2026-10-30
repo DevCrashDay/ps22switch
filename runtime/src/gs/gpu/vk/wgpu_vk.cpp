@@ -182,6 +182,7 @@ struct WGPUDeviceImpl {
     std::vector<std::pair<VkCommandBuffer, std::uint64_t>> spare;  // command buffers and the submission they were last part of
     VkCommandBuffer uploads = VK_NULL_HANDLE;                     // queue writes waiting for the next submission
     std::vector<Staging> staging;
+    std::size_t staging_current = SIZE_MAX;  // the block writes are appended to
     std::deque<MapRequest> maps;
     std::deque<WorkDone> work_done;
     std::deque<std::pair<std::uint64_t, std::function<void()>>> graveyard;  // destroyed once the GPU is past the submission
@@ -353,19 +354,25 @@ VkCommandBuffer begin_commands(WGPUDevice d) {
 }
 
 // Room for `size` bytes of queue writes; the copy out of it goes into d->uploads
+// Room for `size` bytes of queue writes; the copy out of it goes into d->uploads. The writes of many submissions share a block, one
+// after the other, and a block is started again from the front once the GPU is past the last submission that read from it.
 Staging *staging_for(WGPUDevice d, VkDeviceSize size, VkDeviceSize &offset) {
     size = (size + 15) & ~VkDeviceSize{15};
     const std::uint64_t next = d->submitted + 1;  // the submission the pending uploads go out with
-    for (Staging &s : d->staging) {
-        if (s.used && s.free_after == next && s.used + size <= s.size) {  // already in use for this submission: append
+    if (d->staging_current < d->staging.size()) {
+        Staging &s = d->staging[d->staging_current];
+        if (s.used + size <= s.size) {
             offset = s.used;
             s.used += size;
+            s.free_after = next;
             return &s;
         }
     }
     update_completed(d);
-    for (Staging &s : d->staging) {
-        if (s.free_after <= d->completed && size <= s.size) {
+    for (std::size_t i = 0; i < d->staging.size(); ++i) {
+        Staging &s = d->staging[i];
+        if (i != d->staging_current && s.free_after <= d->completed && size <= s.size) {
+            d->staging_current = i;
             s.used = size;
             s.free_after = next;
             offset = 0;
@@ -381,6 +388,10 @@ Staging *staging_for(WGPUDevice d, VkDeviceSize size, VkDeviceSize &offset) {
     s.free_after = next;
     offset = 0;
     d->staging.push_back(s);
+    d->staging_current = d->staging.size() - 1;
+    if (d->staging.size() > 2)
+        std::fprintf(stderr, "[vulkan] staging block %zu of %llu bytes (%llu submissions in flight)\n", d->staging.size(), static_cast<unsigned long long>(s.size),
+                     static_cast<unsigned long long>(d->submitted - d->completed));
     return &d->staging.back();
 }
 
