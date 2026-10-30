@@ -1,6 +1,7 @@
 #include "ps2/part.hpp"
 #include "window.hpp"
 #include "thread.hpp"
+#include "switch_clock.hpp"
 
 #include "ps2/system.hpp"
 
@@ -1484,5 +1485,8 @@ int run_window(const std::function<int()> &emulate) {
     if (g_card.state.load() == 0) SDL_Quit();  // a key card still open is on a thread inside SDL: the program ends without taking SDL down under it
     if (ps2::g_options.on_exit) ps2::g_options.on_exit();  // the host's log copy hands over the last lines before the process ends
     std::fflush(nullptr);
+#ifdef __SWITCH__
+    switch_clock_restore();  // _Exit skips what exit() would run
+#endif
     std::_Exit(result);
 }

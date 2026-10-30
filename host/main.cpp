@@ -3,6 +3,7 @@
 #include "ps2/ee_live.hpp"
 #include "ps2/vu_live.hpp"
 #include "thread.hpp"
+#include "switch_clock.hpp"
 
 #ifdef PS2_WINDOW
 #include "window.hpp"
@@ -643,6 +644,9 @@ int main(int argc, char **argv) {
     }
 #endif
     if (argc < 2) return usage();
+#ifdef __SWITCH__
+    switch_clock_start();
+#endif
 #ifdef _WIN32
     SetConsoleCtrlHandler(on_console_event, TRUE);
     SetUnhandledExceptionFilter(on_crash);
