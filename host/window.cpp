@@ -861,7 +861,10 @@ void poll() {
         std::fprintf(stderr, "[hitch] reading the controllers and the notice took %.1f ms%s", ps2::hitch::ms_since(after_events), "\n");
 }
 
+std::atomic<double> g_shown_ms{0};  // PS2_PRESENT_LOG: time in show_pixels, added to the wait log's "showing the picture"
+
 void show_pixels(const std::uint32_t *rgba, std::uint32_t w, std::uint32_t h) {
+    const auto shown_from = std::chrono::steady_clock::now();
     if (w != g_tex_w || h != g_tex_h) {
         if (g_texture) SDL_DestroyTexture(g_texture);
         g_texture = SDL_CreateTexture(g_renderer, SDL_PIXELFORMAT_ABGR8888, SDL_TEXTUREACCESS_STREAMING, static_cast<int>(w), static_cast<int>(h));
@@ -873,6 +876,7 @@ void show_pixels(const std::uint32_t *rgba, std::uint32_t w, std::uint32_t h) {
     SDL_RenderClear(g_renderer);
     SDL_RenderCopy(g_renderer, g_texture, nullptr, nullptr);
     SDL_RenderPresent(g_renderer);
+    g_shown_ms.store(g_shown_ms.load() + std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - shown_from).count());
 }
 
 void present() {
@@ -983,19 +987,23 @@ struct WaitLog {
     using Clock = std::chrono::steady_clock;
     bool on = std::getenv("PS2_PRESENT_LOG") != nullptr;
     Clock::time_point since = Clock::now();
-    double post = 0, sound = 0, seen_working = 0, seen_idle = 0;
+    double post = 0, sound = 0, seen_working = 0, seen_idle = 0, seen_shown = 0;
     std::atomic<double> working{0}, idle{0};  // written by the window thread, read by the emulation thread
+    std::atomic<double> shown{0};             // of the rendering: handing the picture to SDL (texture upload and present)
     std::uint32_t frames = 0;
     static double ms(Clock::time_point from) { return std::chrono::duration<double, std::milli>(Clock::now() - from).count(); }
     void emulation_frame() {
+        shown.store(g_shown_ms.load());
         if (++frames < 60) return;
         const double seconds = std::chrono::duration<double>(Clock::now() - since).count();
-        std::fprintf(stderr, "[waits] %.1f frames/s; emulation thread per frame: waiting for the window thread %.2f ms, for the sound %.2f ms; window thread per second: rendering %.0f ms, no work %.0f ms\n",
-                     frames / seconds, post / frames, sound / frames, (working.load() - seen_working) / seconds, (idle.load() - seen_idle) / seconds);
+        std::fprintf(stderr, "[waits] %.1f frames/s; emulation thread per frame: waiting for the window thread %.2f ms, for the sound %.2f ms; window thread per second: rendering %.0f ms (showing the picture %.0f ms), no work %.0f ms\n",
+                     frames / seconds, post / frames, sound / frames, (working.load() - seen_working) / seconds, (shown.load() - seen_shown) / seconds,
+                     (idle.load() - seen_idle) / seconds);
         since = Clock::now();
         post = sound = 0;
         seen_working = working.load();
         seen_idle = idle.load();
+        seen_shown = shown.load();
         frames = 0;
     }
 };
