@@ -740,7 +740,8 @@ void hw_emit(const Batch &b, std::uint32_t prim_offset, std::uint32_t setup_offs
         std::uint32_t key = 0;
         if (s[0] & 512u) key = 1 + ((s[7] >> 8) & 3u) + ((s[0] & 32u) ? 0u : 4u);
         if (s[0] & 8u) key |= (1u + ((s[7] >> 12) & 0xFFu)) << 4;
-        const std::uint32_t fix = s[9];
+        // FIX only matters (and only splits runs) when the blend uses it as C
+        const std::uint32_t fix = (s[0] & 8u) && ((s[7] >> 16) & 3u) == 2u ? s[9] : 0u;
         if (!pass.runs.empty() && pass.runs.back().key == key && pass.runs.back().fix == fix) ++pass.runs.back().count;
         else pass.runs.push_back({key, fix, i, 1, pass.draw_param, x0, y0, x1, y1});
     }
