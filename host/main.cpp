@@ -487,6 +487,36 @@ static int run_threads_headless(const std::function<int()> &emulate) {
 #ifdef __SWITCH__
 // The NAME=value lines of launch.txt set before any static object is made, so switches the runtime reads while starting up (PS2_IOP_LOAD
 // and the like) see them as they would see the shell's on the PC. libnx has the arguments and the SD card ready by then.
+// Memory for the GPU (the Vulkan renderer). NVK takes its memory through nvmap, outside the newlib heap, and needs a larger transfer
+// memory than libnx's default; libnx's own heap setup gives newlib everything that is left, so a large GPU allocation could find
+// nothing. The heap is set up as libnx does it, less a reserve for the GPU. The same as NetherSX2's Switch port (source/main.c).
+extern "C" {
+u32 __nx_nv_transfermem_size = 16 * 1024 * 1024;
+extern char *fake_heap_start;
+extern char *fake_heap_end;
+
+void __libnx_initheap(void) {
+    void *addr = nullptr;
+    std::size_t size = 0;
+    if (envHasHeapOverride()) {
+        addr = envGetHeapOverrideAddr();
+        size = envGetHeapOverrideSize();
+    } else {
+        u64 available = 0, used = 0;
+        svcGetInfo(&available, InfoType_TotalMemorySize, CUR_PROCESS_HANDLE, 0);
+        svcGetInfo(&used, InfoType_UsedMemorySize, CUR_PROCESS_HANDLE, 0);
+        if (available > used + 0x200000) size = (available - used - 0x200000) & ~std::size_t{0x1FFFFF};
+        // leave this much unmapped for the GPU: 512 MB with a game's memory (title takeover), 128 MB in the album
+        const std::size_t reserve = std::size_t{size > (std::size_t{2} << 30) ? 512u : 128u} << 20;
+        if (size > reserve + (std::size_t{256} << 20)) size = (size - reserve) & ~std::size_t{0x1FFFFF};
+        if (size == 0) size = 0x2000000 * 16;
+        if (R_FAILED(svcSetHeapSize(&addr, size))) diagAbortWithResult(MAKERESULT(Module_Libnx, LibnxError_HeapAllocFailed));
+    }
+    fake_heap_start = static_cast<char *>(addr);
+    fake_heap_end = static_cast<char *>(addr) + size;
+}
+}
+
 extern "C" char **__system_argv __attribute__((weak));
 extern "C" int __system_argc __attribute__((weak));
 __attribute__((constructor(101))) void switch_early_environment() {
