@@ -21,6 +21,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 WGSL = ROOT / "runtime" / "src" / "gs" / "gpu" / "gs.wgsl"
+HW_WGSL = ROOT / "runtime" / "src" / "gs" / "gpu" / "hw.wgsl"
 OUT = ROOT / "runtime" / "src" / "gs" / "gpu" / "vk" / "spirv_table.cpp"
 
 # (SCALE, TILE, EXPLICIT_FMA): the tile sizes gpu.cpp takes (PS2_TILE=4, 8 or 16), with and without the sums spelled out as fma()
@@ -53,50 +54,61 @@ def specialise(text: str, scale: int, tile: int, fma: bool) -> str:
     return out
 
 
+def compile_wgsl(naga, text, name, tmp, extra=()):
+    src = Path(tmp) / f"{name}.wgsl"
+    spv = src.with_suffix(".spv")
+    src.write_text(text, encoding="utf-8", newline="\n")
+    # every index clamped into its array (branch-free), as WebGPU allows: the driver needs no robust buffer access, which NVK does
+    # with a branch around every memory access
+    r = subprocess.run([naga, "--index-bounds-check-policy", "Restrict", "--buffer-bounds-check-policy", "Restrict", *extra, str(src), str(spv)],
+                       capture_output=True, text=True)
+    if r.returncode != 0 or not spv.is_file():
+        sys.exit(f"naga failed on {name}:\n{r.stdout}{r.stderr}")
+    data = spv.read_bytes()
+    if len(data) % 4 or int.from_bytes(data[:4], "little") != 0x07230203:
+        sys.exit("naga's output is not SPIR-V")
+    return [int.from_bytes(data[i:i + 4], "little") for i in range(0, len(data), 4)]
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--naga", default=os.environ.get("NAGA", "naga"), help="the naga program (naga-cli)")
     args = parser.parse_args()
     naga = shutil.which(args.naga) or args.naga
     text = WGSL.read_text(encoding="utf-8")
+    hw_text = HW_WGSL.read_text(encoding="utf-8")
     h = wgsl_hash(text)
-    modules = []
+    hw_h = wgsl_hash(hw_text)
+    modules = []  # (hash, scale, tile, fma, words); tile 0: a program without overrides, any constants
     with tempfile.TemporaryDirectory() as tmp:
         for scale, tile, fma in VARIANTS:
-            src = Path(tmp) / f"gs_{scale}_{tile}_{int(fma)}.wgsl"
-            spv = src.with_suffix(".spv")
-            src.write_text(specialise(text, scale, tile, fma), encoding="utf-8", newline="\n")
-            # every index clamped into its array (branch-free), as WebGPU allows: the driver needs no robust buffer access, which NVK does
-            # with a branch around every memory access
-            r = subprocess.run([naga, "--index-bounds-check-policy", "Restrict", "--buffer-bounds-check-policy", "Restrict", str(src), str(spv)],
-                               capture_output=True, text=True)
-            if r.returncode != 0 or not spv.is_file():
-                sys.exit(f"naga failed on SCALE={scale} TILE={tile} EXPLICIT_FMA={fma}:\n{r.stdout}{r.stderr}")
-            data = spv.read_bytes()
-            if len(data) % 4 or int.from_bytes(data[:4], "little") != 0x07230203:
-                sys.exit("naga's output is not SPIR-V")
-            words = [int.from_bytes(data[i:i + 4], "little") for i in range(0, len(data), 4)]
-            modules.append((scale, tile, fma, words))
-            print(f"SCALE={scale} TILE={tile} EXPLICIT_FMA={int(fma)}: {len(words)} words")
+            words = compile_wgsl(naga, specialise(text, scale, tile, fma), f"gs_{scale}_{tile}_{int(fma)}", tmp)
+            modules.append((h, scale, tile, fma, words))
+            print(f"gs.wgsl SCALE={scale} TILE={tile} EXPLICIT_FMA={int(fma)}: {len(words)} words")
+        words = compile_wgsl(naga, hw_text, "hw", tmp, ("--capabilities", "dual_source_blending"))
+        modules.append((hw_h, 0, 0, False, words))
+        print(f"hw.wgsl: {len(words)} words")
 
+    sha = lambda t: hashlib.sha256(t.replace(chr(13), '').encode('utf-8')).hexdigest()
     lines = [
-        "// Made by scripts/wgsl_spirv.py from runtime/src/gs/gpu/gs.wgsl: do not edit, run the script again after changing the shader.",
+        "// Made by scripts/wgsl_spirv.py from runtime/src/gs/gpu/gs.wgsl and hw.wgsl: do not edit, run the script again after changing them.",
         f"// gs.wgsl hash {h:016x}",
-        f"// gs.wgsl sha256 {hashlib.sha256(text.replace(chr(13), '').encode('utf-8')).hexdigest()}",
+        f"// gs.wgsl sha256 {sha(text)}",
+        f"// hw.wgsl sha256 {sha(hw_text)}",
         '#include "spirv.hpp"',
         "",
         "namespace ps2::gs::gpu::vk {",
         "",
         "namespace {",
     ]
-    for n, (scale, tile, fma, words) in enumerate(modules):
+    for n, (_, scale, tile, fma, words) in enumerate(modules):
         lines.append(f"const std::uint32_t kWords{n}[] = {{")
         for i in range(0, len(words), 12):
             lines.append("    " + ", ".join(f"0x{w:08x}" for w in words[i:i + 12]) + ",")
         lines.append("};")
     lines += ["}  // namespace", "", "const SpirvVariant kSpirvVariants[] = {"]
-    for n, (scale, tile, fma, words) in enumerate(modules):
-        lines.append(f"    {{0x{h:016x}ull, {scale}, {tile}, {'true' if fma else 'false'}, kWords{n}, sizeof kWords{n} / 4}},")
+    for n, (mh, scale, tile, fma, words) in enumerate(modules):
+        lines.append(f"    {{0x{mh:016x}ull, {scale}, {tile}, {'true' if fma else 'false'}, kWords{n}, sizeof kWords{n} / 4}},")
     lines += ["};", "const std::size_t kSpirvVariantCount = sizeof kSpirvVariants / sizeof kSpirvVariants[0];", "", "}  // namespace ps2::gs::gpu::vk", ""]
     OUT.write_text("\n".join(lines), encoding="utf-8", newline="\n")
     print(f"wrote {OUT.relative_to(ROOT)}")

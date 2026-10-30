@@ -2,9 +2,11 @@
 // drawing program runs where wgpu-native does not: on the Nintendo Switch, through Mesa's NVK driver (docs: README, "Vulkan renderer").
 // gpu.cpp stays as it is on the PC; only the API under it changes.
 //
-// What it covers: compute pipelines, storage and uniform buffers (one bind group layout with a dynamic uniform offset), buffer writes and
-// copies, mapping buffers for reading, and waiting for the queue. What it does not: surfaces, render pipelines and timestamp queries.
-// gpu.cpp falls back on its own when those are missing (the picture is read back and shown by the window code; no timing).
+// What it covers: compute pipelines, storage and uniform buffers (with dynamic offsets), buffer writes and copies, mapping buffers for
+// reading, waiting for the queue, and for the hardware path (PS2_GS_HW, hw.wgsl) 2D textures (storage, sampled, colour and depth
+// attachments, all kept in the GENERAL layout), render pipelines with dual-source blending, and render passes through Vulkan 1.3's
+// dynamic rendering. What it does not: surfaces and timestamp queries; gpu.cpp does without them (the picture is read back and shown by
+// the window code; no timing).
 //
 // WGSL is not compiled here. The shaders were turned into SPIR-V by naga when they last changed (scripts/wgsl_spirv.py) and are built
 // into the program; a WGSL text is matched to its SPIR-V by a hash of the text, and a pipeline's override constants pick the variant.
@@ -58,6 +60,7 @@ extern "C" void *__stdcall GetProcAddress(void *module, const char *name);
 #define PS2_VK_INSTANCE(X)                                                                                                              \
     X(vkDestroyInstance) X(vkEnumeratePhysicalDevices) X(vkGetPhysicalDeviceProperties) X(vkGetPhysicalDeviceQueueFamilyProperties)       \
     X(vkGetPhysicalDeviceMemoryProperties) X(vkGetPhysicalDeviceFeatures) X(vkCreateDevice) X(vkGetDeviceProcAddr)     \
+    X(vkGetPhysicalDeviceFeatures2)                                                                                                   \
     X(vkEnumerateDeviceExtensionProperties)
 #define PS2_VK_DEVICE(X)                                                                                                                \
     X(vkDestroyDevice) X(vkGetDeviceQueue) X(vkQueueSubmit) X(vkDeviceWaitIdle) X(vkCreateBuffer) X(vkDestroyBuffer)                    \
@@ -68,7 +71,10 @@ extern "C" void *__stdcall GetProcAddress(void *module, const char *name);
     X(vkGetSemaphoreCounterValue) X(vkWaitSemaphores) X(vkCreateDescriptorSetLayout) X(vkDestroyDescriptorSetLayout)                    \
     X(vkCreatePipelineLayout) X(vkDestroyPipelineLayout) X(vkCreateDescriptorPool) X(vkDestroyDescriptorPool) X(vkAllocateDescriptorSets) X(vkFreeDescriptorSets)  \
     X(vkUpdateDescriptorSets) X(vkCreateShaderModule) X(vkDestroyShaderModule) X(vkCreateComputePipelines) X(vkDestroyPipeline)                        \
-    X(vkCreateQueryPool) X(vkDestroyQueryPool) X(vkCmdResetQueryPool) X(vkCmdWriteTimestamp) X(vkGetQueryPoolResults)
+    X(vkCreateQueryPool) X(vkDestroyQueryPool) X(vkCmdResetQueryPool) X(vkCmdWriteTimestamp) X(vkGetQueryPoolResults)            \
+    X(vkCreateImage) X(vkDestroyImage) X(vkGetImageMemoryRequirements) X(vkBindImageMemory) X(vkCreateImageView) X(vkDestroyImageView) \
+    X(vkCreateGraphicsPipelines) X(vkCmdBeginRendering) X(vkCmdEndRendering) X(vkCmdSetViewport) X(vkCmdSetScissor)                   \
+    X(vkCmdSetBlendConstants) X(vkCmdDraw)
 
 #ifndef __SWITCH__
 #define PS2_VK_POINTER(name) static PFN_##name name = nullptr;
@@ -154,6 +160,7 @@ struct WGPUAdapterImpl {
     VkPhysicalDevice phys = VK_NULL_HANDLE;
     VkPhysicalDeviceProperties props{};
     std::uint32_t family = 0;
+    bool dynamic_rendering = false, dual_source = false;
 };
 
 struct Staging {
@@ -235,6 +242,8 @@ struct WGPUBindGroupLayoutImpl {
     std::vector<VkDescriptorType> types;  // by binding
 };
 
+
+
 struct WGPUPipelineLayoutImpl {
     WGPUDevice device = nullptr;
     VkPipelineLayout layout = VK_NULL_HANDLE;
@@ -265,6 +274,38 @@ struct WGPUCommandEncoderImpl {
 struct WGPUCommandBufferImpl {
     WGPUDevice device = nullptr;
     VkCommandBuffer cmd = VK_NULL_HANDLE;
+};
+
+struct WGPUTextureImpl {
+    WGPUDevice device = nullptr;
+    VkImage image = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkFormat format = VK_FORMAT_UNDEFINED;
+    std::uint32_t width = 0, height = 0;
+    bool depth = false;
+};
+
+struct WGPUTextureViewImpl {
+    WGPUDevice device = nullptr;
+    WGPUTexture texture = nullptr;
+    VkImageView view = VK_NULL_HANDLE;
+};
+
+struct WGPURenderPipelineImpl {
+    WGPUDevice device = nullptr;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    VkPipelineLayout layout = VK_NULL_HANDLE;
+};
+
+struct WGPURenderPassEncoderImpl {
+    struct Binding {
+        std::uint32_t index;
+        WGPUBindGroup group;
+        std::vector<std::uint32_t> offsets;
+    };
+    WGPUCommandEncoder encoder = nullptr;
+    VkPipelineLayout layout = VK_NULL_HANDLE;
+    std::vector<Binding> pending;  // bound before the first pipeline: made once its layout is known
 };
 
 struct WGPUComputePassEncoderImpl {
@@ -679,6 +720,7 @@ const ps2::gs::gpu::vk::SpirvVariant *find_variant(std::uint64_t hash, const WGP
     fma = fma_env ? std::atoi(fma_env) != 0 : true;
     for (std::size_t i = 0; i < ps2::gs::gpu::vk::kSpirvVariantCount; ++i) {
         const ps2::gs::gpu::vk::SpirvVariant &v = ps2::gs::gpu::vk::kSpirvVariants[i];
+        if (v.wgsl_hash == hash && v.tile == 0) return &v;  // a program without override constants (hw.wgsl)
         if (v.wgsl_hash == hash && v.scale == scale && v.tile == tile && v.explicit_fma == fma) return &v;
     }
     std::fprintf(stderr, "[vulkan] no SPIR-V built for this shader with SCALE=%u TILE=%u EXPLICIT_FMA=%d (scripts/wgsl_spirv.py makes them)\n", scale, tile,
@@ -712,7 +754,7 @@ WGPUInstance wgpuCreateInstance(WGPUInstanceDescriptor const *) {
     VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
     app.pApplicationName = "ps2run";
     app.pEngineName = "ps2-native-recomp";
-    app.apiVersion = VK_API_VERSION_1_2;
+    app.apiVersion = version >= VK_API_VERSION_1_3 ? VK_API_VERSION_1_3 : VK_API_VERSION_1_2;
     VkInstanceCreateInfo ci{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
     ci.pApplicationInfo = &app;
     const char *layer = "VK_LAYER_KHRONOS_validation";
@@ -779,6 +821,17 @@ WGPUFuture wgpuInstanceRequestAdapter(WGPUInstance instance, WGPURequestAdapterO
             best->props = p;
             best->family = family;
             best_score = score;
+            VkPhysicalDeviceFeatures base{};
+            vkGetPhysicalDeviceFeatures(devices[n], &base);
+            best->dual_source = base.dualSrcBlend;
+            best->dynamic_rendering = false;
+            if (p.apiVersion >= VK_API_VERSION_1_3 && instance->instance && vkGetPhysicalDeviceFeatures2) {
+                VkPhysicalDeviceVulkan13Features f13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
+                VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+                f2.pNext = &f13;
+                vkGetPhysicalDeviceFeatures2(devices[n], &f2);
+                best->dynamic_rendering = f13.dynamicRendering;
+            }
         }
     }
     if (info.callback) {
@@ -825,7 +878,10 @@ WGPUStatus wgpuAdapterGetLimits(WGPUAdapter adapter, WGPULimits *limits) {
     return WGPUStatus_Success;
 }
 
-WGPUBool wgpuAdapterHasFeature(WGPUAdapter, WGPUFeatureName) { return false; }  // no timestamp queries
+WGPUBool wgpuAdapterHasFeature(WGPUAdapter adapter, WGPUFeatureName feature) {
+    // no timestamp queries; dual-source blending where the device has it and render passes can be made at all
+    return feature == WGPUFeatureName_DualSourceBlending && adapter->dual_source && adapter->dynamic_rendering;
+}
 
 WGPUFuture wgpuAdapterRequestDevice(WGPUAdapter adapter, WGPUDeviceDescriptor const *descriptor, WGPURequestDeviceCallbackInfo info) {
     std::lock_guard<std::recursive_mutex> hold(g_lock);
@@ -842,6 +898,10 @@ WGPUFuture wgpuAdapterRequestDevice(WGPUAdapter adapter, WGPUDeviceDescriptor co
     if (const char *r = std::getenv("PS2_VK_ROBUST"); r && r[0] == '1') features.robustBufferAccess = supported.robustBufferAccess;
     VkPhysicalDeviceVulkan12Features f12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
     f12.timelineSemaphore = VK_TRUE;
+    VkPhysicalDeviceVulkan13Features f13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
+    f13.dynamicRendering = adapter->dynamic_rendering;
+    if (adapter->dynamic_rendering) f12.pNext = &f13;
+    features.dualSrcBlend = adapter->dual_source;
     const float priority = 1.0f;
     VkDeviceQueueCreateInfo qi{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
     qi.queueFamilyIndex = adapter->family;
@@ -858,6 +918,7 @@ WGPUFuture wgpuAdapterRequestDevice(WGPUAdapter adapter, WGPUDeviceDescriptor co
             if (!std::strcmp(e.extensionName, VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME)) {
                 extensions.push_back(VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME);
                 fexe.pipelineExecutableInfo = VK_TRUE;
+                fexe.pNext = f12.pNext;
                 f12.pNext = &fexe;
             }
         if (extensions.empty()) std::fprintf(stderr, "[vk-stats] the driver has no VK_KHR_pipeline_executable_properties\n");
@@ -1067,8 +1128,10 @@ WGPUBindGroupLayout wgpuDeviceCreateBindGroupLayout(WGPUDevice d, WGPUBindGroupL
         if (e.buffer.type == WGPUBufferBindingType_Uniform) b.descriptorType = e.buffer.hasDynamicOffset ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC : VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
         else if (e.buffer.type == WGPUBufferBindingType_Storage || e.buffer.type == WGPUBufferBindingType_ReadOnlyStorage)
             b.descriptorType = e.buffer.hasDynamicOffset ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        else if (e.storageTexture.access > WGPUStorageTextureAccess_Undefined) b.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        else if (e.texture.sampleType > WGPUTextureSampleType_Undefined) b.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
         else {
-            report(d, "only buffer bindings are supported");
+            report(d, "only buffer and texture bindings are supported");
             delete l;
             return nullptr;
         }
@@ -1141,11 +1204,12 @@ WGPUBindGroup wgpuDeviceCreateBindGroup(WGPUDevice d, WGPUBindGroupDescriptor co
     }
     if (!g->pool) {
         const VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1024}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, 128},
-                                              {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 256}, {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 256}};
+                                              {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 256}, {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 256},
+                                              {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 64}, {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 64}};
         VkDescriptorPoolCreateInfo pi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
         pi.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
         pi.maxSets = 128;
-        pi.poolSizeCount = 4;
+        pi.poolSizeCount = 6;
         pi.pPoolSizes = sizes;
         VkDescriptorPool pool = VK_NULL_HANDLE;
         if (vkCreateDescriptorPool(d->device, &pi, nullptr, &pool) != VK_SUCCESS) {
@@ -1163,18 +1227,25 @@ WGPUBindGroup wgpuDeviceCreateBindGroup(WGPUDevice d, WGPUBindGroupDescriptor co
         g->pool = pool;
     }
     std::vector<VkDescriptorBufferInfo> infos(descriptor->entryCount);
+    std::vector<VkDescriptorImageInfo> images(descriptor->entryCount);
     std::vector<VkWriteDescriptorSet> writes(descriptor->entryCount);
     for (std::size_t i = 0; i < descriptor->entryCount; ++i) {
         const WGPUBindGroupEntry &e = descriptor->entries[i];
-        infos[i].buffer = e.buffer->buffer;
-        infos[i].offset = e.offset;
-        infos[i].range = e.size == WGPU_WHOLE_SIZE ? VK_WHOLE_SIZE : e.size;
         writes[i] = VkWriteDescriptorSet{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
         writes[i].dstSet = g->set;
         writes[i].dstBinding = e.binding;
         writes[i].descriptorCount = 1;
         writes[i].descriptorType = descriptor->layout->types[e.binding];
-        writes[i].pBufferInfo = &infos[i];
+        if (e.textureView) {
+            images[i].imageView = e.textureView->view;
+            images[i].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+            writes[i].pImageInfo = &images[i];
+        } else {
+            infos[i].buffer = e.buffer->buffer;
+            infos[i].offset = e.offset;
+            infos[i].range = e.size == WGPU_WHOLE_SIZE ? VK_WHOLE_SIZE : e.size;
+            writes[i].pBufferInfo = &infos[i];
+        }
     }
     vkUpdateDescriptorSets(d->device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
     return g;
@@ -1326,6 +1397,372 @@ WGPUFuture wgpuQueueOnSubmittedWorkDone(WGPUQueue queue, WGPUQueueWorkDoneCallba
 }
 
 // ---------------------------------------------------------------------------------------------------------------------------------
+// Textures, render pipelines and render passes (the hardware path)
+
+namespace {
+
+VkFormat vk_format(WGPUTextureFormat f) {
+    switch (f) {
+    case WGPUTextureFormat_RGBA8Unorm: return VK_FORMAT_R8G8B8A8_UNORM;
+    case WGPUTextureFormat_BGRA8Unorm: return VK_FORMAT_B8G8R8A8_UNORM;
+    case WGPUTextureFormat_R32Uint: return VK_FORMAT_R32_UINT;
+    case WGPUTextureFormat_Depth32Float: return VK_FORMAT_D32_SFLOAT;
+    default: return VK_FORMAT_UNDEFINED;
+    }
+}
+
+VkCompareOp vk_compare(WGPUCompareFunction c) {
+    switch (c) {
+    case WGPUCompareFunction_Never: return VK_COMPARE_OP_NEVER;
+    case WGPUCompareFunction_Less: return VK_COMPARE_OP_LESS;
+    case WGPUCompareFunction_Equal: return VK_COMPARE_OP_EQUAL;
+    case WGPUCompareFunction_LessEqual: return VK_COMPARE_OP_LESS_OR_EQUAL;
+    case WGPUCompareFunction_Greater: return VK_COMPARE_OP_GREATER;
+    case WGPUCompareFunction_NotEqual: return VK_COMPARE_OP_NOT_EQUAL;
+    case WGPUCompareFunction_GreaterEqual: return VK_COMPARE_OP_GREATER_OR_EQUAL;
+    default: return VK_COMPARE_OP_ALWAYS;
+    }
+}
+
+VkBlendFactor vk_blend_factor(WGPUBlendFactor f) {
+    switch (f) {
+    case WGPUBlendFactor_Zero: return VK_BLEND_FACTOR_ZERO;
+    case WGPUBlendFactor_One: return VK_BLEND_FACTOR_ONE;
+    case WGPUBlendFactor_Src: return VK_BLEND_FACTOR_SRC_COLOR;
+    case WGPUBlendFactor_OneMinusSrc: return VK_BLEND_FACTOR_ONE_MINUS_SRC_COLOR;
+    case WGPUBlendFactor_SrcAlpha: return VK_BLEND_FACTOR_SRC_ALPHA;
+    case WGPUBlendFactor_OneMinusSrcAlpha: return VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+    case WGPUBlendFactor_Dst: return VK_BLEND_FACTOR_DST_COLOR;
+    case WGPUBlendFactor_OneMinusDst: return VK_BLEND_FACTOR_ONE_MINUS_DST_COLOR;
+    case WGPUBlendFactor_DstAlpha: return VK_BLEND_FACTOR_DST_ALPHA;
+    case WGPUBlendFactor_OneMinusDstAlpha: return VK_BLEND_FACTOR_ONE_MINUS_DST_ALPHA;
+    case WGPUBlendFactor_Constant: return VK_BLEND_FACTOR_CONSTANT_COLOR;
+    case WGPUBlendFactor_OneMinusConstant: return VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_COLOR;
+    case WGPUBlendFactor_Src1Alpha: return VK_BLEND_FACTOR_SRC1_ALPHA;
+    case WGPUBlendFactor_OneMinusSrc1Alpha: return VK_BLEND_FACTOR_ONE_MINUS_SRC1_ALPHA;
+    default: return VK_BLEND_FACTOR_ONE;
+    }
+}
+
+VkBlendOp vk_blend_op(WGPUBlendOperation o) {
+    switch (o) {
+    case WGPUBlendOperation_Subtract: return VK_BLEND_OP_SUBTRACT;
+    case WGPUBlendOperation_ReverseSubtract: return VK_BLEND_OP_REVERSE_SUBTRACT;
+    case WGPUBlendOperation_Min: return VK_BLEND_OP_MIN;
+    case WGPUBlendOperation_Max: return VK_BLEND_OP_MAX;
+    default: return VK_BLEND_OP_ADD;
+    }
+}
+
+// Images live in the GENERAL layout: storage, sampled, colour and depth attachment alike, so a pass needs no layout changes
+void image_barrier_general(VkCommandBuffer cmd, VkImage image, bool depth) {
+    VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    b.srcAccessMask = 0;
+    b.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    b.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.image = image;
+    b.subresourceRange = {static_cast<VkImageAspectFlags>(depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT), 0, 1, 0, 1};
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+}
+
+}  // namespace
+
+WGPUTexture wgpuDeviceCreateTexture(WGPUDevice d, WGPUTextureDescriptor const *descriptor) {
+    std::lock_guard<std::recursive_mutex> hold(g_lock);
+    const VkFormat format = vk_format(descriptor->format);
+    if (format == VK_FORMAT_UNDEFINED || descriptor->dimension != WGPUTextureDimension_2D) {
+        report(d, "unsupported texture format or dimension");
+        return nullptr;
+    }
+    auto *t = new WGPUTextureImpl;
+    t->device = d;
+    t->format = format;
+    t->width = descriptor->size.width;
+    t->height = descriptor->size.height;
+    t->depth = format == VK_FORMAT_D32_SFLOAT;
+    VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    ci.imageType = VK_IMAGE_TYPE_2D;
+    ci.format = format;
+    ci.extent = {t->width, t->height, 1};
+    ci.mipLevels = 1;
+    ci.arrayLayers = 1;
+    ci.samples = VK_SAMPLE_COUNT_1_BIT;
+    ci.tiling = VK_IMAGE_TILING_OPTIMAL;
+    const WGPUTextureUsage u = descriptor->usage;
+    if (u & WGPUTextureUsage_RenderAttachment) ci.usage |= t->depth ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    if (u & WGPUTextureUsage_StorageBinding) ci.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
+    if (u & WGPUTextureUsage_TextureBinding) ci.usage |= VK_IMAGE_USAGE_SAMPLED_BIT;
+    if (u & WGPUTextureUsage_CopySrc) ci.usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    if (u & WGPUTextureUsage_CopyDst) ci.usage |= VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    ci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    if (VkResult r = vkCreateImage(d->device, &ci, nullptr, &t->image); r != VK_SUCCESS) {
+        log_vk("vkCreateImage", r);
+        delete t;
+        return nullptr;
+    }
+    VkMemoryRequirements req;
+    vkGetImageMemoryRequirements(d->device, t->image, &req);
+    VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    ai.allocationSize = req.size;
+    ai.memoryTypeIndex = memory_type(d, req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0);
+    if (ai.memoryTypeIndex == UINT32_MAX || vkAllocateMemory(d->device, &ai, nullptr, &t->memory) != VK_SUCCESS) {
+        vkDestroyImage(d->device, t->image, nullptr);
+        delete t;
+        report(d, "no memory for a texture");
+        return nullptr;
+    }
+    vkBindImageMemory(d->device, t->image, t->memory, 0);
+    image_barrier_general(upload_commands(d), t->image, t->depth);
+    return t;
+}
+
+void wgpuTextureRelease(WGPUTexture t) {
+    if (!t) return;
+    std::lock_guard<std::recursive_mutex> hold(g_lock);
+    VkDevice device = t->device->device;
+    const VkImage image = t->image;
+    const VkDeviceMemory memory = t->memory;
+    bury(t->device, [device, image, memory] {
+        vkDestroyImage(device, image, nullptr);
+        vkFreeMemory(device, memory, nullptr);
+    });
+    delete t;
+}
+
+WGPUTextureView wgpuTextureCreateView(WGPUTexture t, WGPUTextureViewDescriptor const *) {
+    std::lock_guard<std::recursive_mutex> hold(g_lock);
+    auto *v = new WGPUTextureViewImpl;
+    v->device = t->device;
+    v->texture = t;
+    VkImageViewCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    ci.image = t->image;
+    ci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    ci.format = t->format;
+    ci.subresourceRange = {static_cast<VkImageAspectFlags>(t->depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT), 0, 1, 0, 1};
+    if (VkResult r = vkCreateImageView(t->device->device, &ci, nullptr, &v->view); r != VK_SUCCESS) {
+        log_vk("vkCreateImageView", r);
+        delete v;
+        return nullptr;
+    }
+    return v;
+}
+
+void wgpuTextureViewRelease(WGPUTextureView v) {
+    if (!v) return;
+    std::lock_guard<std::recursive_mutex> hold(g_lock);
+    VkDevice device = v->device->device;
+    const VkImageView view = v->view;
+    bury(v->device, [device, view] { vkDestroyImageView(device, view, nullptr); });
+    delete v;
+}
+
+WGPURenderPipeline wgpuDeviceCreateRenderPipeline(WGPUDevice d, WGPURenderPipelineDescriptor const *descriptor) {
+    std::lock_guard<std::recursive_mutex> hold(g_lock);
+    if (!d->adapter->dynamic_rendering) {
+        report(d, "render pipelines need Vulkan 1.3 dynamic rendering");
+        return nullptr;
+    }
+    const ps2::gs::gpu::vk::SpirvVariant *v = find_variant(descriptor->vertex.module->hash, nullptr, 0);
+    if (!v) return nullptr;
+    VkShaderModuleCreateInfo mi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    mi.codeSize = v->word_count * 4;
+    mi.pCode = v->words;
+    VkShaderModule module = VK_NULL_HANDLE;
+    if (VkResult r = vkCreateShaderModule(d->device, &mi, nullptr, &module); r != VK_SUCCESS) {
+        log_vk("vkCreateShaderModule", r);
+        return nullptr;
+    }
+    const std::string vs = str(descriptor->vertex.entryPoint);
+    const std::string fs = descriptor->fragment ? str(descriptor->fragment->entryPoint) : std::string();
+    VkPipelineShaderStageCreateInfo stages[2] = {{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}, {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}};
+    stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+    stages[0].module = module;
+    stages[0].pName = vs.c_str();
+    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    stages[1].module = module;
+    stages[1].pName = fs.c_str();
+    VkPipelineVertexInputStateCreateInfo input{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    VkPipelineInputAssemblyStateCreateInfo assembly{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+    switch (descriptor->primitive.topology) {
+    case WGPUPrimitiveTopology_PointList: assembly.topology = VK_PRIMITIVE_TOPOLOGY_POINT_LIST; break;
+    case WGPUPrimitiveTopology_LineList: assembly.topology = VK_PRIMITIVE_TOPOLOGY_LINE_LIST; break;
+    case WGPUPrimitiveTopology_LineStrip: assembly.topology = VK_PRIMITIVE_TOPOLOGY_LINE_STRIP; break;
+    case WGPUPrimitiveTopology_TriangleStrip: assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP; break;
+    default: assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST; break;
+    }
+    VkPipelineViewportStateCreateInfo viewport{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+    viewport.viewportCount = 1;
+    viewport.scissorCount = 1;
+    VkPipelineRasterizationStateCreateInfo raster{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+    raster.polygonMode = VK_POLYGON_MODE_FILL;
+    raster.cullMode = descriptor->primitive.cullMode == WGPUCullMode_Front ? VK_CULL_MODE_FRONT_BIT
+                      : descriptor->primitive.cullMode == WGPUCullMode_Back ? VK_CULL_MODE_BACK_BIT : VK_CULL_MODE_NONE;
+    raster.frontFace = descriptor->primitive.frontFace == WGPUFrontFace_CW ? VK_FRONT_FACE_CLOCKWISE : VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    raster.lineWidth = 1.0f;
+    VkPipelineMultisampleStateCreateInfo multisample{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+    multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    VkPipelineDepthStencilStateCreateInfo depth{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+    VkPipelineRenderingCreateInfo rendering{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
+    if (descriptor->depthStencil) {
+        depth.depthTestEnable = VK_TRUE;
+        depth.depthWriteEnable = descriptor->depthStencil->depthWriteEnabled == WGPUOptionalBool_True;
+        depth.depthCompareOp = vk_compare(descriptor->depthStencil->depthCompare);
+        rendering.depthAttachmentFormat = vk_format(descriptor->depthStencil->format);
+    }
+    std::vector<VkPipelineColorBlendAttachmentState> blends;
+    std::vector<VkFormat> formats;
+    if (descriptor->fragment)
+        for (std::size_t i = 0; i < descriptor->fragment->targetCount; ++i) {
+            const WGPUColorTargetState &t = descriptor->fragment->targets[i];
+            VkPipelineColorBlendAttachmentState b{};
+            b.colorWriteMask = static_cast<VkColorComponentFlags>(t.writeMask & 15u);
+            if (t.blend) {
+                b.blendEnable = VK_TRUE;
+                b.srcColorBlendFactor = vk_blend_factor(t.blend->color.srcFactor);
+                b.dstColorBlendFactor = vk_blend_factor(t.blend->color.dstFactor);
+                b.colorBlendOp = vk_blend_op(t.blend->color.operation);
+                b.srcAlphaBlendFactor = vk_blend_factor(t.blend->alpha.srcFactor);
+                b.dstAlphaBlendFactor = vk_blend_factor(t.blend->alpha.dstFactor);
+                b.alphaBlendOp = vk_blend_op(t.blend->alpha.operation);
+            }
+            blends.push_back(b);
+            formats.push_back(vk_format(t.format));
+        }
+    rendering.colorAttachmentCount = static_cast<std::uint32_t>(formats.size());
+    rendering.pColorAttachmentFormats = formats.data();
+    VkPipelineColorBlendStateCreateInfo blend{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+    blend.attachmentCount = static_cast<std::uint32_t>(blends.size());
+    blend.pAttachments = blends.data();
+    const VkDynamicState states[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_BLEND_CONSTANTS};
+    VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+    dynamic.dynamicStateCount = 3;
+    dynamic.pDynamicStates = states;
+    VkGraphicsPipelineCreateInfo ci{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+    ci.pNext = &rendering;
+    ci.stageCount = descriptor->fragment ? 2u : 1u;
+    ci.pStages = stages;
+    ci.pVertexInputState = &input;
+    ci.pInputAssemblyState = &assembly;
+    ci.pViewportState = &viewport;
+    ci.pRasterizationState = &raster;
+    ci.pMultisampleState = &multisample;
+    ci.pDepthStencilState = &depth;
+    ci.pColorBlendState = &blend;
+    ci.pDynamicState = &dynamic;
+    ci.layout = descriptor->layout->layout;
+    auto *p = new WGPURenderPipelineImpl;
+    p->device = d;
+    p->layout = descriptor->layout->layout;
+    VkResult r = VK_ERROR_UNKNOWN;
+    on_big_stack([&] { r = vkCreateGraphicsPipelines(d->device, VK_NULL_HANDLE, 1, &ci, nullptr, &p->pipeline); });
+    vkDestroyShaderModule(d->device, module, nullptr);
+    if (r != VK_SUCCESS) {
+        log_vk(("vkCreateGraphicsPipelines (" + vs + ", " + fs + ")").c_str(), r);
+        delete p;
+        return nullptr;
+    }
+    return p;
+}
+
+void wgpuRenderPipelineRelease(WGPURenderPipeline p) {
+    if (!p) return;
+    std::lock_guard<std::recursive_mutex> hold(g_lock);
+    VkDevice device = p->device->device;
+    const VkPipeline pipeline = p->pipeline;
+    bury(p->device, [device, pipeline] { vkDestroyPipeline(device, pipeline, nullptr); });
+    delete p;
+}
+
+WGPURenderPassEncoder wgpuCommandEncoderBeginRenderPass(WGPUCommandEncoder e, WGPURenderPassDescriptor const *descriptor) {
+    VkCommandBuffer cmd = e->cmd;
+    full_barrier(cmd);  // WebGPU: a pass sees everything before it
+    std::vector<VkRenderingAttachmentInfo> colors(descriptor->colorAttachmentCount, VkRenderingAttachmentInfo{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO});
+    std::uint32_t width = 0, height = 0;
+    for (std::size_t i = 0; i < descriptor->colorAttachmentCount; ++i) {
+        const WGPURenderPassColorAttachment &a = descriptor->colorAttachments[i];
+        colors[i].imageView = a.view->view;
+        colors[i].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        colors[i].loadOp = a.loadOp == WGPULoadOp_Clear ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD;
+        colors[i].storeOp = a.storeOp == WGPUStoreOp_Discard ? VK_ATTACHMENT_STORE_OP_DONT_CARE : VK_ATTACHMENT_STORE_OP_STORE;
+        colors[i].clearValue.color = {{static_cast<float>(a.clearValue.r), static_cast<float>(a.clearValue.g), static_cast<float>(a.clearValue.b), static_cast<float>(a.clearValue.a)}};
+        width = a.view->texture->width;
+        height = a.view->texture->height;
+    }
+    VkRenderingAttachmentInfo depth{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+    VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
+    if (const WGPURenderPassDepthStencilAttachment *ds = descriptor->depthStencilAttachment) {
+        depth.imageView = ds->view->view;
+        depth.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        depth.loadOp = ds->depthLoadOp == WGPULoadOp_Clear ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD;
+        depth.storeOp = ds->depthStoreOp == WGPUStoreOp_Discard ? VK_ATTACHMENT_STORE_OP_DONT_CARE : VK_ATTACHMENT_STORE_OP_STORE;
+        depth.clearValue.depthStencil = {ds->depthClearValue, 0};
+        ri.pDepthAttachment = &depth;
+        if (!width) {
+            width = ds->view->texture->width;
+            height = ds->view->texture->height;
+        }
+    }
+    ri.renderArea = {{0, 0}, {width, height}};
+    ri.layerCount = 1;
+    ri.colorAttachmentCount = static_cast<std::uint32_t>(colors.size());
+    ri.pColorAttachments = colors.data();
+    vkCmdBeginRendering(cmd, &ri);
+    auto *p = new WGPURenderPassEncoderImpl;
+    p->encoder = e;
+    return p;
+}
+
+void wgpuRenderPassEncoderSetViewport(WGPURenderPassEncoder p, float x, float y, float width, float height, float min_depth, float max_depth) {
+    const VkViewport v{x, y, width, height, min_depth, max_depth};
+    vkCmdSetViewport(p->encoder->cmd, 0, 1, &v);
+}
+
+void wgpuRenderPassEncoderSetScissorRect(WGPURenderPassEncoder p, std::uint32_t x, std::uint32_t y, std::uint32_t width, std::uint32_t height) {
+    const VkRect2D r{{static_cast<std::int32_t>(x), static_cast<std::int32_t>(y)}, {width, height}};
+    vkCmdSetScissor(p->encoder->cmd, 0, 1, &r);
+}
+
+void wgpuRenderPassEncoderSetBlendConstant(WGPURenderPassEncoder p, WGPUColor const *color) {
+    const float c[4] = {static_cast<float>(color->r), static_cast<float>(color->g), static_cast<float>(color->b), static_cast<float>(color->a)};
+    vkCmdSetBlendConstants(p->encoder->cmd, c);
+}
+
+void wgpuRenderPassEncoderSetPipeline(WGPURenderPassEncoder p, WGPURenderPipeline pipeline) {
+    vkCmdBindPipeline(p->encoder->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline->pipeline);
+    p->layout = pipeline->layout;
+    for (const WGPURenderPassEncoderImpl::Binding &b : p->pending)
+        vkCmdBindDescriptorSets(p->encoder->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, p->layout, b.index, 1, &b.group->set, static_cast<std::uint32_t>(b.offsets.size()),
+                                b.offsets.data());
+    p->pending.clear();
+}
+
+void wgpuRenderPassEncoderSetBindGroup(WGPURenderPassEncoder p, std::uint32_t index, WGPUBindGroup group, std::size_t count, std::uint32_t const *offsets) {
+    // before any pipeline (gpu.cpp binds group 0 first): the layout of the next pipeline is not known yet, the binding waits for it
+    if (!p->layout) {
+        p->pending.push_back({index, group, std::vector<std::uint32_t>(offsets, offsets + count)});
+        return;
+    }
+    vkCmdBindDescriptorSets(p->encoder->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, p->layout, index, 1, &group->set, static_cast<std::uint32_t>(count), offsets);
+}
+
+void wgpuRenderPassEncoderDraw(WGPURenderPassEncoder p, std::uint32_t vertices, std::uint32_t instances, std::uint32_t first_vertex, std::uint32_t first_instance) {
+    if (!vertices || !instances) return;
+    vkCmdDraw(p->encoder->cmd, vertices, instances, first_vertex, first_instance);
+}
+
+void wgpuRenderPassEncoderEnd(WGPURenderPassEncoder p) {
+    vkCmdEndRendering(p->encoder->cmd);
+    full_barrier(p->encoder->cmd);
+    time_after(p->encoder->device, p->encoder->cmd, "hw_draw");
+}
+
+void wgpuRenderPassEncoderRelease(WGPURenderPassEncoder p) { delete p; }
+
+// ---------------------------------------------------------------------------------------------------------------------------------
 // Not available here: gpu.cpp does without them (no timing, the picture is shown by the window code).
 
 WGPUQuerySet wgpuDeviceCreateQuerySet(WGPUDevice, WGPUQuerySetDescriptor const *) { return nullptr; }
@@ -1340,16 +1777,5 @@ void wgpuSurfaceGetCurrentTexture(WGPUSurface, WGPUSurfaceTexture *texture) {
     texture->status = WGPUSurfaceGetCurrentTextureStatus_Error;
 }
 WGPUStatus wgpuSurfacePresent(WGPUSurface) { return WGPUStatus_Error; }
-WGPUTextureView wgpuTextureCreateView(WGPUTexture, WGPUTextureViewDescriptor const *) { return nullptr; }
-void wgpuTextureRelease(WGPUTexture) {}
-void wgpuTextureViewRelease(WGPUTextureView) {}
-WGPURenderPipeline wgpuDeviceCreateRenderPipeline(WGPUDevice, WGPURenderPipelineDescriptor const *) { return nullptr; }
-WGPURenderPassEncoder wgpuCommandEncoderBeginRenderPass(WGPUCommandEncoder, WGPURenderPassDescriptor const *) { return nullptr; }
-void wgpuRenderPassEncoderSetViewport(WGPURenderPassEncoder, float, float, float, float, float, float) {}
-void wgpuRenderPassEncoderSetPipeline(WGPURenderPassEncoder, WGPURenderPipeline) {}
-void wgpuRenderPassEncoderSetBindGroup(WGPURenderPassEncoder, std::uint32_t, WGPUBindGroup, std::size_t, std::uint32_t const *) {}
-void wgpuRenderPassEncoderDraw(WGPURenderPassEncoder, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t) {}
-void wgpuRenderPassEncoderEnd(WGPURenderPassEncoder) {}
-void wgpuRenderPassEncoderRelease(WGPURenderPassEncoder) {}
 
 }  // extern "C"
