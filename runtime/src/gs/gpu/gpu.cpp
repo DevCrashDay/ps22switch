@@ -112,6 +112,8 @@ std::unordered_map<std::uint32_t, WGPURenderPipeline> g_hw_draw;
 WGPUShaderModule g_hw_module = nullptr;
 struct HwRun {
     std::uint32_t key, fix, first, count;
+    std::uint32_t draw_param;  // the batch's shapes and setups
+    int x0, y0, x1, y1;        // the batch's box: the scissor of its shapes
 };
 struct HwPass {
     std::uint32_t load_param, draw_param;
@@ -740,7 +742,7 @@ void hw_emit(const Batch &b, std::uint32_t prim_offset, std::uint32_t setup_offs
         if (s[0] & 8u) key |= (1u + ((s[7] >> 12) & 0xFFu)) << 4;
         const std::uint32_t fix = s[9];
         if (!pass.runs.empty() && pass.runs.back().key == key && pass.runs.back().fix == fix) ++pass.runs.back().count;
-        else pass.runs.push_back({key, fix, i, 1});
+        else pass.runs.push_back({key, fix, i, 1, pass.draw_param, x0, y0, x1, y1});
     }
     Command draw{kRaster, 0, 0, static_cast<std::uint32_t>(g_hw_passes.size())};
     draw.hw = 3;
@@ -1218,6 +1220,40 @@ void bench_capture() {
     g_bench_info.clear();
 }
 
+// Render passes in a row with nothing but CLUT loads between them become one pass, the CLUT loads moving in front of it: every pass
+// costs a barrier on each side, and on the Switch those add up. Safe because a CLUT load only writes slots no earlier draw reads (the
+// slots are a ring that is not reused within a submit) and reads video memory, which the draws do not write (they draw into the images;
+// a write-back between them breaks the row). A pass that has to fill its depth image first is not merged. PS2_HW_MERGE=0 keeps them apart.
+void hw_merge_passes() {
+    static const bool merge = os::env("PS2_HW_MERGE") != "0";
+    if (!g_hw || !merge) return;
+    std::vector<Command> out;
+    out.reserve(g_commands.size());
+    std::vector<Command> held;
+    std::ptrdiff_t last = -1;  // the last render pass in out, while only CLUT loads followed it
+    for (const Command &c : g_commands) {
+        if (last >= 0 && !c.hw && c.pipeline == kLoadClut) {
+            held.push_back(c);
+            continue;
+        }
+        if (last >= 0 && c.hw == 3 && !g_hw_passes[c.param].load_depth) {
+            out.insert(out.begin() + last, held.begin(), held.end());
+            last += static_cast<std::ptrdiff_t>(held.size());
+            held.clear();
+            HwPass &into = g_hw_passes[out[static_cast<std::size_t>(last)].param];
+            const HwPass &from = g_hw_passes[c.param];
+            into.runs.insert(into.runs.end(), from.runs.begin(), from.runs.end());
+            continue;
+        }
+        out.insert(out.end(), held.begin(), held.end());
+        held.clear();
+        out.push_back(c);
+        last = c.hw == 3 ? static_cast<std::ptrdiff_t>(out.size() - 1) : -1;
+    }
+    out.insert(out.end(), held.begin(), held.end());
+    g_commands.swap(out);
+}
+
 // Browsers copy writes above about 1 MiB through a slower path, so large uploads go in pieces.
 void submit(WGPUTextureView present_view = nullptr) {
     if (g_commands.empty() && !present_view) return;
@@ -1258,6 +1294,7 @@ void submit(WGPUTextureView present_view = nullptr) {
     writes.endOfPassWriteIndex = 1;
     WGPUComputePassDescriptor cd = WGPU_COMPUTE_PASS_DESCRIPTOR_INIT;
     if (measure) cd.timestampWrites = &writes;
+    hw_merge_passes();
     WGPUComputePassEncoder pass = wgpuCommandEncoderBeginComputePass(enc, &cd);
     Pipeline current = kPipelines;
     ++g_submits;
@@ -1311,11 +1348,24 @@ void submit(WGPUTextureView present_view = nullptr) {
                 wgpuRenderPassEncoderSetScissorRect(rp, static_cast<std::uint32_t>(hp.x0), static_cast<std::uint32_t>(hp.y0), static_cast<std::uint32_t>(hp.x1 - hp.x0 + 1),
                                                     static_cast<std::uint32_t>(hp.y1 - hp.y0 + 1));
             }
-            const std::uint32_t draw_offset = hp.draw_param * kParamStride;
-            wgpuRenderPassEncoderSetBindGroup(rp, 0, g_hw_group_draw, 1, &draw_offset);
+            std::uint32_t bound = ~0u;
+            int scissor[4] = {hp.x0, hp.y0, hp.x1, hp.y1};
             for (const HwRun &run : hp.runs) {
                 WGPURenderPipeline pipeline = hw_pipeline(run.key);
                 if (!pipeline) continue;
+                if (run.draw_param != bound) {
+                    const std::uint32_t draw_offset = run.draw_param * kParamStride;
+                    wgpuRenderPassEncoderSetBindGroup(rp, 0, g_hw_group_draw, 1, &draw_offset);
+                    bound = run.draw_param;
+                }
+                if (run.x0 != scissor[0] || run.y0 != scissor[1] || run.x1 != scissor[2] || run.y1 != scissor[3]) {
+                    wgpuRenderPassEncoderSetScissorRect(rp, static_cast<std::uint32_t>(run.x0), static_cast<std::uint32_t>(run.y0), static_cast<std::uint32_t>(run.x1 - run.x0 + 1),
+                                                        static_cast<std::uint32_t>(run.y1 - run.y0 + 1));
+                    scissor[0] = run.x0;
+                    scissor[1] = run.y0;
+                    scissor[2] = run.x1;
+                    scissor[3] = run.y1;
+                }
                 wgpuRenderPassEncoderSetPipeline(rp, pipeline);
                 const double fix = static_cast<double>(run.fix) / 128.0;
                 const WGPUColor constant{fix, fix, fix, fix};
