@@ -836,8 +836,10 @@ WGPUFuture wgpuAdapterRequestDevice(WGPUAdapter adapter, WGPUDeviceDescriptor co
     VkPhysicalDeviceFeatures supported{};
     vkGetPhysicalDeviceFeatures(adapter->phys, &supported);
     VkPhysicalDeviceFeatures features{};
-    features.robustBufferAccess = supported.robustBufferAccess;  // WebGPU keeps out-of-range accesses harmless; the shader expects that
-    if (const char *r = std::getenv("PS2_VK_ROBUST"); r && r[0] == '0') features.robustBufferAccess = VK_FALSE;
+    // WebGPU keeps out-of-range accesses harmless. The SPIR-V clamps every index itself (scripts/wgsl_spirv.py), so the driver's robust
+    // buffer access is not needed: NVK does it with a branch around every memory access, which made the drawing program several times
+    // slower on the Switch. PS2_VK_ROBUST=1 asks for it anyway.
+    if (const char *r = std::getenv("PS2_VK_ROBUST"); r && r[0] == '1') features.robustBufferAccess = supported.robustBufferAccess;
     VkPhysicalDeviceVulkan12Features f12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
     f12.timelineSemaphore = VK_TRUE;
     const float priority = 1.0f;
@@ -924,7 +926,6 @@ WGPUFuture wgpuAdapterRequestDevice(WGPUAdapter adapter, WGPUDeviceDescriptor co
     }
     d->queue_object = new WGPUQueueImpl{d};
     g_device = d;
-    if (!features.robustBufferAccess) std::fprintf(stderr, "[vulkan] no robust buffer access on this device\n");
     if (info.callback) info.callback(WGPURequestDeviceStatus_Success, d, text(""), info.userdata1, info.userdata2);
     return WGPUFuture{1};
 }

@@ -66,7 +66,10 @@ def main():
             src = Path(tmp) / f"gs_{scale}_{tile}_{int(fma)}.wgsl"
             spv = src.with_suffix(".spv")
             src.write_text(specialise(text, scale, tile, fma), encoding="utf-8", newline="\n")
-            r = subprocess.run([naga, str(src), str(spv)], capture_output=True, text=True)
+            # every index clamped into its array (branch-free), as WebGPU allows: the driver needs no robust buffer access, which NVK does
+            # with a branch around every memory access
+            r = subprocess.run([naga, "--index-bounds-check-policy", "Restrict", "--buffer-bounds-check-policy", "Restrict", str(src), str(spv)],
+                               capture_output=True, text=True)
             if r.returncode != 0 or not spv.is_file():
                 sys.exit(f"naga failed on SCALE={scale} TILE={tile} EXPLICIT_FMA={fma}:\n{r.stdout}{r.stderr}")
             data = spv.read_bytes()
