@@ -769,6 +769,27 @@ void flush_batch() {
         return;
     }
     const std::uint32_t prims = static_cast<std::uint32_t>(b.prims.size() / kPrimWords);
+    if (g_hw) {
+        // the hardware path needs the shapes and setups only: no screen tiles, no texture decoding, no snapshot
+        const std::uint32_t prim_offset = arena_append(b.prims.data(), b.prims.size() * 4);
+        const std::uint32_t setup_offset = arena_append(b.setups.data(), b.setups.size() * 4);
+        if (g_batch_log) {
+            ++g_why_runs[g_why];
+            g_why_prims[g_why] += prims;
+            g_why = kWhyFlush;
+        }
+        hw_emit(b, prim_offset, setup_offset, prims);
+        mark_rendered(pages(b.fbp, b.fbw, b.fpsm, b.minx, b.miny, b.maxx, b.maxy));
+        if (b.zwrite) mark_rendered(pages(b.zbp, b.fbw, b.zpsm, b.minx, b.miny, b.maxx, b.maxy));
+        b.prims.clear();
+        b.setups.clear();
+        b.boxes.clear();
+        g_batch_reads.clear();
+        b.key = ~0ull;
+        b.minx = b.miny = 1 << 30;
+        b.maxx = b.maxy = -1;
+        return;
+    }
     g_touched.clear();
     g_spans.clear();
     g_span_start.resize(prims + 1);
@@ -825,8 +846,7 @@ void flush_batch() {
         g_why_prims[g_why] += prims;
         g_why = kWhyFlush;
     }
-    if (g_hw) hw_emit(b, prim_offset, setup_offset, prims);
-    else g_commands.push_back({kRaster, std::min(tiles, 1024u), (tiles + 1023) / 1024, param});
+    g_commands.push_back({kRaster, std::min(tiles, 1024u), (tiles + 1023) / 1024, param});
     mark_rendered(pages(b.fbp, b.fbw, b.fpsm, b.minx, b.miny, b.maxx, b.maxy));
     if (b.zwrite) mark_rendered(pages(b.zbp, b.fbw, b.zpsm, b.minx, b.miny, b.maxx, b.maxy));
     b.prims.clear();
