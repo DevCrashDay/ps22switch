@@ -2840,10 +2840,19 @@ void load_clut(std::uint64_t tex0, std::uint64_t texclut) {
 
 void texflush() { ++g_texflushes; }
 
+// PS2_SUBMIT_ONCE=1: the frame's work goes to the chip together with the display blit, as one submission, instead of one submission
+// at the vblank and another one for the display. In the shim every submission starts with a full memory barrier (WebGPU's ordering),
+// which waits for everything submitted before it, so the GPU cannot overlap two submissions anyway: a fight makes 78 of them a
+// second, and about 400 ms of every second of the GPU's time is not inside any dispatch - the drains are the first suspect.
+static bool submit_once() {
+    static const bool on = std::getenv("PS2_SUBMIT_ONCE") != nullptr;
+    return on;
+}
+
 void flush() {
     if (g_mode == Mode::off) return;
     flush_all();
-    submit();
+    if (!submit_once()) submit();
     if (g_batch_log) {
         std::uint32_t runs = 0, prims = 0;
         for (int w = 0; w < kWhys; ++w) runs += g_why_runs[w], prims += g_why_prims[w];
