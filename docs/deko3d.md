@@ -25,9 +25,10 @@ Each stage is meant to be runnable on the console on its own, so a failure says 
    (`gpu/vk/wgpu_vk.cpp`), implementing what the hardware path actually uses — about a dozen entry points (device, queue, buffer and
    texture creation and writes, render pass, pipeline, bind groups, draw, submit, present). Until it exists, `PS2_DEKO3D` changes
    nothing about how the game is drawn.
-2. **Shaders**: `hw.wgsl` (and `blit.wgsl`) have to become DKSH. naga turns WGSL into GLSL; the console toolchain needs uam
-   (GLSL → the console's shader bytecode) and deko3d's DKSH container. The uam *headers* come with libnx; a `libuam.a` was not found in
-   `/opt/devkitpro/libnx/lib`, so this is the first thing to test before stage 1 is worth writing.
+2. **Shaders**: `hw.wgsl` (and `blit.wgsl`) have to become DKSH, deko3d's shader container. naga (already here, for SPIR-V) turns WGSL
+   into GLSL; the console toolchain then needs **uam**, the GLSL → NVIDIA shader compiler extracted from Mesa's GLSL and nv50 back
+   ends. There is no prebuilt uam on this machine (`libnx/lib` has `libdeko3d.a` and nothing else, and no `uam` headers). Another port
+   does it by building uam from source into the app — see *Prior art* below — so this stage is a known quantity, not a research risk.
 3. **Switch the hardware path over** and drop NVK from the link; the compute renderer stays as the reference on the PC.
 4. **One command buffer a frame** with explicit barriers, instead of the per-pass submit the Vulkan shim does, and present from the
    same queue.
@@ -54,3 +55,26 @@ What it does not do: draw anything from the PS2, read a texture, keep a pipeline
 If it works, `ps2run.log` holds `[deko] device open`, `[deko] 3 back buffers of 1280x720`, `[deko] swap chain made`, five
 `[deko] N frames in ... s` lines at about 60 frames a second, and `[deko] stage 0 done`, with colours on the screen in between. If it
 fails, the last `[deko]` line names the step, and the device's own complaints are logged by the debug callback.
+
+Two things the Vulkan path learned the hard way apply here as well: the display offers exactly three buffers and only mailbox and
+immediate present modes, and the window has to be ours alone. Stage 0 is run before SDL exists for that reason; once stage 1 draws the
+game, SDL's window and EGL surface have to go, not sit beside deko3d.
+
+## Prior art
+
+`ref-nether/` (NetherSX2's source, on this machine as a reference, not built) already has a complete deko3d backend —
+`ref-nether/source/deko3d/`, 3 826 lines including the uam build recipe: device and swap chain (`dk_gpu.cpp`), presentation
+(`dk_presentation.cpp`), image transfers (`dk_texture.cpp`), render state, the UI, and a shader path (`compiler/Uam.cmake`,
+`compiler/UamBridge.cpp`, `dk_shader_source.cpp`). What it settles:
+
+- **Shaders**: uam is built from source into the app (`FetchContent` of `github.com/PalindromicBreadLoaf/uam`, pinned commit, needs
+  bison, flex and Mako at configure time). `UamCompileGlsl(glsl, stage, &size, &log)` returns a ready DKSH blob — the bridge carries
+  deko3d's own `dksh.h`/`nv_shader_header.h` writer, so nothing else has to be written for stage 2 beyond turning `hw.wgsl` into GLSL.
+- **Symbols**: uam imports a large part of Mesa (the GLSL compiler, nv50_ir), which clashes with the Mesa that NVK links statically. The
+  fix is in `Uam.cmake`: link uam's objects into one relocatable object and strip every global symbol but `UamCompileGlsl`
+  (`objcopy --keep-global-symbol=UamCompileGlsl`). Worth copying for stage 3, where NVK is still linked.
+- **Shaders are unsigned**: DKSH goes through `dkShaderInitialize` with no signature, so this only ever runs on a console with the
+  signature patches homebrew already needs. Same as any deko3d homebrew.
+- **Licences**: uam is Mesa-derived (MIT for those parts); the Dolphin-derived bridge files are GPL-2.0-or-later, and this project's
+  licence is not GPL. That has to be settled before stage 2's code is added, not after.
+

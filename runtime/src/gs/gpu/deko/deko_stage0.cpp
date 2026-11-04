@@ -162,7 +162,9 @@ int deko_stage0(std::uint32_t asked) {
         frame_colour(frame, red, green, blue);
         dkCmdBufClear(commands);  // the last frame's commands are free to be overwritten (the fence above said so)
         dkCmdBufBindRenderTarget(commands, &views[slot], nullptr);
-        dkCmdBufClearColorFloat(commands, 0, 0xF, red, green, blue, 1.0f);
+        dkCmdBufClearColorFloat(commands, 0, DkColorMask_RGBA, red, green, blue, 1.0f);
+        // the clear has to be in memory before the display engine reads the image: the strongest ordering there is, one per frame
+        dkCmdBufBarrier(commands, DkBarrier_Full, 0);
         dkCmdBufSignalFence(commands, &finished, true);
         dkQueueSubmitCommands(queue, dkCmdBufFinishList(commands));
         dkQueueFlush(queue);
