@@ -75,9 +75,13 @@ What it does not do: draw anything from the PS2, read a texture, keep a pipeline
 
 `PS2_DEKO3D_DRAW=1` adds the triangle of `deko/stage_draw.wgsl` over the colour of each frame: two programs uam compiled, loaded as
 deko3d shader modules into a `DkMemBlockFlags_Code` memory block, a pipeline, a viewport, a scissor and one `dkCmdBufDraw`. It costs
-about 130 lines and proves the shader path on the console before the renderer's own 18 KB programs are involved. Its log adds
-`[deko] shader modules loaded: 1792 + 1536 bytes of code` (the space reserved for the two, code plus deko3d's unusable page part); a
-rejected module says so, with deko3d's own complaint after it.
+about 130 lines and proves the shader path on the console before the renderer's own 18 KB programs are involved.
+
+Measured (2026-11-04 22:51, same clocks): `[deko] shader modules loaded: 1536 + 1280 bytes of code` — the space reserved for each
+module, which is its code section plus the part of a page deko3d cannot use, on a `DK_SHADER_CODE_ALIGNMENT` boundary; the module
+files themselves are 768 and 512 bytes, the rest of which is the control block that stays in main memory. deko3d accepted both modules
+(no complaint from the device), and the loop still ran 300 frames in 4963 ms, 60.4 a second: a draw in the frame costs the present
+path nothing measurable.
 
 Two things the Vulkan path learned the hard way apply here as well: the display offers exactly three buffers and only mailbox and
 immediate present modes, and the window has to be ours alone. Stage 0 is run before SDL exists for that reason; once stage 1 draws the
