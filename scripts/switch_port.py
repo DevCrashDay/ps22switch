@@ -196,7 +196,8 @@ def build_nro(name: str, gen_dir: Path, args) -> Path:
     return nro
 
 
-def package(name: str, nro: Path, game_dir: Path, program: Path, disc: Path, patches, wide: bool, copy_disc: bool) -> Path:
+def package(name: str, nro: Path, game_dir: Path, program: Path, disc: Path, patches, wide: bool, copy_disc: bool,
+            launch_env=()) -> Path:
     """sdmc:/switch/ps22switch/<name>/: the .nro, launch.txt and the files it names, with the folder layout launch.txt expects."""
     pkg = SWITCH_OUT_DIR / name / "package" / "switch" / "ps22switch" / name
     pkg.mkdir(parents=True, exist_ok=True)
@@ -223,6 +224,9 @@ def package(name: str, nro: Path, game_dir: Path, program: Path, disc: Path, pat
                "PS2_GS_HW=1",
                "# one '[waits]' line a second: frames per second and where the window thread's time goes",
                "PS2_PRESENT_LOG=1"]
+    # --launch-env <file>: more NAME=value lines (the measuring switches, see build/switch/tests/Z-diagnose). Kept in a file so a
+    # rebuild cannot lose them: that is how the hardware rasterizer line went missing once (BUG-002).
+    launch += list(launch_env)
     (pkg / "launch.txt").write_text("\n".join(launch) + "\n", encoding="utf-8", newline="\n")
     keys = game_dir / "keys.ini"
     if keys.is_file():
@@ -254,6 +258,7 @@ def main():
     parser.add_argument("--nvk-sdk", default="", help="mesa-switch NVK SDK (portlibs/switch folder) for the Vulkan renderer (default: tools/nvk-sdk/portlibs/switch)")
     parser.add_argument("--software", action="store_true", help="draw with the software renderer instead of Vulkan (much slower)")
     parser.add_argument("--wsl-distro", default="devkita64", help="WSL distribution with devkitA64 and switch-cmake (Windows)")
+    parser.add_argument("--launch-env", default="", help="file of NAME=value lines to add to the SD folder's launch.txt (measuring switches)")
     args = parser.parse_args()
 
     target = Path(args.target)
@@ -283,8 +288,11 @@ def main():
         sys.exit(f"no generated C++ in {gen_dir}: run without --skip-port first")
 
     program, disc, patches, wide = launch_arguments(name, game_dir, iso, play, args.widescreen)
+    launch_env = []
+    if args.launch_env:
+        launch_env = [line.rstrip() for line in Path(args.launch_env).read_text(encoding="utf-8").splitlines()]
     nro = build_nro(name, gen_dir, args)
-    package(name, nro, game_dir, program, disc, patches, wide, not args.no_disc_copy)
+    package(name, nro, game_dir, program, disc, patches, wide, not args.no_disc_copy, launch_env)
     print(f"\n[DONE] {title} -> {nro.name}")
 
 

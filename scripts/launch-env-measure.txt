@@ -1,0 +1,19 @@
+# NAME=value lines for the SD folder's launch.txt, for:
+#   python scripts/switch_port.py <disc.iso> --name Tekken-4 --title "Tekken 4" --skip-port --no-disc-copy --launch-env scripts/launch-env-measure.txt
+#
+# These are the measuring switches (docs/switch-performance-plan.md); they cost a few percent of speed. switch_port.py already
+# writes PS2_GS_HW=1 and PS2_PRESENT_LOG=1 itself, so they are not repeated here. host/main.cpp reads every NAME=value line at
+# start, so turning one on or off needs only a launch.txt - never a rebuild.
+
+# [vk-profile] every 2 s: GPU time per program, submissions in flight, and the CPU time spent blocked because the GPU was behind.
+PS2_VK_PROFILE=1
+
+# [parts] every 2 s: what the emulation thread did (game code, IOP and sound, hardware registers, VIF, IPU, waiting).
+PS2_PARTS=1
+
+# [emit] every 2 s: our own command recording (emit_pre, flush_batch) against the time inside NVK's calls (submit).
+PS2_EMIT_LOG=1
+
+# [hitch] one line per picture that took 30 ms or more, with the window thread's time per kind of work (drawing messages,
+# handing the picture over) - noisy, so off unless a picture-level breakdown is wanted.
+#PS2_HITCH_LOG=1

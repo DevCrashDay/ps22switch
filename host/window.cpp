@@ -987,23 +987,30 @@ struct WaitLog {
     using Clock = std::chrono::steady_clock;
     bool on = std::getenv("PS2_PRESENT_LOG") != nullptr;
     Clock::time_point since = Clock::now();
-    double post = 0, sound = 0, seen_working = 0, seen_idle = 0, seen_shown = 0;
+    double post = 0, sound = 0, seen_working = 0, seen_idle = 0, seen_shown = 0, seen_polled = 0;
     std::atomic<double> working{0}, idle{0};  // written by the window thread, read by the emulation thread
     std::atomic<double> shown{0};             // of the rendering: handing the picture to SDL (texture upload and present)
+    std::atomic<double> polled{0};            // reading the window's events and the controllers (the loop's own overhead)
+    std::atomic<std::uint64_t> polls{0};
     std::uint32_t frames = 0;
+    std::uint64_t seen_polls = 0;
     static double ms(Clock::time_point from) { return std::chrono::duration<double, std::milli>(Clock::now() - from).count(); }
     void emulation_frame() {
         shown.store(g_shown_ms.load());
         if (++frames < 60) return;
         const double seconds = std::chrono::duration<double>(Clock::now() - since).count();
-        std::fprintf(stderr, "[waits] %.1f frames/s; emulation thread per frame: waiting for the window thread %.2f ms, for the sound %.2f ms; window thread per second: rendering %.0f ms (showing the picture %.0f ms), no work %.0f ms\n",
+        std::fprintf(stderr,
+                     "[waits] %.1f frames/s; emulation thread per frame: waiting for the window thread %.2f ms, for the sound %.2f ms; window thread per "
+                     "second: rendering %.0f ms (showing the picture %.0f ms), polling %.0f ms in %.0f calls, no work %.0f ms\n",
                      frames / seconds, post / frames, sound / frames, (working.load() - seen_working) / seconds, (shown.load() - seen_shown) / seconds,
-                     (idle.load() - seen_idle) / seconds);
+                     (polled.load() - seen_polled) / seconds, static_cast<double>(polls.load() - seen_polls) / seconds, (idle.load() - seen_idle) / seconds);
         since = Clock::now();
         post = sound = 0;
         seen_working = working.load();
         seen_idle = idle.load();
         seen_shown = shown.load();
+        seen_polled = polled.load();
+        seen_polls = polls.load();
         frames = 0;
     }
 };
@@ -1461,13 +1468,17 @@ int run_window(const std::function<int()> &emulate) {
     });
     const std::function<void(const std::uint32_t *, std::uint32_t, std::uint32_t)> copy = show_pixels, none;
     while (!done.load()) {
+        const auto p0 = WaitLog::Clock::now();
         if (ps2::hitch::on()) {  // PS2_HITCH_LOG=<ms>: the window's own event handling
-            const auto p0 = WaitLog::Clock::now();
             poll();
             const double p_ms = WaitLog::ms(p0);
             if (p_ms > ps2::hitch::threshold_ms() / 3) std::fprintf(stderr, "[hitch] window event polling took %.1f ms (around frame %llu)\n", p_ms, static_cast<unsigned long long>(ps2::frames_run()));
         } else {
             poll();
+        }
+        if (g_waits.on) {  // [waits]: how much of the window thread's second the loop's own overhead takes
+            g_waits.polled.store(g_waits.polled.load() + std::chrono::duration<double, std::milli>(WaitLog::Clock::now() - p0).count());
+            g_waits.polls.fetch_add(1, std::memory_order_relaxed);
         }
         window_stage("drawing the pictures of the emulation (render_pending)");
         if (!g_waits.on) {
