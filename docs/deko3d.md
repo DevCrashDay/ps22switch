@@ -52,6 +52,24 @@ number is promised until it runs.
 
 Being part of every Switch build costs 77 824 bytes of `.nro` and nothing else: without `PS2_DEKO3D` set, no deko3d call is ever made.
 
+### Measured on the console (2026-11-04, `build/switch/tests/H-deko3d`)
+
+```
+[deko] window 1280x720
+[deko] device open
+[deko] 3 back buffers of 1280x720
+[deko] swap chain made
+[deko] 60 frames in 0.9 s (63.8 frames a second)
+[deko] 300 frames in 4.9 s (60.7 frames a second)
+[deko] stage 0 done: 300 frames presented in 4956 ms (60.5 frames a second)
+```
+
+60.5 frames a second, steady (63.8 at the start, 60.7 at the end), at the same clocks the game runs with (CPU 1785, GPU 921.6, memory
+1600 MHz). The colours were seen on the screen, which is the part a log cannot prove.
+
+This is the step the Vulkan path never got past: a swap chain on this console's window (36 combinations of format, present mode,
+transform and image count, all `VK_ERROR_INITIALIZATION_FAILED`), and then present at refresh rate with three buffers in flight.
+
 What it does not do: draw anything from the PS2, read a texture, keep a pipeline. It is a display-path test, not a renderer.
 
 If it works, `ps2run.log` holds `[deko] device open`, `[deko] 3 back buffers of 1280x720`, `[deko] swap chain made`, five
