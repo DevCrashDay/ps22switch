@@ -74,6 +74,13 @@ constexpr PadBinding kPadButtons[] = {
     {SDL_CONTROLLER_BUTTON_DPAD_LEFT, kLeft},   {SDL_CONTROLLER_BUTTON_DPAD_RIGHT, kRight},
 };
 
+// deko3d draws and presents on the console's own window, so SDL keeps input and sound only: with SDL's video subsystem up it would take
+// that window for its renderer, and deko3d could not present into it at all (that is where the Vulkan present path stopped).
+#ifdef PS2_DEKO3D_RENDER
+constexpr bool kSdlVideo = false;
+#else
+constexpr bool kSdlVideo = true;
+#endif
 SDL_Window *g_window = nullptr;
 SDL_Renderer *g_renderer = nullptr;
 SDL_Texture *g_texture = nullptr;
@@ -127,11 +134,13 @@ std::atomic<int> g_beep_request{0};
 bool g_beep_on = true;
 
 void refresh_title() {
+    if (!g_window) return;  // deko3d presents on the console's own window: there is no SDL title to show the speed in
     if (g_notice_text.empty()) SDL_SetWindowTitle(g_window, g_speed_title.c_str());
     else SDL_SetWindowTitle(g_window, (g_notice_text + "   |   " + g_speed_title).c_str());
 }
 
 bool create_renderer() {
+    if (!g_window) return false;
     g_renderer = SDL_CreateRenderer(g_window, -1, SDL_RENDERER_ACCELERATED);
     if (!g_renderer) g_renderer = SDL_CreateRenderer(g_window, -1, SDL_RENDERER_SOFTWARE);
     if (!g_renderer) {
@@ -144,6 +153,14 @@ bool create_renderer() {
 bool attach_gpu() {
     if (std::getenv("PS2_SDL_RENDERER")) return false;
 #ifdef __SWITCH__
+#ifdef PS2_DEKO3D_RENDER
+    // The display is deko3d's: the renderer draws the frame into a swap chain image on the console's own window and presents it.
+    ps2::WindowTarget target;
+    target.kind = ps2::WindowTarget::Vi;
+    target.width = 1280;
+    target.height = 720;
+    return ps2::attach_window(target);
+#else
     // PS2_VK_PRESENT=1: the renderer blits into a swap chain image on the display and the driver presents it, instead of the picture
     // being read back and uploaded into an SDL texture. Off by default, so the path that has been running on the console stays.
     if (std::getenv("PS2_VK_PRESENT")) {
@@ -156,6 +173,9 @@ bool attach_gpu() {
         return ps2::attach_window(target);
     }
 #endif
+#endif
+#ifndef PS2_DEKO3D_RENDER
+    // Every other platform: the window SDL made, whichever video driver it uses
     SDL_SysWMinfo info;
     SDL_VERSION(&info.version);
     if (!SDL_GetWindowWMInfo(g_window, &info)) return false;
@@ -189,6 +209,7 @@ bool attach_gpu() {
     default: return false;
     }
     return ps2::attach_window(target);
+#endif  // !PS2_DEKO3D_RENDER
 }
 
 std::uint8_t axis(SDL_GameController *pad, SDL_GameControllerAxis a) {
@@ -842,7 +863,7 @@ void poll() {
             ps2::flush_memory_card();  // right away: a save made a moment ago must not wait for the emulation to wind down
             ps2::halt("window closed");
         }
-        if (e.type == SDL_KEYDOWN && e.key.keysym.scancode == SDL_SCANCODE_F11 && !e.key.repeat) {
+        if (e.type == SDL_KEYDOWN && e.key.keysym.scancode == SDL_SCANCODE_F11 && !e.key.repeat && g_window) {
             const bool full = SDL_GetWindowFlags(g_window) & SDL_WINDOW_FULLSCREEN;
             SDL_SetWindowFullscreen(g_window, full ? 0 : SDL_WINDOW_FULLSCREEN_DESKTOP);
         }
@@ -1270,7 +1291,7 @@ bool open_window(bool fullscreen) {
     g_beep_on = no_beep.empty() || no_beep == "0";
     g_pad_log = !pad_log.empty() && pad_log != "0";
     if (!script.empty()) SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
-    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_GAMECONTROLLER) != 0) {
+    if (SDL_Init((kSdlVideo ? SDL_INIT_VIDEO : 0u) | SDL_INIT_AUDIO | SDL_INIT_GAMECONTROLLER) != 0) {
         std::fprintf(stderr, "SDL: %s\n", SDL_GetError());
         return false;
     }
@@ -1291,10 +1312,13 @@ bool open_window(bool fullscreen) {
     }
     load_keys();
     const Uint32 flags = SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI | (fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0u);
-    g_window = SDL_CreateWindow("ps2-native-recomp", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, ps2::g_options.widescreen ? 1280 : 960, 720, flags);
-    if (!g_window) {
-        std::fprintf(stderr, "SDL: %s\n", SDL_GetError());
-        return false;
+    if (kSdlVideo) {
+        g_window = SDL_CreateWindow("ps2-native-recomp", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+                                    ps2::g_options.widescreen ? 1280 : 960, 720, flags);
+        if (!g_window) {
+            std::fprintf(stderr, "SDL: %s\n", SDL_GetError());
+            return false;
+        }
     }
     SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "linear");
     SDL_AudioSpec want{}, have{};
