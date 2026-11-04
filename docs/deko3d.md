@@ -50,6 +50,8 @@ number is promised until it runs.
   combinations of format, present mode, transform and image count all came back `VK_ERROR_INITIALIZATION_FAILED`.
 - `build/switch/tests/H-deko3d/`: the .nro and the `launch.txt` that runs it (`PS2_DEKO3D=300`, five seconds).
 
+Being part of every Switch build costs 77 824 bytes of `.nro` and nothing else: without `PS2_DEKO3D` set, no deko3d call is ever made.
+
 What it does not do: draw anything from the PS2, read a texture, keep a pipeline. It is a display-path test, not a renderer.
 
 If it works, `ps2run.log` holds `[deko] device open`, `[deko] 3 back buffers of 1280x720`, `[deko] swap chain made`, five
