@@ -70,6 +70,9 @@ struct WGPUDeviceImpl {
     std::uint32_t code_used = 0;
     // Command memory the GPU may still be reading: freed when it has finished with it.
     std::vector<std::shared_ptr<ps2::gs::gpu::deko::Memory>> retired;
+    // Image and sampler descriptors: deko3d binds images by handle, and a handle is an index into these two tables.
+    std::shared_ptr<ps2::gs::gpu::deko::Memory> descriptors;
+    std::uint32_t image_count = 0, sampler_count = 0;
     void error(std::string message);
 };
 
@@ -90,7 +93,8 @@ struct WGPUTextureImpl {
     std::shared_ptr<ps2::gs::gpu::deko::Image> image;
     WGPUTextureFormat format = WGPUTextureFormat_Undefined;
     std::uint32_t width = 0, height = 0;
-    bool borrowed = false;  // a swap chain back buffer: the swap chain owns it
+    std::uint32_t image_slot = 0xFFFFFFFFu;  // its descriptor in the device's table, made when it is first bound
+    bool borrowed = false;                   // a swap chain back buffer: the swap chain owns it
 };
 
 struct WGPUTextureViewImpl {
@@ -103,6 +107,8 @@ struct WGPUBindGroupLayoutImpl {
         std::uint32_t binding = 0;
         bool buffer = false;
         bool uniform = false;
+        bool dynamic = false;  // has a dynamic offset: the pass's offset list supplies it
+        bool storage_texture = false;
         WGPUTextureFormat format = WGPUTextureFormat_Undefined;
     };
     std::vector<Entry> entries;
@@ -113,6 +119,7 @@ struct WGPUPipelineLayoutImpl {
 };
 
 struct WGPUBindGroupImpl {
+    WGPUBindGroupLayoutImpl *layout = nullptr;
     struct Entry {
         std::uint32_t binding = 0;
         WGPUBuffer buffer = nullptr;
@@ -128,14 +135,22 @@ struct WGPUShaderModuleImpl {
 };
 
 struct WGPUComputePipelineImpl {
-    WGPUShaderModuleImpl *module = nullptr;
     std::string entry_point;
+    DkShader shader{};
+    bool ready = false;  // false: no deko3d module for this entry point (it logs once)
 };
 
 struct WGPURenderPipelineImpl {
-    WGPUShaderModuleImpl *vertex = nullptr;
-    WGPUShaderModuleImpl *fragment = nullptr;
     std::string vertex_entry, fragment_entry;
+    DkShader vertex{}, fragment{};
+    DkPrimitive primitive = DkPrimitive_Triangles;
+    dk::RasterizerState rasterizer;
+    dk::MultisampleState multisample;
+    dk::ColorState color;
+    dk::ColorWriteState write;
+    std::vector<dk::BlendState> blends;
+    dk::DepthStencilState depth;
+    bool ready = false;
 };
 
 struct WGPUCommandBufferImpl {
@@ -278,6 +293,15 @@ WGPUFuture wgpuAdapterRequestDevice(WGPUAdapter, WGPUDeviceDescriptor const *des
         if (info.callback) info.callback(WGPURequestDeviceStatus_Error, nullptr, text("no memory for shader code"), info.userdata1, info.userdata2);
         return WGPUFuture{1};
     }
+    // The image and sampler descriptors a shader's bindings index into: deko3d binds images by handle, and a handle is an index here.
+    constexpr std::uint32_t kImages = 1024, kSamplers = 256;
+    d->descriptors = d->gpu.allocate(kImages * sizeof(DkImageDescriptor) + kSamplers * sizeof(DkSamplerDescriptor),
+                                     DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached);
+    if (!d->descriptors) {
+        delete d;
+        if (info.callback) info.callback(WGPURequestDeviceStatus_Error, nullptr, text("no memory for the image descriptors"), info.userdata1, info.userdata2);
+        return WGPUFuture{1};
+    }
     (void)descriptor;
     std::fprintf(stderr, "[deko] device open (deko3d)\n");
     if (info.callback) info.callback(WGPURequestDeviceStatus_Success, d, text(""), info.userdata1, info.userdata2);
@@ -390,8 +414,172 @@ WGPUTextureView wgpuTextureCreateView(WGPUTexture t, WGPUTextureViewDescriptor c
 void wgpuTextureViewRelease(WGPUTextureView v) { delete v; }
 
 // ---------------------------------------------------------------------------------------------------------------------------------
-// Bind groups, layouts and pipelines (the next slice; these keep gpu.cpp's objects and say what is missing)
+// Bind groups, layouts and pipelines
 // ---------------------------------------------------------------------------------------------------------------------------------
+
+namespace {
+
+DkCompareOp to_compare(WGPUCompareFunction f) {
+    switch (f) {
+        case WGPUCompareFunction_Never: return DkCompareOp_Never;
+        case WGPUCompareFunction_Less: return DkCompareOp_Less;
+        case WGPUCompareFunction_Equal: return DkCompareOp_Equal;
+        case WGPUCompareFunction_LessEqual: return DkCompareOp_Lequal;
+        case WGPUCompareFunction_Greater: return DkCompareOp_Greater;
+        case WGPUCompareFunction_NotEqual: return DkCompareOp_NotEqual;
+        case WGPUCompareFunction_GreaterEqual: return DkCompareOp_Gequal;
+        default: return DkCompareOp_Always;
+    }
+}
+
+DkBlendFactor to_blend_factor(WGPUBlendFactor f) {
+    switch (f) {
+        case WGPUBlendFactor_One: return DkBlendFactor_One;
+        case WGPUBlendFactor_Src: return DkBlendFactor_SrcColor;
+        case WGPUBlendFactor_OneMinusSrc: return DkBlendFactor_InvSrcColor;
+        case WGPUBlendFactor_SrcAlpha: return DkBlendFactor_SrcAlpha;
+        case WGPUBlendFactor_OneMinusSrcAlpha: return DkBlendFactor_InvSrcAlpha;
+        case WGPUBlendFactor_Dst: return DkBlendFactor_DstColor;
+        case WGPUBlendFactor_OneMinusDst: return DkBlendFactor_InvDstColor;
+        case WGPUBlendFactor_DstAlpha: return DkBlendFactor_DstAlpha;
+        case WGPUBlendFactor_OneMinusDstAlpha: return DkBlendFactor_InvDstAlpha;
+        case WGPUBlendFactor_SrcAlphaSaturated: return DkBlendFactor_SrcAlphaSaturate;
+        case WGPUBlendFactor_Constant: return DkBlendFactor_ConstColor;
+        case WGPUBlendFactor_OneMinusConstant: return DkBlendFactor_InvConstColor;
+        // the second colour a dual-source fragment shader writes: what the PS2's alpha blending needs (hw_fs writes it)
+        case WGPUBlendFactor_Src1: return DkBlendFactor_Src1Color;
+        case WGPUBlendFactor_OneMinusSrc1: return DkBlendFactor_InvSrc1Color;
+        case WGPUBlendFactor_Src1Alpha: return DkBlendFactor_Src1Alpha;
+        case WGPUBlendFactor_OneMinusSrc1Alpha: return DkBlendFactor_InvSrc1Alpha;
+        default: return DkBlendFactor_Zero;
+    }
+}
+
+DkBlendOp to_blend_op(WGPUBlendOperation op) {
+    switch (op) {
+        case WGPUBlendOperation_Subtract: return DkBlendOp_Sub;
+        case WGPUBlendOperation_ReverseSubtract: return DkBlendOp_RevSub;
+        case WGPUBlendOperation_Min: return DkBlendOp_Min;
+        case WGPUBlendOperation_Max: return DkBlendOp_Max;
+        default: return DkBlendOp_Add;
+    }
+}
+
+DkFace to_face(WGPUCullMode mode) {
+    switch (mode) {
+        case WGPUCullMode_Front: return DkFace_Front;
+        case WGPUCullMode_Back: return DkFace_Back;
+        default: return DkFace_None;
+    }
+}
+
+DkFrontFace to_front_face(WGPUFrontFace face) { return face == WGPUFrontFace_CW ? DkFrontFace_CW : DkFrontFace_CCW; }
+
+DkPrimitive to_primitive(WGPUPrimitiveTopology topology) {
+    switch (topology) {
+        case WGPUPrimitiveTopology_PointList: return DkPrimitive_Points;
+        case WGPUPrimitiveTopology_LineList: return DkPrimitive_Lines;
+        case WGPUPrimitiveTopology_LineStrip: return DkPrimitive_LineStrip;
+        case WGPUPrimitiveTopology_TriangleStrip: return DkPrimitive_TriangleStrip;
+        default: return DkPrimitive_Triangles;
+    }
+}
+
+// One DKSH module into the device's code memory, ready for dkShaderInitialize. False when uam has no module for that entry point, which
+// is a program this renderer cannot draw with (hw_writeback reads a depth texture, which naga cannot write as GLSL at all).
+bool load_program(WGPUDeviceImpl *d, const std::string &entry, DkShader &shader) {
+    const ps2::gs::gpu::deko::DkshProgram *program = ps2::gs::gpu::deko::dksh_program(entry.c_str());
+    if (!program || !program->words || program->count < 6) {
+        std::fprintf(stderr, "[deko] no compiled module for %s: that program cannot run (scripts/wgsl_dksh.py)\n", entry.c_str());
+        return false;
+    }
+    const std::uint32_t *words = program->words;
+    const std::uint32_t control_size = words[2], code_size = words[3];
+    if (words[0] != 0x48534B44 || control_size + code_size != program->count * 4) {
+        std::fprintf(stderr, "[deko] %s: the module is not a deko3d shader module\n", entry.c_str());
+        return false;
+    }
+    const std::uint32_t slot = (code_size + DK_SHADER_CODE_UNUSABLE_SIZE + DK_SHADER_CODE_ALIGNMENT - 1) & ~(DK_SHADER_CODE_ALIGNMENT - 1);
+    if (d->code_used + slot > d->code_memory->size) {
+        std::fprintf(stderr, "[deko] no room left for the shader %s\n", entry.c_str());
+        return false;
+    }
+    std::memcpy(d->code_memory->cpu + d->code_used, reinterpret_cast<const std::uint8_t *>(words) + control_size, code_size);
+    DkShaderMaker maker;
+    dkShaderMakerDefaults(&maker, d->code_memory->block, d->code_used);
+    maker.control = words;
+    dkShaderInitialize(&shader, &maker);
+    d->code_used += slot;
+    if (!dkShaderIsValid(&shader)) {
+        std::fprintf(stderr, "[deko] deko3d rejected the shader %s\n", entry.c_str());
+        return false;
+    }
+    return true;
+}
+
+// The handle of a texture's view in the device's image descriptor table. A storage image (what a compute program writes) has its own
+// entry; sampled ones would need a sampler next to them, and nothing this renderer draws with samples a texture except the program that
+// cannot be compiled at all.
+bool image_handle(WGPUDeviceImpl *d, WGPUTextureImpl *texture, bool storage, DkResHandle &handle) {
+    if (!texture || !texture->image || !d->descriptors) return false;
+    if (!storage) {
+        log_once("sampled textures are only used by hw_writeback, which has no compiled module (see docs/deko3d.md)");
+        return false;
+    }
+    // One descriptor per image, written the first time the image is bound: an image does not move for its lifetime.
+    if (texture->image_slot == 0xFFFFFFFFu) {
+        if (d->image_count >= 1024) {
+            log_once("the image descriptor table is full");
+            return false;
+        }
+        auto *table = reinterpret_cast<DkImageDescriptor *>(d->descriptors->cpu);
+        texture->image_slot = d->image_count++;
+        dkImageDescriptorInitialize(&table[texture->image_slot], &texture->image->view, true, false);
+    }
+    handle = dkMakeImageHandle(texture->image_slot);
+    return true;
+}
+
+// The stage a bind group's buffers go to, as deko3d's per-stage binding.
+constexpr DkStage kBufferStages[] = {DkStage_Vertex, DkStage_Fragment, DkStage_Compute};
+
+// Binds a group's buffers (by address, dynamic offset included) and storage images at the binding numbers the shaders use. deko3d has no
+// descriptor sets for buffers, so this is where the Vulkan version's per-draw set binding disappears.
+void bind_group(DkCmdBuf cmd, const WGPUBindGroupImpl *group, bool compute, std::size_t offset_count, const std::uint32_t *offsets) {
+    if (!group) return;
+    std::size_t next_offset = 0;
+    for (const WGPUBindGroupImpl::Entry &entry : group->entries) {
+        // A dynamic offset comes from the pass's list, in the order the layout marks the entries dynamic.
+        bool is_dynamic = false;
+        if (group->layout)
+            for (const WGPUBindGroupLayoutImpl::Entry &l : group->layout->entries)
+                if (l.binding == entry.binding && l.dynamic) is_dynamic = true;
+        std::uint32_t dynamic = 0;
+        if (is_dynamic) {
+            if (next_offset < offset_count) dynamic = offsets[next_offset];
+            ++next_offset;
+        }
+        if (entry.is_buffer) {
+            if (!entry.buffer || !entry.buffer->memory) continue;
+            const std::uint64_t offset = entry.offset + dynamic;
+            const std::uint64_t size = entry.size == WGPU_WHOLE_SIZE || entry.size == 0 ? entry.buffer->size - offset : entry.size;
+            DkBufExtents extents{entry.buffer->memory->gpu + offset, static_cast<std::uint32_t>(size)};
+            for (DkStage stage : kBufferStages) {
+                if (compute && stage != DkStage_Compute) continue;
+                if (!compute && stage == DkStage_Compute) continue;
+                dkCmdBufBindStorageBuffers(cmd, stage, entry.binding, &extents, 1);
+                dkCmdBufBindUniformBuffers(cmd, stage, entry.binding, &extents, 1);
+            }
+        } else if (entry.texture && entry.texture->texture) {
+            DkResHandle handle = 0;
+            if (!compute) continue;  // only the compute programs bind images, and only as storage images
+            if (!image_handle(entry.texture->texture->device, entry.texture->texture, true, handle)) continue;
+            dkCmdBufBindImages(cmd, DkStage_Compute, entry.binding, &handle, 1);
+        }
+    }
+}
+
+}
 
 WGPUBindGroupLayout wgpuDeviceCreateBindGroupLayout(WGPUDevice, WGPUBindGroupLayoutDescriptor const *descriptor) {
     auto *l = new WGPUBindGroupLayoutImpl;
@@ -401,6 +589,8 @@ WGPUBindGroupLayout wgpuDeviceCreateBindGroupLayout(WGPUDevice, WGPUBindGroupLay
         entry.binding = e.binding;
         entry.buffer = e.buffer.type != WGPUBufferBindingType_BindingNotUsed;
         entry.uniform = e.buffer.type == WGPUBufferBindingType_Uniform;
+        entry.dynamic = e.buffer.hasDynamicOffset;
+        entry.storage_texture = e.storageTexture.access != WGPUStorageTextureAccess_Undefined;
         l->entries.push_back(entry);
     }
     return l;
@@ -418,6 +608,7 @@ void wgpuPipelineLayoutRelease(WGPUPipelineLayout p) { delete p; }
 
 WGPUBindGroup wgpuDeviceCreateBindGroup(WGPUDevice, WGPUBindGroupDescriptor const *descriptor) {
     auto *g = new WGPUBindGroupImpl;
+    g->layout = descriptor->layout;
     for (std::size_t i = 0; i < descriptor->entryCount; ++i) {
         const WGPUBindGroupEntry &e = descriptor->entries[i];
         WGPUBindGroupImpl::Entry entry;
@@ -437,40 +628,53 @@ WGPUBindGroup wgpuDeviceCreateBindGroup(WGPUDevice, WGPUBindGroupDescriptor cons
 
 void wgpuBindGroupRelease(WGPUBindGroup g) { delete g; }
 
-WGPUShaderModule wgpuDeviceCreateShaderModule(WGPUDevice, WGPUShaderModuleDescriptor const *descriptor) {
-    // gpu.cpp passes the WGSL text and the entry point through a chained WGSL descriptor; the entry point name is what finds the module
-    // uam compiled (dksh_table.cpp). Nothing is compiled here.
-    auto *m = new WGPUShaderModuleImpl;
-    m->entry_point = "unknown";
-    for (const WGPUChainedStruct *c = descriptor->nextInChain; c; c = c->next) {
-        if (c->sType == WGPUSType_ShaderSourceWGSL) {
-            const auto *wgsl = reinterpret_cast<const WGPUShaderSourceWGSL *>(c);
-            (void)wgsl;
-        }
-    }
-    return m;
+WGPUShaderModule wgpuDeviceCreateShaderModule(WGPUDevice, WGPUShaderModuleDescriptor const *) {
+    // The module itself is only a handle: a pipeline names the entry point, and that name finds the module uam compiled
+    // (dksh_table.cpp). Nothing is compiled or even parsed here.
+    return new WGPUShaderModuleImpl;
 }
 
 void wgpuShaderModuleRelease(WGPUShaderModule m) { delete m; }
 
-WGPUComputePipeline wgpuDeviceCreateComputePipeline(WGPUDevice, WGPUComputePipelineDescriptor const *descriptor) {
+WGPUComputePipeline wgpuDeviceCreateComputePipeline(WGPUDevice d, WGPUComputePipelineDescriptor const *descriptor) {
     auto *p = new WGPUComputePipelineImpl;
-    p->module = descriptor->compute.module;
-    if (descriptor->compute.entryPoint.data) p->entry_point.assign(descriptor->compute.entryPoint.data, descriptor->compute.entryPoint.length);
+    if (descriptor->compute.entryPoint.data)
+        p->entry_point.assign(descriptor->compute.entryPoint.data, descriptor->compute.entryPoint.length);
+    p->ready = load_program(d, p->entry_point, p->shader);
     return p;
 }
 
 void wgpuComputePipelineRelease(WGPUComputePipeline p) { delete p; }
 
-WGPURenderPipeline wgpuDeviceCreateRenderPipeline(WGPUDevice, WGPURenderPipelineDescriptor const *descriptor) {
+WGPURenderPipeline wgpuDeviceCreateRenderPipeline(WGPUDevice d, WGPURenderPipelineDescriptor const *descriptor) {
     auto *p = new WGPURenderPipelineImpl;
-    p->vertex = descriptor->vertex.module;
-    if (descriptor->vertex.entryPoint.data) p->vertex_entry.assign(descriptor->vertex.entryPoint.data, descriptor->vertex.entryPoint.length);
-    if (descriptor->fragment) {
-        p->fragment = descriptor->fragment->module;
-        if (descriptor->fragment->entryPoint.data)
-            p->fragment_entry.assign(descriptor->fragment->entryPoint.data, descriptor->fragment->entryPoint.length);
+    if (descriptor->vertex.entryPoint.data)
+        p->vertex_entry.assign(descriptor->vertex.entryPoint.data, descriptor->vertex.entryPoint.length);
+    if (descriptor->fragment && descriptor->fragment->entryPoint.data)
+        p->fragment_entry.assign(descriptor->fragment->entryPoint.data, descriptor->fragment->entryPoint.length);
+    p->primitive = to_primitive(descriptor->primitive.topology);
+    // The fixed state deko3d has to be told explicitly, from the pipeline's description.
+    p->rasterizer.setCullMode(to_face(descriptor->primitive.cullMode)).setFrontFace(to_front_face(descriptor->primitive.frontFace));
+    if (descriptor->depthStencil) {
+        p->depth.setDepthCompareOp(to_compare(descriptor->depthStencil->depthCompare));
+        p->depth.setDepthTestEnable(descriptor->depthStencil->depthCompare != WGPUCompareFunction_Always);
+        p->depth.setDepthWriteEnable(descriptor->depthStencil->depthWriteEnabled);
     }
+    if (descriptor->fragment) {
+        for (std::uint32_t i = 0; i < descriptor->fragment->targetCount; ++i) {
+            const WGPUColorTargetState *target = &descriptor->fragment->targets[i];
+            dk::BlendState blend;
+            if (target->blend) {
+                blend.setOps(to_blend_op(target->blend->color.operation), to_blend_op(target->blend->alpha.operation));
+                blend.setFactors(to_blend_factor(target->blend->color.srcFactor), to_blend_factor(target->blend->color.dstFactor),
+                                 to_blend_factor(target->blend->alpha.srcFactor), to_blend_factor(target->blend->alpha.dstFactor));
+            }
+            p->blends.push_back(blend);
+            p->color.setBlendEnable(i, target->blend != nullptr);
+            p->write.setMask(i, target->writeMask);
+        }
+    }
+    p->ready = load_program(d, p->vertex_entry, p->vertex) && load_program(d, p->fragment_entry, p->fragment);
     return p;
 }
 
@@ -492,6 +696,11 @@ WGPUCommandEncoder wgpuDeviceCreateCommandEncoder(WGPUDevice d, WGPUCommandEncod
     }
     e->commands = dk::CmdBufMaker{d->gpu.device()}.create();
     dkCmdBufAddMemory(e->commands, e->memory->block, 0, e->memory->size);
+    // The image and sampler tables, and the invalidate that makes newly written descriptors visible to the shaders.
+    constexpr std::uint32_t kImages = 1024, kSamplers = 256;
+    dkCmdBufBindImageDescriptorSet(e->commands, d->descriptors->gpu, kImages);
+    dkCmdBufBindSamplerDescriptorSet(e->commands, d->descriptors->gpu + kImages * sizeof(DkImageDescriptor), kSamplers);
+    dkCmdBufBarrier(e->commands, DkBarrier_None, DkInvalidateFlags_Descriptors);
     return e;
 }
 
@@ -516,12 +725,24 @@ WGPUComputePassEncoder wgpuCommandEncoderBeginComputePass(WGPUCommandEncoder e, 
     return p;
 }
 
-void wgpuComputePassEncoderSetPipeline(WGPUComputePassEncoder p, WGPUComputePipeline pipeline) { p->pipeline = pipeline; }
+void wgpuComputePassEncoderSetPipeline(WGPUComputePassEncoder p, WGPUComputePipeline pipeline) {
+    p->pipeline = pipeline;
+    if (!pipeline || !pipeline->ready) return;
+    const DkShader *shaders[] = {&pipeline->shader};
+    dkCmdBufBindShaders(p->encoder->commands, DkStageFlag_Compute, shaders, 1);
+}
 
-void wgpuComputePassEncoderSetBindGroup(WGPUComputePassEncoder, std::uint32_t, WGPUBindGroup, std::size_t, std::uint32_t const *) {}
+void wgpuComputePassEncoderSetBindGroup(WGPUComputePassEncoder p, std::uint32_t, WGPUBindGroup group, std::size_t count,
+                                        std::uint32_t const *offsets) {
+    bind_group(p->encoder->commands, group, true, count, offsets);
+}
 
-void wgpuComputePassEncoderDispatchWorkgroups(WGPUComputePassEncoder, std::uint32_t, std::uint32_t, std::uint32_t) {
-    log_once("compute dispatches are the next slice: the VRAM moves are not running on deko3d yet");
+void wgpuComputePassEncoderDispatchWorkgroups(WGPUComputePassEncoder p, std::uint32_t x, std::uint32_t y, std::uint32_t z) {
+    if (!p || !p->pipeline || !p->pipeline->ready || !x || !y || !z) return;
+    DkCmdBuf cmd = p->encoder->commands;
+    dkCmdBufDispatchCompute(cmd, x, y, z);
+    // WebGPU: each dispatch sees what the one before it wrote.
+    dkCmdBufBarrier(cmd, DkBarrier_Primitives, DkInvalidateFlags_Image | DkInvalidateFlags_Descriptors);
 }
 
 void wgpuComputePassEncoderEnd(WGPUComputePassEncoder) {}
@@ -530,26 +751,54 @@ void wgpuComputePassEncoderRelease(WGPUComputePassEncoder p) { delete p; }
 WGPURenderPassEncoder wgpuCommandEncoderBeginRenderPass(WGPUCommandEncoder e, WGPURenderPassDescriptor const *descriptor) {
     auto *p = new WGPURenderPassEncoderImpl;
     p->encoder = e;
-    // The attachment says what to do with the image before and after the pass; the clear is a deko3d clear on the bound target.
-    for (std::size_t i = 0; i < descriptor->colorAttachmentCount; ++i) {
-        const WGPURenderPassColorAttachment &a = descriptor->colorAttachments[i];
-        if (!a.view || !a.view->texture || !a.view->texture->image) continue;
-        const DkImageView &view = a.view->texture->image->view;
-        dkCmdBufBindRenderTarget(e->commands, &view, nullptr);
-        if (a.loadOp == WGPULoadOp_Clear) {
-            dkCmdBufClearColorFloat(e->commands, static_cast<std::uint32_t>(i), DkColorMask_RGBA, static_cast<float>(a.clearValue.r),
-                                    static_cast<float>(a.clearValue.g), static_cast<float>(a.clearValue.b), static_cast<float>(a.clearValue.a));
-        }
-        p->width = a.view->texture->width;
-        p->height = a.view->texture->height;
+    // deko3d's attachments are the images themselves: there is no load or store, so a "load" pass simply finds the image as it was and a
+    // "clear" is an explicit clear on it. That is also why the hardware path's separate depth-load pass works unchanged.
+    DkCmdBuf cmd = e->commands;
+    DkImageView color_view{}, depth_view{};
+    const DkImageView *color = nullptr, *depth = nullptr;
+    if (descriptor->colorAttachmentCount && descriptor->colorAttachments[0].view && descriptor->colorAttachments[0].view->texture &&
+        descriptor->colorAttachments[0].view->texture->image) {
+        color_view = descriptor->colorAttachments[0].view->texture->image->view;
+        color = &color_view;
+        p->width = descriptor->colorAttachments[0].view->texture->width;
+        p->height = descriptor->colorAttachments[0].view->texture->height;
     }
-    log_once("render passes clear and set state, but nothing is drawn yet: pipelines bind in the next slice");
+    const WGPURenderPassDepthStencilAttachment *d = descriptor->depthStencilAttachment;
+    if (d && d->view && d->view->texture && d->view->texture->image) {
+        depth_view = d->view->texture->image->view;
+        depth = &depth_view;
+    }
+    dkCmdBufBindRenderTargets(cmd, &color, color ? 1u : 0u, depth);
+    if (color && descriptor->colorAttachments[0].loadOp == WGPULoadOp_Clear) {
+        const WGPUColor c = descriptor->colorAttachments[0].clearValue;
+        dkCmdBufClearColorFloat(cmd, 0, DkColorMask_RGBA, static_cast<float>(c.r), static_cast<float>(c.g), static_cast<float>(c.b),
+                                static_cast<float>(c.a));
+    }
+    if (depth && d->depthLoadOp == WGPULoadOp_Clear) dkCmdBufClearDepthStencil(cmd, true, d->depthClearValue, 0, 0);
+    // Every vertex comes from the storage buffers (hw_vs builds them from the vertex index): no attributes, no buffers.
+    dkCmdBufBindVtxAttribState(cmd, nullptr, 0);
+    dkCmdBufBindVtxBufferState(cmd, nullptr, 0);
     return p;
 }
 
-void wgpuRenderPassEncoderSetPipeline(WGPURenderPassEncoder p, WGPURenderPipeline pipeline) { p->pipeline = pipeline; }
+void wgpuRenderPassEncoderSetPipeline(WGPURenderPassEncoder p, WGPURenderPipeline pipeline) {
+    p->pipeline = pipeline;
+    if (!pipeline || !pipeline->ready) return;
+    DkCmdBuf cmd = p->encoder->commands;
+    const DkShader *shaders[] = {&pipeline->vertex, &pipeline->fragment};
+    dkCmdBufBindShaders(cmd, DkStageFlag_Vertex | DkStageFlag_Fragment, shaders, 2);
+    dkCmdBufBindRasterizerState(cmd, &pipeline->rasterizer);
+    dkCmdBufBindMultisampleState(cmd, &pipeline->multisample);
+    dkCmdBufBindColorState(cmd, &pipeline->color);
+    dkCmdBufBindColorWriteState(cmd, &pipeline->write);
+    dkCmdBufBindDepthStencilState(cmd, &pipeline->depth);
+    if (!pipeline->blends.empty()) dkCmdBufBindBlendStates(cmd, 0, pipeline->blends.data(), static_cast<std::uint32_t>(pipeline->blends.size()));
+}
 
-void wgpuRenderPassEncoderSetBindGroup(WGPURenderPassEncoder, std::uint32_t, WGPUBindGroup, std::size_t, std::uint32_t const *) {}
+void wgpuRenderPassEncoderSetBindGroup(WGPURenderPassEncoder p, std::uint32_t, WGPUBindGroup group, std::size_t count,
+                                       std::uint32_t const *offsets) {
+    bind_group(p->encoder->commands, group, false, count, offsets);
+}
 
 void wgpuRenderPassEncoderSetViewport(WGPURenderPassEncoder p, float x, float y, float width, float height, float min_depth, float max_depth) {
     const DkViewport viewport{x, y, width, height, min_depth, max_depth};
@@ -566,8 +815,10 @@ void wgpuRenderPassEncoderSetBlendConstant(WGPURenderPassEncoder p, WGPUColor co
                           static_cast<float>(color->a));
 }
 
-void wgpuRenderPassEncoderDraw(WGPURenderPassEncoder, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t) {
-    log_once("draws are the next slice: nothing is on screen from the game yet");
+void wgpuRenderPassEncoderDraw(WGPURenderPassEncoder p, std::uint32_t vertices, std::uint32_t instances, std::uint32_t first_vertex,
+                              std::uint32_t first_instance) {
+    if (!p || !p->pipeline || !p->pipeline->ready || !vertices) return;
+    dkCmdBufDraw(p->encoder->commands, p->pipeline->primitive, vertices, instances, first_vertex, first_instance);
 }
 
 void wgpuRenderPassEncoderEnd(WGPURenderPassEncoder) {}

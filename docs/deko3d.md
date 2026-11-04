@@ -154,13 +154,24 @@ What the deko3d version does differently, and why it should be cheaper than the 
 - **Command memory belongs to the encoder**, and `wgpuQueueSubmit` replays the encoders' lists into one device list
   (`dkCmdBufCallList`) and submits that; the memory is retired when the fence says the GPU is done with it.
 
-Implemented in this slice: instance, adapter (limits, dual-source blending advertised, timestamp queries not), device and queue, buffers
-(created zeroed, writes, mapping), textures and views, the surface (three swap-chain back buffers on the console's window, acquire,
-present), command encoders and submission, and a render pass that binds its colour target, clears it, and takes viewport, scissor and
-blend constant.
+Implemented: instance, adapter (limits, dual-source blending advertised, timestamp queries not), device and queue, buffers (created
+zeroed, writes, mapping), textures and views, the surface (three swap-chain back buffers on the console's window, acquire, present),
+command encoders and submission, bind groups that bind buffers by address (dynamic offsets from the layout, as WebGPU's have them) and
+storage images by descriptor handle, compute pipelines and dispatches, render pipelines with the fixed state mapped from their
+description (primitive, cull, front face, depth compare and write, per-target blend and write mask, dual-source factors), render passes
+that bind colour and depth, clear what is asked and take viewport, scissor and blend constant, and `draw` as `dkCmdBufDraw`.
 
-Not in it yet: bind groups bind nothing, pipelines create no deko3d state, and `draw`/`dispatch` only log once that they are the next
-slice. So `PS2_DEKO3D_RENDER=ON` boots and configures but draws nothing — it is not a playable build yet.
+Two things stand between this and a first deko3d-rendered frame, and neither is the shim:
+
+1. **The window.** `gpu.cpp` presents through a surface only when the window layer asks it to (`PS2_VK_PRESENT`'s path on the Switch), and
+   SDL owns the console's window otherwise. The deko3d renderer needs SDL to keep input and audio and give up video, and the present loop
+   to come from deko3d. That is one change in `host/window.cpp`, and it is the same change that lets NVK leave the link.
+2. **`hw_writeback`.** The program that writes a render target back into video memory reads a depth texture, which naga cannot write as
+   GLSL, so it has no module: writebacks do nothing right now, which would leave every page of video memory the game reads afterwards
+   stale. The fix is to split it — a colour-only writeback that compiles today, and a depth one that reads a colour image (the depth
+   target kept as `R32F`) instead of a depth texture — and to have `gpu.cpp` choose per target format.
+
+So `PS2_DEKO3D_RENDER=ON` still draws nothing: it boots, opens its device and stays up. It is not a playable build yet.
 
 Two things to settle in the next slice: the front-face winding and depth convention (`DkDeviceFlags_OriginLowerLeft`, `DkFrontFace`,
 and the PS2's own cull/ZTST state — the triangle test already showed how silently a wrong choice draws nothing), and `gl_FragCoord`'s
