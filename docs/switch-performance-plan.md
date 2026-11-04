@@ -18,6 +18,52 @@ GPU, per second: drawing 310 ms, uploads 85 ms, fill and write-back 100 ms (now 
 the GPU's time that the timestamps do not cover (barriers, the copies of queue writes, gaps). Emulation thread: game code 39 %, waiting
 for the window thread 46 %. So the GPU (and the window thread that feeds it) is still the limit in fights; menus are paced by the game.
 
+## Re-reading the last log (2026-11-04): the window thread, not the GPU, is the limit
+
+The steady part of the last fight log (`references/important_logs/switch_ps2run_2026-10-30_hw-path_fight.log`, lines 130 to 170) says
+something the earlier summary above hides. Per second, at 25 to 26 fps:
+
+| Measured | Value | Per frame |
+|---|---|---|
+| Window thread busy (recording all GPU work **and** presenting) | 999 to 1000 ms | **38 ms** |
+| GPU busy (sum of the shim's per-dispatch timestamps) | 597 to 600 ms | 23 ms |
+| Of the window thread: blocked because the GPU is 9 submissions behind | 337 to 392 ms | **14 ms** |
+| Emulation thread waiting for the window thread | 10 to 12 ms | 10 to 12 ms |
+| Submissions | 78 to 80 | 3 |
+| Draws (render passes) / uploads / CLUT loads | 500 / 2500 / 500 | 19 / 95 / 19 |
+
+The GPU is **only ~60 % busy** while the window thread is **100 % busy**. So the frame rate is not set by how much the GPU has to do
+(it has 40 % of its time free); it is set by how long the window thread needs to (a) do its own work and (b) wait for the GPU. That
+thread costs 38 ms a frame and 14 ms of it is the wait above, so about **24 ms a frame is its own CPU work**. The previous session read
+the same log as "GPU bound" because the GPU's timestamps cover 60 % of the second; it is the other 40 % that decides.
+
+This matters because it changes what to write next:
+
+* if most of the 24 ms is **presenting** (SDL: read back the picture, upload it into an SDL texture, `SDL_RenderPresent` including any
+  wait for the screen's refresh), the fix is to present from Vulkan directly (R7) - it removes work *and* a possible vsync wait, and
+  nothing on the GPU side needs to change;
+* if most of it is **recording** (95 upload dispatches and 19 render passes a frame, each a handful of driver calls), the fix is fewer
+  commands (R10, R11) - worth 30 to 40 % of the thread's time, and it also lowers the GPU's 23 ms;
+* only if the GPU were nearly 100 % busy would the texture cache (R9) be the first thing to do, and it is the largest piece of work.
+
+A fight frame needs 16.6 ms for 60 fps. Both the window thread (38 ms) and the GPU (23 ms) are above it, so 60 fps needs roughly
+2.3x on that thread and 1.4x on the GPU - the GPU part is the easy half. Nobody should promise 60 fps from a single change.
+
+### The one measurement that separates those cases
+
+The .nro already on the SD card (commit `8e693c9`) prints everything needed; only `launch.txt` has to change - see
+`build/switch/tests/Z-diagnose/`:
+
+| Line | Field | Meaning |
+|---|---|---|
+| `[waits]` | `showing the picture M ms` | SDL upload and present, including a possible wait for the screen |
+| `[vk-profile]` | `CPU waited X ms` | blocked because 9 submissions were already queued |
+| `[hitch]` | `picture ...: N ms busy ... gif A ms; present B ms;` | the same split per picture, by kind of work |
+| `[waits]` | `rendering R ms` | the whole thread; `R - M - X` is its own CPU work |
+
+That run decides between R7 (present), R10/R11 (fewer commands) and R9 (texture cache). The A to G test builds answer a different
+question - which of the seven unmeasured commits helped - and should be measured after, not before.
+
 ## Approaches, roughly in order of expected gain per day of work
 
 1. **Texture cache** (GPU, large). The pixel shader decodes every texel from PS2 memory: the swizzle table, the word, the CLUT, four

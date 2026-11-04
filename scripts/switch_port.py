@@ -218,7 +218,11 @@ def package(name: str, nro: Path, game_dir: Path, program: Path, disc: Path, pat
     if wide:
         launch.append("--widescreen")
     launch += ["# clocks while the game runs, in MHz (0 keeps the system's; sys-clk's profile wins unless PS2_CLOCK_FORCE=1)",
-               "PS2_CPU_MHZ=1785", "PS2_GPU_MHZ=921.6", "PS2_MEM_MHZ=1600", "#PS2_CLOCK_FORCE=1"]
+               "PS2_CPU_MHZ=1785", "PS2_GPU_MHZ=921.6", "PS2_MEM_MHZ=1600", "#PS2_CLOCK_FORCE=1",
+               "# the hardware rasterizer: fights are about three times faster with it than with the default compute renderer",
+               "PS2_GS_HW=1",
+               "# one '[waits]' line a second: frames per second and where the window thread's time goes",
+               "PS2_PRESENT_LOG=1"]
     (pkg / "launch.txt").write_text("\n".join(launch) + "\n", encoding="utf-8", newline="\n")
     keys = game_dir / "keys.ini"
     if keys.is_file():
