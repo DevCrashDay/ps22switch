@@ -21,3 +21,8 @@ PS2_EMIT_LOG=1
 # Three pictures may be in flight between the emulation thread and the screen instead of two. Measured on 2026-11-04: 21 -> 25 fps
 # in a fight. One more frame of input lag, and the value that the repeatable run in build/switch/tests/Z-diagnose uses.
 PS2_PRESENT_DEPTH=3
+
+# Present from Vulkan: the blit draws into a swap chain on the display instead of the picture being read back and uploaded into an SDL
+# texture (6.4 ms of the drawing thread's frame). Falls back to SDL on its own when the surface or the swap chain cannot be made, so a
+# run without the two [present] lines near the top of the log simply used the old path. Remove this line if the picture is wrong.
+PS2_VK_PRESENT=1
