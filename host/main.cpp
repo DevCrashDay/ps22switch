@@ -446,6 +446,28 @@ static void log_machine() {
 // --frames-dir works too: the pictures are read back here, on the drawing side, at the same frames as in a run with one thread, under the
 // same names (a picture that cannot be shown, such as one while the display is off, is skipped).
 static int run_threads_headless(const std::function<int()> &emulate) {
+#ifdef PS2_PROFILE
+    // PS2_PROFILE samples the emulation thread. PS2_PROFILE_RENDER=<file> samples the thread that draws instead (the window thread,
+    // where the drawing commands are recorded and the picture is handed over), which is where a run below full speed can lose its time.
+    // The same PS2_PROFILE_FROM=<frame> says when it starts.
+    struct RenderProfile {
+        std::string path;
+        std::uint64_t from = 0;
+        bool armed = false;
+        RenderProfile() {
+            if (const char *p = std::getenv("PS2_PROFILE_RENDER"); p && *p) path = p;
+            if (const char *f = std::getenv("PS2_PROFILE_FROM")) from = std::strtoull(f, nullptr, 10);
+        }
+        void tick() {
+            if (armed || path.empty() || ps2::frame_count() < from) return;
+            armed = true;
+            start_profile(0);  // 0: arm now, on this thread
+        }
+        void finish() {
+            if (armed) write_profile(path.c_str());
+        }
+    } render_profile;
+#endif
     ps2::init_graphics();
     ps2::g_options.on_vblank = [] { ps2::post_present(); };
     const std::string pictures = ps2::g_options.frames_dir;
@@ -477,8 +499,15 @@ static int run_threads_headless(const std::function<int()> &emulate) {
             std::fclose(f);
         }
     };
-    while (!done.load())
+    while (!done.load()) {
         if (ps2::render_pending(false, pictures.empty() ? none : save, nullptr, 8.0) == ps2::Rendered::idle) ps2::wait_render_work(4);
+#ifdef PS2_PROFILE
+        render_profile.tick();
+#endif
+    }
+#ifdef PS2_PROFILE
+    render_profile.finish();
+#endif
     emulation.join();
     std::fflush(nullptr);
     std::_Exit(result);

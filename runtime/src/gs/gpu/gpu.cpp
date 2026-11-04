@@ -939,6 +939,67 @@ void batch_ranges() {
     b.z_range = region(b.zbp, b.fbw, b.zpsm, b.minx, b.miny, b.maxx, b.maxy);
 }
 
+// PS2_EMIT_LOG=1: where the window thread's time goes while it turns the game's drawing commands into GPU work. That is CPU time on the
+// thread that also presents the picture, so on the Switch it comes straight off the frame rate. "operations waiting" is how many uploads
+// and CLUT loads one emit_all call had: the cost of emit_pre grows with the square of that number, so it is worth watching.
+struct EmitStats {
+    bool on = std::getenv("PS2_EMIT_LOG") != nullptr;
+    std::chrono::steady_clock::time_point since = std::chrono::steady_clock::now();
+    double pre_ms = 0, flush_ms = 0;
+    std::uint64_t calls = 0, ops = 0, groups = 0, grouping_checks = 0;
+    void report() {
+        if (!on) return;
+        const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - since).count();
+        if (seconds < 2.0) return;
+        std::fprintf(stderr, "[emit] per second: %.0f emit_all calls, %.0f operations waiting, %.0f groups, %.1f overlap tests per group; emit_pre %.1f ms, flush_batch %.1f ms\n",
+                     calls / seconds, calls ? static_cast<double>(ops) / static_cast<double>(calls) : 0.0, groups / seconds,
+                     groups ? static_cast<double>(grouping_checks) / static_cast<double>(groups) : 0.0, pre_ms / seconds, flush_ms / seconds);
+        since = std::chrono::steady_clock::now();
+        pre_ms = flush_ms = 0;
+        calls = ops = groups = grouping_checks = 0;
+    }
+};
+EmitStats g_emit;
+
+// The memory the CLUT loads of one emit_pre read, as a few disjoint intervals, so that "does this upload write any of it?" is a binary
+// search instead of a walk over every CLUT load. What this replaces was quadratic in the operations a frame queues, and a Tekken 4 fight
+// queues thousands of them: 343 million overlap tests a second, 230 ms of every second on the PC (PS2_EMIT_LOG=1). The order test it
+// answers (is there a CLUT load before an upload that writes what it reads) is the same one, exactly.
+class ClutReads {
+public:
+    void clear() { spans_.clear(); }
+    void add(const Range &r) {
+        if (r.lo >= r.hi) return;
+        std::uint64_t lo = r.lo, hi = r.hi;
+        auto first = std::lower_bound(spans_.begin(), spans_.end(), lo, [](const Span &s, std::uint64_t v) { return s.hi <= v; });
+        auto last = first;
+        while (last != spans_.end() && last->lo <= hi) {
+            lo = std::min(lo, last->lo);
+            hi = std::max(hi, last->hi);
+            ++last;
+        }
+        const auto at = static_cast<std::ptrdiff_t>(first - spans_.begin());
+        const auto count = static_cast<std::ptrdiff_t>(last - first);
+        if (count) {
+            spans_[static_cast<std::size_t>(at)] = Span{lo, hi};
+            spans_.erase(spans_.begin() + at + 1, spans_.begin() + at + count);
+        } else {
+            spans_.insert(spans_.begin() + at, Span{lo, hi});
+        }
+    }
+    bool overlaps(const Range &r) const {
+        if (r.lo >= r.hi) return false;
+        auto it = std::lower_bound(spans_.begin(), spans_.end(), r.lo, [](const Span &s, std::uint64_t v) { return s.hi <= v; });
+        return it != spans_.end() && it->lo < r.hi;
+    }
+
+private:
+    struct Span {
+        std::uint64_t lo, hi;
+    };
+    std::vector<Span> spans_;
+};
+
 bool batch_conflict(const Range &r, bool clut) {
     Batch &b = g_batch;
     if (b.prims.empty()) return false;
@@ -959,13 +1020,28 @@ void emit_pre() {
     // and written as before, in two dispatches (fewer when uploads overlap each other). PS2_PRE_REORDER=0 keeps the queue's order.
     static const bool reorder = os::env("PS2_PRE_REORDER") != "0";
     if (reorder && g_pre.size() > 2) {
+        // One pass: keep the memory the CLUT loads read so far and ask it about every upload that comes later. Same answer as the pair of
+        // nested loops this replaces, without their cost.
+        static ClutReads clut_reads;
+        clut_reads.clear();
         bool safe = true;
-        for (std::size_t a = 0; a < g_pre.size() && safe; ++a) {
-            if (!g_pre[a].clut) continue;
-            for (std::size_t z = a + 1; z < g_pre.size() && safe; ++z)
-                if (!g_pre[z].clut && g_pre[z].range.overlaps(g_pre[a].range.lo, g_pre[a].range.hi)) safe = false;
+        for (const PreOp &op : g_pre) {
+            if (op.clut) clut_reads.add(op.range);
+            else if (clut_reads.overlaps(op.range)) {
+                safe = false;
+                break;
+            }
         }
-        if (safe) std::stable_partition(g_pre.begin(), g_pre.end(), [](const PreOp &op) { return !op.clut; });
+        if (safe) {  // stable: the CLUT loads' order decides which of them wrote a palette, and the uploads' order their offsets
+            static std::vector<PreOp> ordered;
+            ordered.clear();
+            ordered.reserve(g_pre.size());
+            for (const PreOp &op : g_pre)
+                if (!op.clut) ordered.push_back(op);
+            for (const PreOp &op : g_pre)
+                if (op.clut) ordered.push_back(op);
+            g_pre.swap(ordered);
+        }
     }
     std::size_t i = 0;
     while (i < g_pre.size()) {
@@ -974,10 +1050,14 @@ void emit_pre() {
         while (j < g_pre.size() && g_pre[j].clut == clut) {
             bool overlap = false;
             if (!clut)
-                for (std::size_t k = i; k < j && !overlap; ++k) overlap = uploads_overlap(g_pre[k], g_pre[j]);
+                for (std::size_t k = i; k < j && !overlap; ++k) {
+                    if (g_emit.on) ++g_emit.grouping_checks;
+                    overlap = uploads_overlap(g_pre[k], g_pre[j]);
+                }
             if (overlap) break;
             ++j;
         }
+        if (g_emit.on) ++g_emit.groups;
         const std::uint32_t count = static_cast<std::uint32_t>(j - i);
         std::uint32_t *records = g_arena.grow(count * 12u);
         const std::uint32_t offset = static_cast<std::uint32_t>(records - g_arena.data());
@@ -1017,6 +1097,20 @@ void emit_pre() {
 }
 
 void emit_all() {
+    if (g_emit.on) {
+        const auto t0 = std::chrono::steady_clock::now();
+        const std::size_t pending = g_pre.size();
+        emit_pre();
+        const auto t1 = std::chrono::steady_clock::now();
+        flush_batch();
+        const auto t2 = std::chrono::steady_clock::now();
+        g_emit.pre_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
+        g_emit.flush_ms += std::chrono::duration<double, std::milli>(t2 - t1).count();
+        g_emit.calls += 1;
+        g_emit.ops += pending;
+        g_emit.report();
+        return;
+    }
     emit_pre();
     flush_batch();
 }
