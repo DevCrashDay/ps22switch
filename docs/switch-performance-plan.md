@@ -64,6 +64,29 @@ The .nro already on the SD card (commit `8e693c9`) prints everything needed; onl
 That run decides between R7 (present), R10/R11 (fewer commands) and R9 (texture cache). The A to G test builds answer a different
 question - which of the seven unmeasured commits helped - and should be measured after, not before.
 
+## 2026-11-04: profiling the drawing thread on the PC, and the one quadratic loop it found
+
+The console log above cannot say where the drawing thread's own CPU time goes, so the sampling profiler was pointed at that thread
+instead of the emulation thread (`PS2_PROFILE_RENDER=<file>`, new, works on a `PS2_THREADS=1` PC run) and `PS2_EMIT_LOG=1` (new) was
+added to time the three parts of the drawing path. Fight, PC, hardware path, before the change:
+
+| Part of the drawing thread | Share |
+|---|---|
+| `emit_pre()` - turning the queued uploads and CLUT loads into dispatches | **19.8 %** (232 ms of every second) |
+| `gpu::draw()`, `gif::render()`, `gs::write_packed()`, `gs::kick()`, `gs::write()`, `gs::vertex()`, the queue ring | 22 % |
+| inside the Vulkan driver and the C library (`memcpy`, `memcmp`) | 14 % |
+| waiting for the emulation thread (PC only: there the emulation thread is the limit) | 42 % |
+
+`emit_pre` asked "does a CLUT load read memory that a later upload writes?" with two nested loops over every queued operation, and a
+Tekken 4 fight queues thousands of them per frame: **343 million overlap tests a second**. One forward pass over a few merged
+intervals answers the same question exactly; `emit_pre` fell from 232.6 to 22.9 ms/s (10x) and the 42 comparison frames stayed
+identical (`cmp.py`: same 42, different 0). The PC's frame rate did not move, because on the PC the emulation thread is the limit, not
+the drawing thread - on the Switch it is the other way round, which is why this was worth doing.
+
+After the fix the same profile says the drawing thread's own work is now: `gpu::draw` 10.8 %, `gif::render` 6.7 %, `gs::write_packed`
+4.3 %, `gs::kick` 4.0 %, the queue ring 4.2 %, `emit_pre` 1.5 %, `flush_batch` 0.7 %. `submit()` - the driver calls themselves - is
+93.6 ms/s, so on the Switch, where every driver call is several times dearer, that is the part to watch next.
+
 ## Approaches, roughly in order of expected gain per day of work
 
 1. **Texture cache** (GPU, large). The pixel shader decodes every texel from PS2 memory: the swizzle table, the word, the CLUT, four
@@ -91,6 +114,12 @@ question - which of the seven unmeasured commits helped - and should be measured
 
 ## Measuring on the console
 
-`launch.txt` lines: `PS2_PRESENT_LOG=1` (frames per second, waits), `PS2_VK_PROFILE=1` (GPU time per program; costs some time
-itself), `PS2_PARTS=1` (emulation thread breakdown), `PS2_VK_STATS=1` (shader statistics and machine code), `PS2_GS_HW=0` (the
-compute renderer), `PS2_SWITCH_CORES=e,v,w`, `PS2_VK_IN_FLIGHT=n`, `PS2_PRE_REORDER=0`.
+`launch.txt` lines: `PS2_PRESENT_LOG=1` (frames per second, waits, how much of the window thread goes into showing the picture),
+`PS2_VK_PROFILE=1` (GPU time per program, and the CPU time spent waiting for the GPU; costs some time itself), `PS2_PARTS=1`
+(emulation thread breakdown), `PS2_EMIT_LOG=1` (every 2 s: `emit_pre`, `flush_batch` and the driver calls of a `submit`, in ms/s),
+`PS2_HITCH_LOG=<ms>` (one line per picture over that many ms, with the window thread's time per kind of work),
+`PS2_VK_STATS=1` (shader statistics and machine code), `PS2_GS_HW=0` (the compute renderer), `PS2_SWITCH_CORES=e,v,w`,
+`PS2_VK_IN_FLIGHT=n`, `PS2_PRE_REORDER=0`, `PS2_HW_MERGE=0`, `PS2_HW_DECODE=1`.
+
+On the PC: `PS2_THREADS=1` runs the window run's three threads without a window, `PS2_PROFILE=<file>` samples the emulation thread,
+`PS2_PROFILE_RENDER=<file>` samples the drawing thread (both with `PS2_PROFILE_FROM=<frame>`), `PS2_EMIT_LOG=1` as above.

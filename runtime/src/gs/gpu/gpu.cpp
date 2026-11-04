@@ -945,18 +945,19 @@ void batch_ranges() {
 struct EmitStats {
     bool on = std::getenv("PS2_EMIT_LOG") != nullptr;
     std::chrono::steady_clock::time_point since = std::chrono::steady_clock::now();
-    double pre_ms = 0, flush_ms = 0;
-    std::uint64_t calls = 0, ops = 0, groups = 0, grouping_checks = 0;
+    double pre_ms = 0, flush_ms = 0, submit_ms = 0;
+    std::uint64_t calls = 0, ops = 0, groups = 0, grouping_checks = 0, submits = 0;
     void report() {
         if (!on) return;
         const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - since).count();
         if (seconds < 2.0) return;
-        std::fprintf(stderr, "[emit] per second: %.0f emit_all calls, %.0f operations waiting, %.0f groups, %.1f overlap tests per group; emit_pre %.1f ms, flush_batch %.1f ms\n",
+        std::fprintf(stderr, "[emit] per second: %.0f emit_all calls, %.0f operations waiting, %.0f groups, %.1f overlap tests per group; emit_pre %.1f ms, flush_batch %.1f ms, %.0f submits %.1f ms\n",
                      calls / seconds, calls ? static_cast<double>(ops) / static_cast<double>(calls) : 0.0, groups / seconds,
-                     groups ? static_cast<double>(grouping_checks) / static_cast<double>(groups) : 0.0, pre_ms / seconds, flush_ms / seconds);
+                     groups ? static_cast<double>(grouping_checks) / static_cast<double>(groups) : 0.0, pre_ms / seconds, flush_ms / seconds, submits / seconds,
+                     submit_ms / seconds);
         since = std::chrono::steady_clock::now();
-        pre_ms = flush_ms = 0;
-        calls = ops = groups = grouping_checks = 0;
+        pre_ms = flush_ms = submit_ms = 0;
+        calls = ops = groups = grouping_checks = submits = 0;
     }
 };
 EmitStats g_emit;
@@ -1420,6 +1421,7 @@ void hw_merge_passes() {
 
 // Browsers copy writes above about 1 MiB through a slower path, so large uploads go in pieces.
 void submit(WGPUTextureView present_view = nullptr) {
+    const auto submit_from = g_emit.on ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     if (g_commands.empty() && !present_view) return;
     if (g_bench.capturing) bench_capture();
     if (g_profile_out && !present_view && g_timestamps && frame_count() >= g_profile_from && frame_count() < g_profile_to) {
@@ -1606,6 +1608,10 @@ void submit(WGPUTextureView present_view = nullptr) {
     g_decoded_used = 0;
     g_hw_decoded.clear();
     g_clut_loads = 0;
+    if (g_emit.on) {  // how much of the drawing thread's time the driver calls themselves take (command recording, submit, queue writes)
+        g_emit.submit_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - submit_from).count();
+        ++g_emit.submits;
+    }
 }
 
 void read_back(WGPUBuffer source, std::uint64_t bytes, void *out, std::uint64_t offset = 0) {
