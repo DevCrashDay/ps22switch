@@ -1467,18 +1467,26 @@ int run_window(const std::function<int()> &emulate) {
         ps2::wake_render_thread();
     });
     const std::function<void(const std::uint32_t *, std::uint32_t, std::uint32_t)> copy = show_pixels, none;
+    // Reading the window's events and the two controllers costs about 17 microseconds, and this loop runs several hundred times a second:
+    // it is woken for every few messages the emulation thread posts (16 000 wake-ups a second in a Tekken 4 fight). A key or a pad is
+    // fast enough at a millisecond, so poll() is called at most that often - it was 270 ms of every second otherwise, a quarter of the
+    // thread that is the frame rate's limit.
+    auto last_poll = WaitLog::Clock::now() - std::chrono::milliseconds(2);
     while (!done.load()) {
         const auto p0 = WaitLog::Clock::now();
-        if (ps2::hitch::on()) {  // PS2_HITCH_LOG=<ms>: the window's own event handling
-            poll();
-            const double p_ms = WaitLog::ms(p0);
-            if (p_ms > ps2::hitch::threshold_ms() / 3) std::fprintf(stderr, "[hitch] window event polling took %.1f ms (around frame %llu)\n", p_ms, static_cast<unsigned long long>(ps2::frames_run()));
-        } else {
-            poll();
-        }
-        if (g_waits.on) {  // [waits]: how much of the window thread's second the loop's own overhead takes
-            g_waits.polled.store(g_waits.polled.load() + std::chrono::duration<double, std::milli>(WaitLog::Clock::now() - p0).count());
-            g_waits.polls.fetch_add(1, std::memory_order_relaxed);
+        if (WaitLog::ms(last_poll) >= 1.0) {
+            last_poll = p0;
+            if (ps2::hitch::on()) {  // PS2_HITCH_LOG=<ms>: the window's own event handling
+                poll();
+                const double p_ms = WaitLog::ms(p0);
+                if (p_ms > ps2::hitch::threshold_ms() / 3) std::fprintf(stderr, "[hitch] window event polling took %.1f ms (around frame %llu)\n", p_ms, static_cast<unsigned long long>(ps2::frames_run()));
+            } else {
+                poll();
+            }
+            if (g_waits.on) {  // [waits]: how much of the window thread's second the loop's own overhead takes
+                g_waits.polled.store(g_waits.polled.load() + std::chrono::duration<double, std::milli>(WaitLog::Clock::now() - p0).count());
+                g_waits.polls.fetch_add(1, std::memory_order_relaxed);
+            }
         }
         window_stage("drawing the pictures of the emulation (render_pending)");
         if (!g_waits.on) {
