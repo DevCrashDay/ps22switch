@@ -239,8 +239,14 @@ void open_pad(int device) {
     for (int port = 0; port < 2; ++port)
         if (!g_pads[port]) {
             g_pads[port] = SDL_GameControllerOpen(device);
-            if (g_pads[port]) std::fprintf(stderr, "[pad] %s (%s) in port %d\n", or_unknown(SDL_GameControllerName(g_pads[port])), pad_kind(g_pads[port]), port + 1);
-            else std::fprintf(stderr, "[pad] cannot open controller %d: %s\n", device, SDL_GetError());
+            if (g_pads[port]) {
+                SDL_Joystick *stick = SDL_GameControllerGetJoystick(g_pads[port]);
+                std::fprintf(stderr, "[pad] %s (%s) in port %d: %d axes, %d buttons, %d hats\n", or_unknown(SDL_GameControllerName(g_pads[port])),
+                             pad_kind(g_pads[port]), port + 1, stick ? SDL_JoystickNumAxes(stick) : 0, stick ? SDL_JoystickNumButtons(stick) : 0,
+                             stick ? SDL_JoystickNumHats(stick) : 0);
+            } else {
+                std::fprintf(stderr, "[pad] cannot open controller %d: %s\n", device, SDL_GetError());
+            }
             return;
         }
     std::fprintf(stderr, "[pad] %s is not used: both ports have a controller\n", or_unknown(SDL_GameControllerNameForIndex(device)));
@@ -704,6 +710,7 @@ void poll_port(int port) {
     std::uint16_t pressed = 0;
     std::uint8_t l2 = 0xFF, r2 = 0xFF;
     std::uint8_t lx = 0x80, ly = 0x80, rx = 0x80, ry = 0x80;
+    Uint8 hat = 0;
     if (port == 0) read_keyboard(pressed, lx, ly, rx, ry);
     if (pad) {
         for (const PadBinding &b : kPadButtons)
@@ -720,6 +727,16 @@ void poll_port(int port) {
         if (ly == 0x80) ly = axis(pad, SDL_CONTROLLER_AXIS_LEFTY);
         if (rx == 0x80) rx = axis(pad, SDL_CONTROLLER_AXIS_RIGHTX);
         if (ry == 0x80) ry = axis(pad, SDL_CONTROLLER_AXIS_RIGHTY);
+        // The D-pad reaches SDL as a joystick hat, and a generic controller mapping does not always turn the hat into DPAD_* buttons -
+        // on the Switch it did not, so the four directions never arrived in the log while Cross, Circle and Start did. Read the hat as
+        // well; asking for both costs nothing and covers the pads where the mapping does work.
+        if (SDL_Joystick *stick = SDL_GameControllerGetJoystick(pad)) {
+            hat = SDL_JoystickGetHat(stick, 0);
+            if (hat & SDL_HAT_UP) pressed |= kUp;
+            if (hat & SDL_HAT_DOWN) pressed |= kDown;
+            if (hat & SDL_HAT_LEFT) pressed |= kLeft;
+            if (hat & SDL_HAT_RIGHT) pressed |= kRight;
+        }
     }
     rumble(port);
     static std::uint64_t last[2] = {~0ull, ~0ull};
@@ -733,9 +750,9 @@ void poll_port(int port) {
         std::string names;
         for (int i = 0; i < 16; ++i)
             if (pressed & (1u << i)) names += std::string(" ") + kNames[i];
-        std::fprintf(stderr, "[pad] frame %llu port %d buttons %04X%s, left stick %u %u, right stick %u %u, l2 %u r2 %u\n",
+        std::fprintf(stderr, "[pad] frame %llu port %d buttons %04X%s, left stick %u %u, right stick %u %u, l2 %u r2 %u, hat %u\n",
                      static_cast<unsigned long long>(ps2::frames_run()), port + 1, pressed, names.empty() ? " none" : names.c_str(), lx, ly, rx, ry,
-                     pressed & kL2 ? l2 : 0, pressed & kR2 ? r2 : 0);
+                     pressed & kL2 ? l2 : 0, pressed & kR2 ? r2 : 0, static_cast<unsigned>(hat));
     }
     ps2::set_pad_pressure(8, l2, port);
     ps2::set_pad_pressure(9, r2, port);

@@ -22,7 +22,7 @@ PS2_EMIT_LOG=1
 # in a fight. One more frame of input lag, and the value that the repeatable run in build/switch/tests/Z-diagnose uses.
 PS2_PRESENT_DEPTH=3
 
-# Present from Vulkan: the blit draws into a swap chain on the display instead of the picture being read back and uploaded into an SDL
-# texture (6.4 ms of the drawing thread's frame). Falls back to SDL on its own when the surface or the swap chain cannot be made, so a
-# run without the two [present] lines near the top of the log simply used the old path. Remove this line if the picture is wrong.
-PS2_VK_PRESENT=1
+# Present from Vulkan on the display instead of through SDL. Off: the display's surface cannot make a swap chain while SDL owns the
+# window (36 combinations tried, all VK_ERROR_INITIALIZATION_FAILED - see docs/switch-performance-plan.md), and it falls back to SDL
+# anyway. Turn it on to retry after the window handling is reworked, with the log's [present] lines as the evidence.
+#PS2_VK_PRESENT=1
