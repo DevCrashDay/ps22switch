@@ -22,6 +22,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 WGSL = ROOT / "runtime" / "src" / "gs" / "gpu" / "gs.wgsl"
 HW_WGSL = ROOT / "runtime" / "src" / "gs" / "gpu" / "hw.wgsl"
+BLIT_WGSL = ROOT / "runtime" / "src" / "gs" / "gpu" / "blit.wgsl"
 OUT = ROOT / "runtime" / "src" / "gs" / "gpu" / "vk" / "spirv_table.cpp"
 
 # (SCALE, TILE, EXPLICIT_FMA): the tile sizes gpu.cpp takes (PS2_TILE=4, 8 or 16), with and without the sums spelled out as fma()
@@ -77,8 +78,10 @@ def main():
     naga = shutil.which(args.naga) or args.naga
     text = WGSL.read_text(encoding="utf-8")
     hw_text = HW_WGSL.read_text(encoding="utf-8")
+    blit_text = BLIT_WGSL.read_text(encoding="utf-8")
     h = wgsl_hash(text)
     hw_h = wgsl_hash(hw_text)
+    blit_h = wgsl_hash(blit_text)
     modules = []  # (hash, scale, tile, fma, words); tile 0: a program without overrides, any constants
     with tempfile.TemporaryDirectory() as tmp:
         for scale, tile, fma in VARIANTS:
@@ -88,13 +91,18 @@ def main():
         words = compile_wgsl(naga, hw_text, "hw", tmp, ("--capabilities", "dual_source_blending"))
         modules.append((hw_h, 0, 0, False, words))
         print(f"hw.wgsl: {len(words)} words")
+        # the blit that draws into the window's swap chain (PS2_VK_PRESENT=1): a program without overrides, like hw.wgsl
+        words = compile_wgsl(naga, blit_text, "blit", tmp)
+        modules.append((blit_h, 0, 0, False, words))
+        print(f"blit.wgsl: {len(words)} words")
 
     sha = lambda t: hashlib.sha256(t.replace(chr(13), '').encode('utf-8')).hexdigest()
     lines = [
-        "// Made by scripts/wgsl_spirv.py from runtime/src/gs/gpu/gs.wgsl and hw.wgsl: do not edit, run the script again after changing them.",
+        "// Made by scripts/wgsl_spirv.py from runtime/src/gs/gpu/gs.wgsl, hw.wgsl and blit.wgsl: do not edit, run the script again after changing them.",
         f"// gs.wgsl hash {h:016x}",
         f"// gs.wgsl sha256 {sha(text)}",
         f"// hw.wgsl sha256 {sha(hw_text)}",
+        f"// blit.wgsl sha256 {sha(blit_text)}",
         '#include "spirv.hpp"',
         "",
         "namespace ps2::gs::gpu::vk {",

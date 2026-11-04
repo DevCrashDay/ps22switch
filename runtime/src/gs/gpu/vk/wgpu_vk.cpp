@@ -1908,10 +1908,20 @@ static bool surface_make_swapchain(WGPUSurface s) {
     ci.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
     ci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
     ci.preTransform = caps.currentTransform;
+    // libnx's display surface does not take every compositing mode; ask for one it says it supports (opaque first: the picture has no
+    // alpha to show the console's own screen through).
     ci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+    for (const VkCompositeAlphaFlagBitsKHR mode : {VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR, VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR,
+                                                   VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR, VK_COMPOSITE_ALPHA_POST_MULTIPLIED_BIT_KHR})
+        if (caps.supportedCompositeAlpha & mode) {
+            ci.compositeAlpha = mode;
+            break;
+        }
     ci.presentMode = s->mode;
     ci.clipped = VK_TRUE;
     ci.oldSwapchain = s->swapchain;
+    std::fprintf(stderr, "[present] surface: %ux%u, images %u..%u, composite alpha 0x%x, transform %d, usage 0x%x\n", extent.width, extent.height,
+                 caps.minImageCount, caps.maxImageCount, caps.supportedCompositeAlpha, static_cast<int>(caps.currentTransform), caps.supportedUsageFlags);
     VkSwapchainKHR fresh = VK_NULL_HANDLE;
     if (VkResult r = vkCreateSwapchainKHR(d->device, &ci, nullptr, &fresh); r != VK_SUCCESS) {
         log_vk("vkCreateSwapchainKHR", r);
@@ -1994,29 +2004,25 @@ WGPUStatus wgpuSurfaceGetCapabilities(WGPUSurface s, WGPUAdapter adapter, WGPUSu
     vkGetPhysicalDeviceSurfacePresentModesKHR(adapter->phys, s->surface, &m, nullptr);
     std::vector<VkPresentModeKHR> modes(m);
     if (m) vkGetPhysicalDeviceSurfacePresentModesKHR(adapter->phys, s->surface, &m, modes.data());
-    // gpu.cpp asks for the format it can blit into and for a present mode; it picks fifo unless immediate or mailbox is offered.
+    // gpu.cpp asks for the format it can blit into and for a present mode; it picks fifo unless immediate or mailbox is offered. Only fifo
+    // is offered here: the display's surface locks the picture to the screen's refresh, which is what a 60 Hz game wants anyway (a drop
+    // to 30 is then even, not tearing), and vkCreateSwapchainKHR accepts it everywhere.
     auto *format_list = static_cast<WGPUTextureFormat *>(std::malloc(sizeof(WGPUTextureFormat) * 2));
     format_list[0] = s->format == VK_FORMAT_R8G8B8A8_UNORM ? WGPUTextureFormat_RGBA8Unorm : WGPUTextureFormat_BGRA8Unorm;
     format_list[1] = s->format == VK_FORMAT_R8G8B8A8_UNORM ? WGPUTextureFormat_BGRA8Unorm : WGPUTextureFormat_RGBA8Unorm;
-    std::size_t count = 1;
-    for (VkPresentModeKHR mode : modes)
-        if (mode == VK_PRESENT_MODE_MAILBOX_KHR || mode == VK_PRESENT_MODE_IMMEDIATE_KHR) ++count;
-    auto *present_modes = static_cast<WGPUPresentMode *>(std::malloc(sizeof(WGPUPresentMode) * count));
-    std::size_t at = 0;
-    present_modes[at++] = WGPUPresentMode_Fifo;
-    for (VkPresentModeKHR mode : modes)
-        if (mode == VK_PRESENT_MODE_IMMEDIATE_KHR) present_modes[at++] = WGPUPresentMode_Immediate;
-        else if (mode == VK_PRESENT_MODE_MAILBOX_KHR) present_modes[at++] = WGPUPresentMode_Mailbox;
+    auto *present_modes = static_cast<WGPUPresentMode *>(std::malloc(sizeof(WGPUPresentMode)));
+    present_modes[0] = WGPUPresentMode_Fifo;
     auto *alpha = static_cast<WGPUCompositeAlphaMode *>(std::malloc(sizeof(WGPUCompositeAlphaMode)));
     alpha[0] = WGPUCompositeAlphaMode_Auto;
     caps->usages = WGPUTextureUsage_RenderAttachment;
     caps->formatCount = 2;
     caps->formats = format_list;
-    caps->presentModeCount = count;
+    caps->presentModeCount = 1;
     caps->presentModes = present_modes;
     caps->alphaModeCount = 1;
     caps->alphaModes = alpha;
     (void)sc;
+    (void)modes;
     return WGPUStatus_Success;
 #else
     (void)adapter;
