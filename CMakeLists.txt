@@ -223,6 +223,27 @@ elseif(EMSCRIPTEN OR EXISTS "${PS2_WGPU_DIR}/lib/libwgpu_native.a")
     endif()
 endif()
 
+# deko3d: the console's own GPU API, which needs no Vulkan and no SDL in between (runtime/src/gs/gpu/deko). On to make the device and
+# the swap chain part of every Switch build: PS2_DEKO3D=<frames> in launch.txt then runs the stage 0 bring-up test instead of the game.
+if(NINTENDO_SWITCH)
+    option(PS2_DEKO3D "Switch: build with deko3d (PS2_DEKO3D=1 runs the stage 0 bring-up test)" ON)
+else()
+    option(PS2_DEKO3D "Switch: build with deko3d (PS2_DEKO3D=1 runs the stage 0 bring-up test)" OFF)
+endif()
+if(PS2_DEKO3D AND NOT NINTENDO_SWITCH)
+    message(FATAL_ERROR "PS2_DEKO3D is the Switch's GPU API: only the Switch build has it (-DPS2_DEKO3D=OFF elsewhere)")
+endif()
+if(PS2_DEKO3D)
+    # libdeko3d.a and deko3d.h come with libnx, and the headers are already on the include path
+    find_library(PS2_DEKO3D_LIBRARY NAMES deko3d PATHS "$ENV{DEVKITPRO}/libnx/lib" NO_DEFAULT_PATH)
+    if(NOT PS2_DEKO3D_LIBRARY)
+        message(FATAL_ERROR "PS2_DEKO3D needs libdeko3d.a, which comes with libnx (looked in $ENV{DEVKITPRO}/libnx/lib): -DPS2_DEKO3D=OFF")
+    endif()
+    target_sources(ps2runtime PRIVATE runtime/src/gs/gpu/deko/deko_stage0.cpp)
+    target_compile_definitions(ps2runtime PUBLIC PS2_DEKO3D)
+    target_link_libraries(ps2runtime PUBLIC "${PS2_DEKO3D_LIBRARY}")
+endif()
+
 if(PS2_GENERATED)
     file(GLOB PS2_UNITS CONFIGURE_DEPENDS "${PS2_GENERATED}/*.cpp")
     add_library(ps2game STATIC ${PS2_UNITS})

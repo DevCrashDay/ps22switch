@@ -2,6 +2,7 @@
 #include "ps2/system.hpp"
 #include "ps2/ee_live.hpp"
 #include "ps2/vu_live.hpp"
+#include "ps2/deko_stage0.h"
 #include "thread.hpp"
 #include "switch_clock.hpp"
 
@@ -778,6 +779,13 @@ int main(int argc, char **argv) {
         else if (a == "--quick-dir" && i + 1 < argc) ps2::g_options.quick_dir = argv[++i];
         else return usage();
     }
+
+#ifdef PS2_DEKO3D
+    // PS2_DEKO3D=1 (or =<frames>): stage 0 of the deko3d renderer (runtime/src/gs/gpu/deko/deko_stage0.cpp) instead of the game.
+    // It has to run before open_window() below, because SDL takes the console's window for its own, and deko3d cannot present into a
+    // window that SDL's EGL surface already owns (that is where the Vulkan present path stopped).
+    if (const std::string deko = ps2::os::env("PS2_DEKO3D"); !deko.empty() && deko != "0") return ps2::deko_stage0();
+#endif
 
 #ifdef PS2_WINDOW
     // PS2_NO_LOG_COPY=1 leaves the log alone (no memory copy, no file): the way back if the pipe is ever in the way
