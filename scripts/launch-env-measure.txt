@@ -17,3 +17,7 @@ PS2_EMIT_LOG=1
 # [hitch] one line per picture that took 30 ms or more, with the window thread's time per kind of work (drawing messages,
 # handing the picture over) - noisy, so off unless a picture-level breakdown is wanted.
 #PS2_HITCH_LOG=1
+
+# Three pictures may be in flight between the emulation thread and the screen instead of two. Measured on 2026-11-04: 21 -> 25 fps
+# in a fight. One more frame of input lag, and the value that the repeatable run in build/switch/tests/Z-diagnose uses.
+PS2_PRESENT_DEPTH=3

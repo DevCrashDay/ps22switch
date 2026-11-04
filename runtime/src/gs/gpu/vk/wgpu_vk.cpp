@@ -27,6 +27,10 @@
 #define VK_NO_PROTOTYPES
 #endif
 #include <vulkan/vulkan.h>
+#ifdef __SWITCH__
+#include <vulkan/vulkan_vi.h>
+extern "C" void *nwindowGetDefault();  // libnx: the display. Declared here so this file needs no libnx header.
+#endif
 
 #include <algorithm>
 #include <chrono>
@@ -54,6 +58,16 @@ extern "C" void *__stdcall GetProcAddress(void *module, const char *name);
 
 #include "spirv.hpp"
 
+// PS2_VK_PRESENT=1: show the picture by drawing into a swap chain image on the display and presenting it, instead of reading it back
+// and handing it to SDL. Off by default: the SDL path is the one that has been running on the console.
+static bool vi_present() {
+    static const bool on = [] {
+        const char *v = std::getenv("PS2_VK_PRESENT");
+        return v && v[0] == '1';
+    }();
+    return on;
+}
+
 // ---------------------------------------------------------------------------------------------------------------------------------
 // Vulkan entry points. NVK on the Switch is linked in and exports them all; elsewhere they come from the system's loader.
 #define PS2_VK_GLOBAL(X) X(vkCreateInstance) X(vkEnumerateInstanceVersion)
@@ -61,7 +75,8 @@ extern "C" void *__stdcall GetProcAddress(void *module, const char *name);
     X(vkDestroyInstance) X(vkEnumeratePhysicalDevices) X(vkGetPhysicalDeviceProperties) X(vkGetPhysicalDeviceQueueFamilyProperties)       \
     X(vkGetPhysicalDeviceMemoryProperties) X(vkGetPhysicalDeviceFeatures) X(vkCreateDevice) X(vkGetDeviceProcAddr)     \
     X(vkGetPhysicalDeviceFeatures2)                                                                                                   \
-    X(vkEnumerateDeviceExtensionProperties)
+    X(vkEnumerateDeviceExtensionProperties) X(vkGetPhysicalDeviceSurfaceCapabilitiesKHR) X(vkGetPhysicalDeviceSurfaceFormatsKHR)          \
+    X(vkGetPhysicalDeviceSurfacePresentModesKHR) X(vkDestroySurfaceKHR)
 #define PS2_VK_DEVICE(X)                                                                                                                \
     X(vkDestroyDevice) X(vkGetDeviceQueue) X(vkQueueSubmit) X(vkDeviceWaitIdle) X(vkCreateBuffer) X(vkDestroyBuffer)                    \
     X(vkGetBufferMemoryRequirements) X(vkAllocateMemory) X(vkFreeMemory) X(vkBindBufferMemory) X(vkMapMemory)                          \
@@ -74,7 +89,8 @@ extern "C" void *__stdcall GetProcAddress(void *module, const char *name);
     X(vkCreateQueryPool) X(vkDestroyQueryPool) X(vkCmdResetQueryPool) X(vkCmdWriteTimestamp) X(vkGetQueryPoolResults)            \
     X(vkCreateImage) X(vkDestroyImage) X(vkGetImageMemoryRequirements) X(vkBindImageMemory) X(vkCreateImageView) X(vkDestroyImageView) \
     X(vkCreateGraphicsPipelines) X(vkCmdBeginRendering) X(vkCmdEndRendering) X(vkCmdSetViewport) X(vkCmdSetScissor)                   \
-    X(vkCmdSetBlendConstants) X(vkCmdDraw)
+    X(vkCmdSetBlendConstants) X(vkCmdDraw) X(vkCreateSwapchainKHR) X(vkDestroySwapchainKHR) X(vkGetSwapchainImagesKHR)                \
+    X(vkAcquireNextImageKHR) X(vkQueuePresentKHR)
 
 #ifndef __SWITCH__
 #define PS2_VK_POINTER(name) static PFN_##name name = nullptr;
@@ -201,6 +217,10 @@ struct WGPUDeviceImpl {
     WGPUUncapturedErrorCallbackInfo errors{};
     WGPUQueue queue_object = nullptr;
     std::uint64_t max_in_flight = 8;  // submissions the CPU may be ahead of the GPU (PS2_VK_IN_FLIGHT)
+    // PS2_VK_PRESENT=1: the swap chain's image is acquired with present_wait and the submission that draws into it signals
+    // present_signal, which the present then waits on (a binary semaphore per picture, the same queue, no CPU wait).
+    VkSemaphore present_wait = VK_NULL_HANDLE, present_signal = VK_NULL_HANDLE;
+    bool present_pending = false, present_signalled = false;  // a blit was recorded / a submit signalled it, for the present to wait on
     // PS2_VK_PROFILE=1: GPU time of every dispatch from timestamps, summed by program and written to the log every 2 seconds
     struct Timed {
         VkCommandBuffer cmd;
@@ -283,6 +303,7 @@ struct WGPUTextureImpl {
     VkFormat format = VK_FORMAT_UNDEFINED;
     std::uint32_t width = 0, height = 0;
     bool depth = false;
+    bool borrowed = false;  // a swap chain image: the surface owns it, releasing this wrapper must not destroy it
 };
 
 struct WGPUTextureViewImpl {
@@ -306,6 +327,7 @@ struct WGPURenderPassEncoderImpl {
     WGPUCommandEncoder encoder = nullptr;
     VkPipelineLayout layout = VK_NULL_HANDLE;
     std::vector<Binding> pending;  // bound before the first pipeline: made once its layout is known
+    VkImage swapchain_image = VK_NULL_HANDLE;  // PS2_VK_PRESENT=1: this pass draws into the swap chain image, which goes back to PRESENT_SRC
 };
 
 struct WGPUComputePassEncoderImpl {
@@ -403,8 +425,23 @@ void dispatch_barrier(VkCommandBuffer cmd) {
                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &b, 0, nullptr, 0, nullptr);
 }
 
-void update_completed(WGPUDevice d) {
-    std::uint64_t value = 0;
+// A swap chain image's layout for the blit: UNDEFINED (or PRESENT_SRC) before a pass, PRESENT_SRC after it, which is what
+// vkQueuePresentKHR needs. The contents are cleared by the pass, so the old contents never matter.
+void swapchain_barrier(VkCommandBuffer cmd, VkImage image, bool to_general) {
+    VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    b.oldLayout = to_general ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_GENERAL;
+    b.newLayout = to_general ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.image = image;
+    b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    b.srcAccessMask = to_general ? 0 : VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    b.dstAccessMask = to_general ? VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT : 0;
+    vkCmdPipelineBarrier(cmd, to_general ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT : VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                         to_general ? VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT : VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+}
+
+void update_completed(WGPUDevice d) {    std::uint64_t value = 0;
     if (vkGetSemaphoreCounterValue(d->device, d->timeline, &value) == VK_SUCCESS) d->completed = std::max(d->completed, value);
 }
 
@@ -563,10 +600,29 @@ void submit(WGPUDevice d, const std::vector<VkCommandBuffer> &given) {
     si.pCommandBuffers = all.data();
     si.signalSemaphoreCount = 1;
     si.pSignalSemaphores = &d->timeline;
+    // PS2_VK_PRESENT=1: wait for the swap chain image to be free before drawing into it, and signal that the blit is done so the present
+    // can wait for it. Both are binary semaphores; the timeline one above keeps its value.
+    VkSemaphore signals[2] = {d->timeline, d->present_signal};
+    std::uint64_t signal_values[2] = {serial, 0};
+    if (d->present_pending && d->present_signal) {
+        ti.signalSemaphoreValueCount = 2;
+        ti.pSignalSemaphoreValues = signal_values;
+        si.signalSemaphoreCount = 2;
+        si.pSignalSemaphores = signals;
+        d->present_pending = false;
+        d->present_signalled = true;  // the present waits on it, then the surface makes a new one
+    }
+    VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    if (d->present_wait) {
+        si.waitSemaphoreCount = 1;
+        si.pWaitSemaphores = &d->present_wait;
+        si.pWaitDstStageMask = &wait_stage;
+    }
     if (VkResult r = vkQueueSubmit(d->queue, 1, &si, VK_NULL_HANDLE); r != VK_SUCCESS) {
         report(d, "vkQueueSubmit failed: " + std::to_string(static_cast<int>(r)));
         return;
     }
+    d->present_wait = VK_NULL_HANDLE;
     d->submitted = serial;
     for (VkCommandBuffer c : all) d->spare.emplace_back(c, serial);
     if (d->queries) {
@@ -762,6 +818,13 @@ WGPUInstance wgpuCreateInstance(WGPUInstanceDescriptor const *) {
         ci.enabledLayerCount = 1;
         ci.ppEnabledLayerNames = &layer;
     }
+#ifdef __SWITCH__
+    const char *vi_extension = VK_NN_VI_SURFACE_EXTENSION_NAME;
+    if (vi_present()) {
+        ci.enabledExtensionCount = 1;
+        ci.ppEnabledExtensionNames = &vi_extension;
+    }
+#endif
     VkInstance instance = VK_NULL_HANDLE;
     VkResult r = vkCreateInstance(&ci, nullptr, &instance);
     if (r != VK_SUCCESS && ci.enabledLayerCount) {
@@ -924,6 +987,9 @@ WGPUFuture wgpuAdapterRequestDevice(WGPUAdapter adapter, WGPUDeviceDescriptor co
         if (extensions.empty()) std::fprintf(stderr, "[vk-stats] the driver has no VK_KHR_pipeline_executable_properties\n");
     }
     VkDeviceCreateInfo ci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
+#ifdef __SWITCH__
+    if (vi_present()) extensions.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);  // PS2_VK_PRESENT=1 draws into a swap chain
+#endif
     ci.enabledExtensionCount = static_cast<std::uint32_t>(extensions.size());
     ci.ppEnabledExtensionNames = extensions.data();
     ci.pNext = &f12;
@@ -1523,6 +1589,10 @@ WGPUTexture wgpuDeviceCreateTexture(WGPUDevice d, WGPUTextureDescriptor const *d
 void wgpuTextureRelease(WGPUTexture t) {
     if (!t) return;
     std::lock_guard<std::recursive_mutex> hold(g_lock);
+    if (t->borrowed) {  // a swap chain image: the swap chain destroys it when it is made again
+        delete t;
+        return;
+    }
     VkDevice device = t->device->device;
     const VkImage image = t->image;
     const VkDeviceMemory memory = t->memory;
@@ -1733,9 +1803,16 @@ WGPURenderPassEncoder wgpuCommandEncoderBeginRenderPass(WGPUCommandEncoder e, WG
     ri.layerCount = 1;
     ri.colorAttachmentCount = static_cast<std::uint32_t>(colors.size());
     ri.pColorAttachments = colors.data();
+    // PS2_VK_PRESENT=1: a pass that draws into the swap chain image needs it in GENERAL for the pass and back in PRESENT_SRC for the
+    // present; the contents are cleared by the pass, so the layout it comes back in never matters.
+    VkImage swapchain_image = VK_NULL_HANDLE;
+    for (std::size_t i = 0; i < descriptor->colorAttachmentCount; ++i)
+        if (descriptor->colorAttachments[i].view->texture->borrowed) swapchain_image = descriptor->colorAttachments[i].view->texture->image;
+    if (swapchain_image) swapchain_barrier(cmd, swapchain_image, true);
     vkCmdBeginRendering(cmd, &ri);
     auto *p = new WGPURenderPassEncoderImpl;
     p->encoder = e;
+    p->swapchain_image = swapchain_image;
     return p;
 }
 
@@ -1779,6 +1856,10 @@ void wgpuRenderPassEncoderDraw(WGPURenderPassEncoder p, std::uint32_t vertices, 
 
 void wgpuRenderPassEncoderEnd(WGPURenderPassEncoder p) {
     vkCmdEndRendering(p->encoder->cmd);
+    if (p->swapchain_image) {
+        swapchain_barrier(p->encoder->cmd, p->swapchain_image, false);  // ready for vkQueuePresentKHR
+        p->encoder->device->present_pending = true;                     // the submission that carries this pass signals the present
+    }
     full_barrier(p->encoder->cmd);
     time_after(p->encoder->device, p->encoder->cmd, "hw_draw");
 }
@@ -1786,19 +1867,249 @@ void wgpuRenderPassEncoderEnd(WGPURenderPassEncoder p) {
 void wgpuRenderPassEncoderRelease(WGPURenderPassEncoder p) { delete p; }
 
 // ---------------------------------------------------------------------------------------------------------------------------------
-// Not available here: gpu.cpp does without them (no timing, the picture is shown by the window code).
+// Surfaces. Only the Switch's display is implemented (PS2_VK_PRESENT=1, VK_NN_vi_surface): the renderer's blit draws into a swap
+// chain image instead of the picture being read back and handed to SDL. Everywhere else, and without the switch, gpu.cpp does
+// without a surface and the window code shows the picture.
+
+struct WGPUSurfaceImpl {
+    WGPUInstance instance = nullptr;
+    VkSurfaceKHR surface = VK_NULL_HANDLE;
+    WGPUDevice device = nullptr;
+    VkSwapchainKHR swapchain = VK_NULL_HANDLE;
+    VkFormat format = VK_FORMAT_B8G8R8A8_UNORM;
+    VkColorSpaceKHR space = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
+    std::uint32_t width = 0, height = 0;
+    VkPresentModeKHR mode = VK_PRESENT_MODE_FIFO_KHR;
+    std::vector<VkImage> images;
+    std::uint32_t index = 0;
+    bool acquired = false;
+};
+
+#ifdef __SWITCH__
+// Made again after a resize or VK_ERROR_OUT_OF_DATE_KHR: the old one is kept until the new one exists, then destroyed.
+static bool surface_make_swapchain(WGPUSurface s) {
+    WGPUDevice d = s->device;
+    if (!d) return false;
+    VkSurfaceCapabilitiesKHR caps{};
+    if (vkGetPhysicalDeviceSurfaceCapabilitiesKHR(d->adapter->phys, s->surface, &caps) != VK_SUCCESS) return false;
+    VkExtent2D extent{caps.currentExtent.width, caps.currentExtent.height};
+    if (extent.width == 0xFFFFFFFFu || extent.width == 0) {
+        extent.width = std::clamp(s->width, caps.minImageExtent.width, caps.maxImageExtent.width);
+        extent.height = std::clamp(s->height, caps.minImageExtent.height, caps.maxImageExtent.height);
+    }
+    const std::uint32_t count = std::clamp<std::uint32_t>(3, caps.minImageCount, caps.maxImageCount ? caps.maxImageCount : 3);
+    VkSwapchainCreateInfoKHR ci{VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
+    ci.surface = s->surface;
+    ci.minImageCount = count;
+    ci.imageFormat = s->format;
+    ci.imageColorSpace = s->space;
+    ci.imageExtent = extent;
+    ci.imageArrayLayers = 1;
+    ci.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    ci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    ci.preTransform = caps.currentTransform;
+    ci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+    ci.presentMode = s->mode;
+    ci.clipped = VK_TRUE;
+    ci.oldSwapchain = s->swapchain;
+    VkSwapchainKHR fresh = VK_NULL_HANDLE;
+    if (VkResult r = vkCreateSwapchainKHR(d->device, &ci, nullptr, &fresh); r != VK_SUCCESS) {
+        log_vk("vkCreateSwapchainKHR", r);
+        return false;
+    }
+    if (s->swapchain) vkDestroySwapchainKHR(d->device, s->swapchain, nullptr);
+    s->swapchain = fresh;
+    std::uint32_t n = 0;
+    vkGetSwapchainImagesKHR(d->device, s->swapchain, &n, nullptr);
+    s->images.resize(n);
+    if (n) vkGetSwapchainImagesKHR(d->device, s->swapchain, &n, s->images.data());
+    s->width = extent.width;
+    s->height = extent.height;
+    s->acquired = false;
+    VkSemaphoreCreateInfo si{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+    if (!d->present_signal) vkCreateSemaphore(d->device, &si, nullptr, &d->present_signal);
+    if (!d->present_wait) vkCreateSemaphore(d->device, &si, nullptr, &d->present_wait);
+    std::fprintf(stderr, "[present] swap chain: %ux%u, %u images, %s\n", extent.width, extent.height, n,
+                 s->mode == VK_PRESENT_MODE_MAILBOX_KHR ? "mailbox" : s->mode == VK_PRESENT_MODE_IMMEDIATE_KHR ? "immediate" : "fifo");
+    return true;
+}
+#endif
+
+// gpu.cpp's own call (not WebGPU): a surface on the Switch's display, from libnx's default nwindow.
+extern "C" WGPUSurface wgpuCreateViSurface(WGPUInstance instance, void *window) {
+#ifdef __SWITCH__
+    if (!vi_present() || !instance) return nullptr;
+    VkViSurfaceCreateInfoNN ci{VK_STRUCTURE_TYPE_VI_SURFACE_CREATE_INFO_NN};
+    ci.window = window ? window : nwindowGetDefault();
+    auto *s = new WGPUSurfaceImpl;
+    s->instance = instance;
+    if (VkResult r = vkCreateViSurfaceNN(instance->instance, &ci, nullptr, &s->surface); r != VK_SUCCESS) {
+        log_vk("vkCreateViSurfaceNN", r);
+        delete s;
+        return nullptr;
+    }
+    std::fprintf(stderr, "[present] a Vulkan surface on the display (VK_NN_vi_surface)\n");
+    return s;
+#else
+    (void)instance;
+    (void)window;
+    return nullptr;
+#endif
+}
 
 WGPUQuerySet wgpuDeviceCreateQuerySet(WGPUDevice, WGPUQuerySetDescriptor const *) { return nullptr; }
 void wgpuCommandEncoderResolveQuerySet(WGPUCommandEncoder, WGPUQuerySet, std::uint32_t, std::uint32_t, WGPUBuffer, std::uint64_t) {}
 WGPUSurface wgpuInstanceCreateSurface(WGPUInstance, WGPUSurfaceDescriptor const *) { return nullptr; }
-void wgpuSurfaceRelease(WGPUSurface) {}
-WGPUStatus wgpuSurfaceGetCapabilities(WGPUSurface, WGPUAdapter, WGPUSurfaceCapabilities *) { return WGPUStatus_Error; }
-void wgpuSurfaceCapabilitiesFreeMembers(WGPUSurfaceCapabilities) {}
-void wgpuSurfaceConfigure(WGPUSurface, WGPUSurfaceConfiguration const *) {}
-void wgpuSurfaceGetCurrentTexture(WGPUSurface, WGPUSurfaceTexture *texture) {
+
+void wgpuSurfaceRelease(WGPUSurface s) {
+    if (!s) return;
+    if (s->device) {
+        if (s->swapchain) vkDeviceWaitIdle(s->device->device);
+        if (s->swapchain) vkDestroySwapchainKHR(s->device->device, s->swapchain, nullptr);
+    }
+#ifdef __SWITCH__
+    if (s->surface) vkDestroySurfaceKHR(s->instance->instance, s->surface, nullptr);
+#else
+    if (s->surface) vkDestroySurfaceKHR(s->instance->instance, s->surface, nullptr);
+#endif
+    delete s;
+}
+
+WGPUStatus wgpuSurfaceGetCapabilities(WGPUSurface s, WGPUAdapter adapter, WGPUSurfaceCapabilities *caps) {
+    if (!s || !s->surface || !caps) return WGPUStatus_Error;
+#ifdef __SWITCH__
+    VkSurfaceCapabilitiesKHR sc{};
+    if (vkGetPhysicalDeviceSurfaceCapabilitiesKHR(adapter->phys, s->surface, &sc) != VK_SUCCESS) return WGPUStatus_Error;
+    std::uint32_t n = 0;
+    vkGetPhysicalDeviceSurfaceFormatsKHR(adapter->phys, s->surface, &n, nullptr);
+    std::vector<VkSurfaceFormatKHR> formats(n);
+    if (n) vkGetPhysicalDeviceSurfaceFormatsKHR(adapter->phys, s->surface, &n, formats.data());
+    for (const VkSurfaceFormatKHR &f : formats)
+        if ((f.format == VK_FORMAT_R8G8B8A8_UNORM || f.format == VK_FORMAT_B8G8R8A8_UNORM) && f.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) {
+            s->format = f.format;
+            s->space = f.colorSpace;
+            break;
+        }
+    std::uint32_t m = 0;
+    vkGetPhysicalDeviceSurfacePresentModesKHR(adapter->phys, s->surface, &m, nullptr);
+    std::vector<VkPresentModeKHR> modes(m);
+    if (m) vkGetPhysicalDeviceSurfacePresentModesKHR(adapter->phys, s->surface, &m, modes.data());
+    // gpu.cpp asks for the format it can blit into and for a present mode; it picks fifo unless immediate or mailbox is offered.
+    auto *format_list = static_cast<WGPUTextureFormat *>(std::malloc(sizeof(WGPUTextureFormat) * 2));
+    format_list[0] = s->format == VK_FORMAT_R8G8B8A8_UNORM ? WGPUTextureFormat_RGBA8Unorm : WGPUTextureFormat_BGRA8Unorm;
+    format_list[1] = s->format == VK_FORMAT_R8G8B8A8_UNORM ? WGPUTextureFormat_BGRA8Unorm : WGPUTextureFormat_RGBA8Unorm;
+    std::size_t count = 1;
+    for (VkPresentModeKHR mode : modes)
+        if (mode == VK_PRESENT_MODE_MAILBOX_KHR || mode == VK_PRESENT_MODE_IMMEDIATE_KHR) ++count;
+    auto *present_modes = static_cast<WGPUPresentMode *>(std::malloc(sizeof(WGPUPresentMode) * count));
+    std::size_t at = 0;
+    present_modes[at++] = WGPUPresentMode_Fifo;
+    for (VkPresentModeKHR mode : modes)
+        if (mode == VK_PRESENT_MODE_IMMEDIATE_KHR) present_modes[at++] = WGPUPresentMode_Immediate;
+        else if (mode == VK_PRESENT_MODE_MAILBOX_KHR) present_modes[at++] = WGPUPresentMode_Mailbox;
+    auto *alpha = static_cast<WGPUCompositeAlphaMode *>(std::malloc(sizeof(WGPUCompositeAlphaMode)));
+    alpha[0] = WGPUCompositeAlphaMode_Auto;
+    caps->usages = WGPUTextureUsage_RenderAttachment;
+    caps->formatCount = 2;
+    caps->formats = format_list;
+    caps->presentModeCount = count;
+    caps->presentModes = present_modes;
+    caps->alphaModeCount = 1;
+    caps->alphaModes = alpha;
+    (void)sc;
+    return WGPUStatus_Success;
+#else
+    (void)adapter;
+    return WGPUStatus_Error;
+#endif
+}
+
+void wgpuSurfaceCapabilitiesFreeMembers(WGPUSurfaceCapabilities caps) {
+    std::free(const_cast<WGPUTextureFormat *>(caps.formats));
+    std::free(const_cast<WGPUPresentMode *>(caps.presentModes));
+    std::free(const_cast<WGPUCompositeAlphaMode *>(caps.alphaModes));
+}
+
+void wgpuSurfaceConfigure(WGPUSurface s, WGPUSurfaceConfiguration const *config) {
+    if (!s || !s->surface || !config || !config->device) return;
+    s->device = config->device;
+    const VkFormat format = vk_format(config->format);
+    if (format != VK_FORMAT_UNDEFINED) s->format = format;
+    s->width = config->width;
+    s->height = config->height;
+    s->mode = config->presentMode == WGPUPresentMode_Immediate    ? VK_PRESENT_MODE_IMMEDIATE_KHR
+              : config->presentMode == WGPUPresentMode_Mailbox   ? VK_PRESENT_MODE_MAILBOX_KHR
+              : config->presentMode == WGPUPresentMode_FifoRelaxed ? VK_PRESENT_MODE_FIFO_RELAXED_KHR
+                                                                  : VK_PRESENT_MODE_FIFO_KHR;
+#ifdef __SWITCH__
+    surface_make_swapchain(s);
+#endif
+}
+
+void wgpuSurfaceGetCurrentTexture(WGPUSurface s, WGPUSurfaceTexture *texture) {
     texture->texture = nullptr;
     texture->status = WGPUSurfaceGetCurrentTextureStatus_Error;
+    if (!s || !s->swapchain) return;
+#ifdef __SWITCH__
+    WGPUDevice d = s->device;
+    if (!d) return;
+    if (!d->present_wait) {
+        VkSemaphoreCreateInfo si{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+        vkCreateSemaphore(d->device, &si, nullptr, &d->present_wait);
+        if (!d->present_wait) return;
+    }
+    VkResult r = vkAcquireNextImageKHR(d->device, s->swapchain, UINT64_MAX, d->present_wait, VK_NULL_HANDLE, &s->index);
+    if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) {
+        if (!surface_make_swapchain(s)) return;
+        r = vkAcquireNextImageKHR(d->device, s->swapchain, UINT64_MAX, d->present_wait, VK_NULL_HANDLE, &s->index);
+    }
+    if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) {
+        log_vk("vkAcquireNextImageKHR", r);
+        return;
+    }
+    if (s->index >= s->images.size()) return;
+    auto *t = new WGPUTextureImpl;
+    t->device = d;
+    t->image = s->images[s->index];
+    t->format = s->format;
+    t->width = s->width;
+    t->height = s->height;
+    t->borrowed = true;  // the swap chain owns it
+    s->acquired = true;
+    texture->texture = t;
+    texture->status = WGPUSurfaceGetCurrentTextureStatus_SuccessOptimal;
+#endif
 }
-WGPUStatus wgpuSurfacePresent(WGPUSurface) { return WGPUStatus_Error; }
+
+WGPUStatus wgpuSurfacePresent(WGPUSurface s) {
+    if (!s || !s->swapchain || !s->acquired) return WGPUStatus_Error;
+#ifdef __SWITCH__
+    WGPUDevice d = s->device;
+    VkPresentInfoKHR pi{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
+    if (d->present_signalled && d->present_signal) {
+        pi.waitSemaphoreCount = 1;  // the blit is drawn before the picture goes to the screen
+        pi.pWaitSemaphores = &d->present_signal;
+    }
+    pi.swapchainCount = 1;
+    pi.pSwapchains = &s->swapchain;
+    pi.pImageIndices = &s->index;
+    VkResult r = vkQueuePresentKHR(d->queue, &pi);
+    s->acquired = false;
+    d->present_signalled = false;
+    d->present_wait = VK_NULL_HANDLE;
+    d->present_signal = VK_NULL_HANDLE;  // a binary semaphore is used once; the surface makes the next two
+    if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) {
+        surface_make_swapchain(s);
+        return WGPUStatus_Success;
+    }
+    if (r != VK_SUCCESS) {
+        log_vk("vkQueuePresentKHR", r);
+        return WGPUStatus_Error;
+    }
+    return WGPUStatus_Success;
+#else
+    return WGPUStatus_Error;
+#endif
+}
 
 }  // extern "C"

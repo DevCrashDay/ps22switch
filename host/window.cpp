@@ -143,6 +143,19 @@ bool create_renderer() {
 
 bool attach_gpu() {
     if (std::getenv("PS2_SDL_RENDERER")) return false;
+#ifdef __SWITCH__
+    // PS2_VK_PRESENT=1: the renderer blits into a swap chain image on the display and the driver presents it, instead of the picture
+    // being read back and uploaded into an SDL texture. Off by default, so the path that has been running on the console stays.
+    if (std::getenv("PS2_VK_PRESENT")) {
+        ps2::WindowTarget target;
+        target.kind = ps2::WindowTarget::Vi;
+        int w = 0, h = 0;
+        SDL_GetWindowSizeInPixels(g_window, &w, &h);
+        target.width = static_cast<std::uint32_t>(w);
+        target.height = static_cast<std::uint32_t>(h);
+        return ps2::attach_window(target);
+    }
+#endif
     SDL_SysWMinfo info;
     SDL_VERSION(&info.version);
     if (!SDL_GetWindowWMInfo(g_window, &info)) return false;

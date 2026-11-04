@@ -14,6 +14,10 @@
 // not need one: there the images are the size of what is drawn.
 extern "C" void wgpuRenderPassSetAreaHint(std::uint32_t x, std::uint32_t y, std::uint32_t width, std::uint32_t height);
 #endif
+#if defined(__SWITCH__) && defined(PS2_VULKAN)
+// This shim's own call (vk/wgpu_vk.cpp): a surface on the display itself, for presenting with Vulkan instead of through SDL.
+extern "C" WGPUSurface wgpuCreateViSurface(WGPUInstance instance, void *window);
+#endif
 
 #include <algorithm>
 #include <array>
@@ -3038,11 +3042,19 @@ bool attach_surface(const SurfaceTarget &target) {
         wayland.display = target.display;
         wayland.surface = target.surface;
         sd.nextInChain = &wayland.chain;
-    } else {
+    } else if (target.kind != SurfaceTarget::Vi) {
         return false;
     }
 #endif
-    g_surface = wgpuInstanceCreateSurface(g_instance, &sd);
+    if (target.kind == SurfaceTarget::Vi) {  // PS2_VK_PRESENT=1: the Switch's display, from the shim's own call
+#if defined(__SWITCH__) && defined(PS2_VULKAN)
+        g_surface = wgpuCreateViSurface(g_instance, target.surface);
+#else
+        return false;
+#endif
+    } else {
+        g_surface = wgpuInstanceCreateSurface(g_instance, &sd);
+    }
     if (!g_surface) return false;
     WGPUSurfaceCapabilities caps = WGPU_SURFACE_CAPABILITIES_INIT;
     if (wgpuSurfaceGetCapabilities(g_surface, g_adapter, &caps) != WGPUStatus_Success || !caps.formatCount) {
