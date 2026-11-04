@@ -125,6 +125,14 @@ else()
 endif()
 set(NVK_SDK "" CACHE PATH "mesa-switch install prefix with NVK (Switch)")
 set(PS2_VULKAN_INCLUDE "" CACHE PATH "folder with vulkan/vulkan.h (not the Switch)")
+# deko3d: the console's own GPU API (runtime/src/gs/gpu/deko). PS2_DEKO3D builds the bring-up test and the layer; PS2_DEKO3D_RENDER makes
+# it the renderer instead of Vulkan/NVK. Both are declared here because the renderer choice below needs them.
+if(NINTENDO_SWITCH)
+    option(PS2_DEKO3D "Switch: build with deko3d (PS2_DEKO3D=1 runs the stage 0 bring-up test)" ON)
+else()
+    option(PS2_DEKO3D "Switch: build with deko3d (PS2_DEKO3D=1 runs the stage 0 bring-up test)" OFF)
+endif()
+option(PS2_DEKO3D_RENDER "Switch: draw through deko3d instead of Vulkan/NVK (being built: nothing is drawn yet)" OFF)
 if(PS2_VULKAN AND NOT EMSCRIPTEN)
     if(NINTENDO_SWITCH AND NOT EXISTS "${NVK_SDK}/lib/libvulkan.a")
         message(FATAL_ERROR "PS2_VULKAN on the Switch needs NVK_SDK (the mesa-switch-nvk-sdk download's portlibs/switch folder): "
@@ -163,7 +171,18 @@ if(PS2_VULKAN AND NOT EMSCRIPTEN)
             DEPENDS runtime/src/gs/gpu/${name}.wgsl cmake/embed.cmake)
     endforeach()
     target_sources(ps2runtime PRIVATE runtime/src/gs/gpu/gpu.cpp "${CMAKE_BINARY_DIR}/gs_wgsl.cpp" "${CMAKE_BINARY_DIR}/blit_wgsl.cpp" "${CMAKE_BINARY_DIR}/hw_wgsl.cpp"
-        runtime/src/gs/gpu/vk/wgpu_vk.cpp runtime/src/gs/gpu/vk/spirv_table.cpp)
+        runtime/src/gs/gpu/vk/spirv_table.cpp)
+    # Which renderer does the drawing: the hand-written Vulkan layer over NVK, or the deko3d one (runtime/src/gs/gpu/deko/wgpu_deko.cpp).
+    # Both answer the same WebGPU calls, so only one of them may be linked.
+    if(PS2_DEKO3D_RENDER)
+        if(NOT PS2_DEKO3D)
+            message(FATAL_ERROR "PS2_DEKO3D_RENDER draws through deko3d, so it needs PS2_DEKO3D (the Switch build)")
+        endif()
+        target_sources(ps2runtime PRIVATE runtime/src/gs/gpu/deko/wgpu_deko.cpp)
+        target_compile_definitions(ps2runtime PUBLIC PS2_DEKO3D_RENDER)
+    else()
+        target_sources(ps2runtime PRIVATE runtime/src/gs/gpu/vk/wgpu_vk.cpp)
+    endif()
     target_include_directories(ps2runtime PRIVATE runtime/src/gs/gpu/vk/include runtime/src/gs/gpu/vk)
     set_source_files_properties(runtime/src/gs/gpu/vk/wgpu_vk.cpp PROPERTIES COMPILE_OPTIONS -Wno-missing-field-initializers)  # { VK_STRUCTURE_TYPE_... } leaves the rest zero
     target_compile_definitions(ps2runtime PUBLIC PS2_GPU PS2_VULKAN)
@@ -223,13 +242,8 @@ elseif(EMSCRIPTEN OR EXISTS "${PS2_WGPU_DIR}/lib/libwgpu_native.a")
     endif()
 endif()
 
-# deko3d: the console's own GPU API, which needs no Vulkan and no SDL in between (runtime/src/gs/gpu/deko). On to make the device and
-# the swap chain part of every Switch build: PS2_DEKO3D=<frames> in launch.txt then runs the stage 0 bring-up test instead of the game.
-if(NINTENDO_SWITCH)
-    option(PS2_DEKO3D "Switch: build with deko3d (PS2_DEKO3D=1 runs the stage 0 bring-up test)" ON)
-else()
-    option(PS2_DEKO3D "Switch: build with deko3d (PS2_DEKO3D=1 runs the stage 0 bring-up test)" OFF)
-endif()
+# deko3d: the device, the swap chain and the shader modules (runtime/src/gs/gpu/deko). The option itself is declared higher up, because
+# choosing the renderer needs it: PS2_DEKO3D=<frames> in launch.txt then runs the stage 0 bring-up test instead of the game.
 if(PS2_DEKO3D AND NOT NINTENDO_SWITCH)
     message(FATAL_ERROR "PS2_DEKO3D is the Switch's GPU API: only the Switch build has it (-DPS2_DEKO3D=OFF elsewhere)")
 endif()

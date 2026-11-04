@@ -134,6 +134,39 @@ different program rather than a translation of this one.
 To rebuild the table: `python scripts/wgsl_dksh.py --naga <naga> --uam <uam build/uam>`. Neither program is needed to build the
 `.nro` — only to change a shader.
 
+## Stage 1: the shim (in progress)
+
+`runtime/src/gs/gpu/deko/wgpu_deko.cpp` answers the same 63 WebGPU calls `gpu.cpp` makes, on deko3d, and `-DPS2_DEKO3D_RENDER=ON`
+swaps it in for `gpu/vk/wgpu_vk.cpp`. That build **links**: 133 targets, a 36.7 MB `.nro` with 67 `wgpu*` symbols and no Vulkan shim
+(NVK is still linked until stage 3). `gpu.cpp` itself has not changed.
+
+What the deko3d version does differently, and why it should be cheaper than the Vulkan one:
+
+- **Buffers bind by address, not by descriptor set.** deko3d takes a GPU address and size per slot (`dkCmdBufBindStorageBuffers`), so a
+  bind group is just a list of (slot, address, size) that a pass binds when it is used — dynamic offset included. No descriptor memory,
+  no layout matching, no `vkAllocateDescriptorSets`. Vulkan's equivalent was ~2.4–2.9 µs per draw on the A57.
+- **A queue write is a memcpy.** Buffers are CPU-uncached/deko3d-visible memory, so `wgpuQueueWriteBuffer` writes the bytes and the next
+  command list opens with `DkBarrier_Full, DkInvalidateFlags_L2Cache` (the Tegra's L2 is not coherent with the CPU). The Vulkan version
+  copied through a staging buffer every time.
+- **A readback is a barrier and a wait**, not a staging copy plus a fence.
+- **Shaders are looked up, not compiled**: the pipeline's entry point name finds the DKSH module `uam` compiled, so there is no SPIR-V,
+  no NAK, no shader compilation on the console at all.
+- **Command memory belongs to the encoder**, and `wgpuQueueSubmit` replays the encoders' lists into one device list
+  (`dkCmdBufCallList`) and submits that; the memory is retired when the fence says the GPU is done with it.
+
+Implemented in this slice: instance, adapter (limits, dual-source blending advertised, timestamp queries not), device and queue, buffers
+(created zeroed, writes, mapping), textures and views, the surface (three swap-chain back buffers on the console's window, acquire,
+present), command encoders and submission, and a render pass that binds its colour target, clears it, and takes viewport, scissor and
+blend constant.
+
+Not in it yet: bind groups bind nothing, pipelines create no deko3d state, and `draw`/`dispatch` only log once that they are the next
+slice. So `PS2_DEKO3D_RENDER=ON` boots and configures but draws nothing — it is not a playable build yet.
+
+Two things to settle in the next slice: the front-face winding and depth convention (`DkDeviceFlags_OriginLowerLeft`, `DkFrontFace`,
+and the PS2's own cull/ZTST state — the triangle test already showed how silently a wrong choice draws nothing), and `gl_FragCoord`'s
+origin in `hw_fs`, which must match what the Vulkan path produced. Both are cheapest to check with a screenshot comparison against the
+Vulkan build.
+
 ## Prior art
 
 `ref-nether/` (NetherSX2's source, on this machine as a reference, not built) already has a complete deko3d backend —
