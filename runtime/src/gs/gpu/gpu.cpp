@@ -8,6 +8,12 @@
 #ifndef __EMSCRIPTEN__
 #include <webgpu/wgpu.h>
 #endif
+#ifdef PS2_VULKAN
+// This shim's own call, not WebGPU: the area the next render pass draws in, so the driver loads and stores only those tiles of the
+// hardware path's 2048x2048 images (defined in vk/wgpu_vk.cpp). wgpu-native, used on the PC for comparison, has no such call and does
+// not need one: there the images are the size of what is drawn.
+extern "C" void wgpuRenderPassSetAreaHint(std::uint32_t x, std::uint32_t y, std::uint32_t width, std::uint32_t height);
+#endif
 
 #include <algorithm>
 #include <array>
@@ -1500,6 +1506,23 @@ void submit(WGPUTextureView present_view = nullptr) {
             rd.colorAttachmentCount = 1;
             rd.colorAttachments = &color;
             rd.depthStencilAttachment = &depth;
+#ifdef PS2_VULKAN
+            // Only the part of the 2048x2048 images this pass can change is loaded and stored; see wgpuRenderPassSetAreaHint in
+            // vk/wgpu_vk.cpp. The depth load draws in its own box, so the area is the union of the two.
+            {
+                int ax0 = std::max(0, hp.x0), ay0 = std::max(0, hp.y0);
+                int ax1 = std::min(static_cast<int>(kHwSize) - 1, hp.x1), ay1 = std::min(static_cast<int>(kHwSize) - 1, hp.y1);
+                if (hp.load_depth) {
+                    ax0 = std::max(0, std::min(ax0, hp.lx0));
+                    ay0 = std::max(0, std::min(ay0, hp.ly0));
+                    ax1 = std::min(static_cast<int>(kHwSize) - 1, std::max(ax1, hp.lx1));
+                    ay1 = std::min(static_cast<int>(kHwSize) - 1, std::max(ay1, hp.ly1));
+                }
+                if (ax1 >= ax0 && ay1 >= ay0)
+                    wgpuRenderPassSetAreaHint(static_cast<std::uint32_t>(ax0), static_cast<std::uint32_t>(ay0),
+                                              static_cast<std::uint32_t>(ax1 - ax0 + 1), static_cast<std::uint32_t>(ay1 - ay0 + 1));
+            }
+#endif
             WGPURenderPassEncoder rp = wgpuCommandEncoderBeginRenderPass(enc, &rd);
             wgpuRenderPassEncoderSetViewport(rp, 0.0f, 0.0f, static_cast<float>(kHwSize), static_cast<float>(kHwSize), 0.0f, 1.0f);
             wgpuRenderPassEncoderSetScissorRect(rp, static_cast<std::uint32_t>(hp.x0), static_cast<std::uint32_t>(hp.y0), static_cast<std::uint32_t>(hp.x1 - hp.x0 + 1),

@@ -49,6 +49,42 @@ This matters because it changes what to write next:
 A fight frame needs 16.6 ms for 60 fps. Both the window thread (38 ms) and the GPU (23 ms) are above it, so 60 fps needs roughly
 2.3x on that thread and 1.4x on the GPU - the GPU part is the easy half. Nobody should promise 60 fps from a single change.
 
+## 2026-11-04, the console log with every switch on: it is the GPU after all
+
+`PS2_PRESENT_LOG`, `PS2_VK_PROFILE`, `PS2_PARTS` and `PS2_EMIT_LOG` together, steady fight, 26 fps, 38.5 ms a frame:
+
+| Measured | Per second | Per frame |
+|---|---|---|
+| window thread busy | 999 ms (100 %, nothing idle) | 38.5 ms |
+| of it: blocked on the in-flight cap (`CPU waited`) | **449 ms** | **17 ms** |
+| of it: SDL present (`showing the picture`) | 167 ms | 6.4 ms |
+| of it: our command recording (`emit_pre` 17 + `flush_batch` 22) | 39 ms | 1.5 ms |
+| of it: inside NVK's calls (`submit`, excluding the blocking above) | 67 ms | 2.6 ms |
+| of it: the rest, the game's drawing commands -> vertices -> batches | ~280 ms | ~11 ms |
+| polling the window and the controllers, in 52 calls | 3 ms | 0.1 ms |
+| GPU busy (sum of the shim's per-dispatch timestamps) | 601 ms | 23.1 ms |
+| emulation thread: game code 48 %, IOP 3 %, waiting for the window 42 % | | |
+
+Two conclusions, and they are not the ones earlier sections of this file expected:
+
+1. **The GPU is the limit again.** The CPU blocks 17 ms of every 38.5 ms frame waiting for the GPU to finish submissions, the
+   in-flight window sits at its cap of 9, and the emulation thread spends 42 % of its frame waiting for the window thread. Measured
+   dispatch time is only 601 of those 1000 ms, so **about 400 ms a second of GPU time is work no timestamp covers** - barriers, the
+   load and store of the render pass attachments, and the copies of the queue writes.
+2. **The window thread's own work is not the problem any more** (recording 1.5 ms, driver calls 2.6 ms, polling 0.1 ms of a 38.5 ms
+   frame). The `emit_pre` fix took what was the largest item in the PC profile out; what remains on that thread is the present
+   (6.4 ms a frame, R7) and waiting (17 ms).
+
+`hw_draw` is 350 of the 601 measured ms - 500 render passes a second at 0.7 ms each. A pass covers a box of a few hundred pixels of
+the hardware path's **2048x2048** colour and depth images, but the shim declared the whole image as the Vulkan render area, so the
+driver had to load and store up to 32 MB per pass instead of about 1 MB. That is the first suspect for the 400 uncounted
+milliseconds, and the shim now takes the batch's box as `renderArea` (`wgpuRenderPassSetAreaHint`, pixel-identical on the PC:
+`cmp.py` 42/42). If the next log shows the frame better than this one, that was it; if not, the texture cache (R9) moves to the
+front - `hw_draw`'s remaining cost is the per-pixel texture decode in `hw_fs`, and `PS2_HW_DECODE=1` is the cheap test of that.
+
+For 60 fps from here: the GPU needs 601 ms of measured work plus the uncounted part under 16.6 ms a frame, and the present (6.4 ms,
+R7) has to go as well - 6.4 ms alone is 39 % of the budget.
+
 ### The one measurement that separates those cases
 
 The .nro already on the SD card (commit `8e693c9`) prints everything needed; only `launch.txt` has to change - see

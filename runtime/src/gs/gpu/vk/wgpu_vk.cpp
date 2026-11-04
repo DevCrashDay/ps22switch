@@ -1677,6 +1677,23 @@ void wgpuRenderPipelineRelease(WGPURenderPipeline p) {
     delete p;
 }
 
+// Not WebGPU: this shim's own call. The area the next render pass draws in.
+//
+// The hardware path keeps a 2048x2048 colour image and a 2048x2048 depth image (a PS2 framebuffer coordinate maps straight into them),
+// but a batch of a Tekken 4 fight draws in a box of a few hundred pixels of that. A render pass loads and stores its whole render area,
+// so with the area taken from the attachment the driver moves about 32 MB per pass for a pass that changes about 1 MB. gpu.cpp passes
+// the batch's box here; the driver then loads and stores only those tiles. Outside the area the images keep what they had, which is
+// exactly what a load and a store of untouched tiles produce.
+struct RenderAreaHint {
+    bool set = false;
+    std::uint32_t x = 0, y = 0, width = 0, height = 0;
+};
+RenderAreaHint g_area_hint;
+
+extern "C" void wgpuRenderPassSetAreaHint(std::uint32_t x, std::uint32_t y, std::uint32_t width, std::uint32_t height) {
+    g_area_hint = {true, x, y, width, height};
+}
+
 WGPURenderPassEncoder wgpuCommandEncoderBeginRenderPass(WGPUCommandEncoder e, WGPURenderPassDescriptor const *descriptor) {
     VkCommandBuffer cmd = e->cmd;
     full_barrier(cmd);  // WebGPU: a pass sees everything before it
@@ -1707,6 +1724,12 @@ WGPURenderPassEncoder wgpuCommandEncoderBeginRenderPass(WGPUCommandEncoder e, WG
         }
     }
     ri.renderArea = {{0, 0}, {width, height}};
+    if (g_area_hint.set) {
+        const std::uint32_t x = std::min(g_area_hint.x, width), y = std::min(g_area_hint.y, height);
+        const std::uint32_t w = std::min(g_area_hint.width, width - x), h = std::min(g_area_hint.height, height - y);
+        if (w && h) ri.renderArea = {{static_cast<std::int32_t>(x), static_cast<std::int32_t>(y)}, {w, h}};
+        g_area_hint.set = false;  // one pass only: a pass without a hint (the blit to the screen) keeps the whole attachment
+    }
     ri.layerCount = 1;
     ri.colorAttachmentCount = static_cast<std::uint32_t>(colors.size());
     ri.pColorAttachments = colors.data();
