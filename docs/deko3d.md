@@ -20,15 +20,16 @@ Each stage is meant to be runnable on the console on its own, so a failure says 
 
 0. **Bring-up** (done, `runtime/src/gs/gpu/deko/deko_stage0.cpp`): a device, a swap chain on the console's default window, a clear.
    No SDL, no Vulkan, no game. Proves the device opens, the window can be ours, a command list is submitted, and the compositor shows
-   the result.
+   the result. `PS2_DEKO3D_DRAW=1` adds a triangle drawn with a shader uam compiled: the whole shader path on its own.
 1. **The calls `gpu.cpp` makes**: `wgpu_deko.cpp` in the same folder, the same file-and-a-half the Vulkan shim is
    (`gpu/vk/wgpu_vk.cpp`), implementing what the hardware path actually uses — about a dozen entry points (device, queue, buffer and
    texture creation and writes, render pass, pipeline, bind groups, draw, submit, present). Until it exists, `PS2_DEKO3D` changes
    nothing about how the game is drawn.
-2. **Shaders**: `hw.wgsl` (and `blit.wgsl`) have to become DKSH, deko3d's shader container. naga (already here, for SPIR-V) turns WGSL
-   into GLSL; the console toolchain then needs **uam**, the GLSL → NVIDIA shader compiler extracted from Mesa's GLSL and nv50 back
-   ends. There is no prebuilt uam on this machine (`libnx/lib` has `libdeko3d.a` and nothing else, and no `uam` headers). Another port
-   does it by building uam from source into the app — see *Prior art* below — so this stage is a known quantity, not a research risk.
+2. **Shaders** (done for everything the renderer draws with): `hw.wgsl`, `blit.wgsl` and the bring-up triangle become deko3d shader
+   modules with `scripts/wgsl_dksh.py` — naga writes GLSL 450 per entry point, uam compiles that to the Tegra X1's shader bytecode,
+   and the script writes `runtime/src/gs/gpu/deko/dksh_table.cpp`, the counterpart of the SPIR-V table. All of it happens on the PC
+   before the build, so no compiler and no GPL code goes into the `.nro`. See *Shaders* below for the sizes, the one program that does
+   not translate, and how to run the script.
 3. **Switch the hardware path over** and drop NVK from the link; the compute renderer stays as the reference on the PC.
 4. **One command buffer a frame** with explicit barriers, instead of the per-pass submit the Vulkan shim does, and present from the
    same queue.
@@ -72,13 +73,50 @@ transform and image count, all `VK_ERROR_INITIALIZATION_FAILED`), and then prese
 
 What it does not do: draw anything from the PS2, read a texture, keep a pipeline. It is a display-path test, not a renderer.
 
-If it works, `ps2run.log` holds `[deko] device open`, `[deko] 3 back buffers of 1280x720`, `[deko] swap chain made`, five
-`[deko] N frames in ... s` lines at about 60 frames a second, and `[deko] stage 0 done`, with colours on the screen in between. If it
-fails, the last `[deko]` line names the step, and the device's own complaints are logged by the debug callback.
+`PS2_DEKO3D_DRAW=1` adds the triangle of `deko/stage_draw.wgsl` over the colour of each frame: two programs uam compiled, loaded as
+deko3d shader modules into a `DkMemBlockFlags_Code` memory block, a pipeline, a viewport, a scissor and one `dkCmdBufDraw`. It costs
+about 130 lines and proves the shader path on the console before the renderer's own 18 KB programs are involved. Its log adds
+`[deko] shader modules loaded: 1792 + 1536 bytes of code` (the space reserved for the two, code plus deko3d's unusable page part); a
+rejected module says so, with deko3d's own complaint after it.
 
 Two things the Vulkan path learned the hard way apply here as well: the display offers exactly three buffers and only mailbox and
 immediate present modes, and the window has to be ours alone. Stage 0 is run before SDL exists for that reason; once stage 1 draws the
 game, SDL's window and EGL surface have to go, not sit beside deko3d.
+
+## Shaders
+
+`scripts/wgsl_dksh.py` turns the renderer's WGSL into deko3d shader modules, entirely on the PC, before the build:
+
+```
+naga --profile core450 --entry-point hw_vs hw.wgsl hw_vs.vert     (naga-cli; the same program wgsl_spirv.py uses)
+uam hw_vs.vert -s vert -o hw_vs.dksh                            (uam, built from source: meson setup build && ninja -C build)
+```
+
+uam wants a `layout(binding = N)` on every block, sampler and image, and that number *is* the deko3d binding ID. naga writes no
+bindings, but names each global after the one it came from (`_group_0_binding_3_vs`), so the script puts the number back; a global it
+cannot name is a hard error rather than a guess. The table is checked against the three `.wgsl` files by sha256 at configure time, as
+`spirv_table.cpp` is against `gs.wgsl`, so a stale table cannot be built by accident.
+
+What it produced (2026-11-04, naga 29, uam 1.1.0):
+
+| program | stage | bytes |
+| --- | --- | --- |
+| `hw_vs` | vertex | 3 840 |
+| `hw_full_vs` | vertex | 768 |
+| `hw_fs` (dual-source blending) | fragment | 18 176 |
+| `hw_fs_single` | fragment | 18 176 |
+| `hw_load_depth` | fragment (writes `gl_FragDepth`) | 2 816 |
+| `hw_load_color` | compute (storage image) | 3 328 |
+| `blit` `vs` / `fs` | vertex / fragment | 768 / 37 376 |
+| `triangle_vs` / `triangle_fs` | vertex / fragment | 768 / 512 |
+
+`hw_writeback` is the one that does not translate: it reads VRAM back through a `textureLoad` of a *depth* texture, and naga cannot
+write that as GLSL at all ("`textureLoad` from depth textures is not supported in GLSL"). Nothing is lost that a deko3d renderer needs:
+it does not have to keep depth in a depth image to read it back, so that program becomes one reading a colour image (`R32F`), which is a
+different program rather than a translation of this one.
+
+To rebuild the table: `python scripts/wgsl_dksh.py --naga <naga> --uam <uam build/uam>`. Neither program is needed to build the
+`.nro` — only to change a shader.
 
 ## Prior art
 
@@ -87,14 +125,14 @@ game, SDL's window and EGL surface have to go, not sit beside deko3d.
 (`dk_presentation.cpp`), image transfers (`dk_texture.cpp`), render state, the UI, and a shader path (`compiler/Uam.cmake`,
 `compiler/UamBridge.cpp`, `dk_shader_source.cpp`). What it settles:
 
-- **Shaders**: uam is built from source into the app (`FetchContent` of `github.com/PalindromicBreadLoaf/uam`, pinned commit, needs
-  bison, flex and Mako at configure time). `UamCompileGlsl(glsl, stage, &size, &log)` returns a ready DKSH blob — the bridge carries
-  deko3d's own `dksh.h`/`nv_shader_header.h` writer, so nothing else has to be written for stage 2 beyond turning `hw.wgsl` into GLSL.
-- **Symbols**: uam imports a large part of Mesa (the GLSL compiler, nv50_ir), which clashes with the Mesa that NVK links statically. The
-  fix is in `Uam.cmake`: link uam's objects into one relocatable object and strip every global symbol but `UamCompileGlsl`
-  (`objcopy --keep-global-symbol=UamCompileGlsl`). Worth copying for stage 3, where NVK is still linked.
+- **How a DKSH module is loaded** (`dk_shader.cpp`, worth following exactly): the module is a control block plus a code section; the
+  code goes into a `DkMemBlockFlags_Code` block at a `DK_SHADER_CODE_ALIGNMENT` offset, `dkShaderMakerDefaults(&maker, block, offset)`
+  takes that address, and `maker.control` points at the control block, which stays in main memory.
 - **Shaders are unsigned**: DKSH goes through `dkShaderInitialize` with no signature, so this only ever runs on a console with the
   signature patches homebrew already needs. Same as any deko3d homebrew.
-- **Licences**: uam is Mesa-derived (MIT for those parts); the Dolphin-derived bridge files are GPL-2.0-or-later, and this project's
-  licence is not GPL. That has to be settled before stage 2's code is added, not after.
+- **Licences**: uam's own files are zlib (fincs), `mesa-imported/` is Mesa's MIT, and uam ships a command-line compiler — so the
+  offline path above uses no GPL code at all. NetherSX2's route (compiling uam into the app through a Dolphin-derived bridge,
+  GPL-2.0-or-later, and isolating its symbols from NVK's Mesa with `objcopy --keep-global-symbol=UamCompileGlsl`) is only needed if a
+  shader has to be compiled on the console. Ours do not: uam produces bytecode for the Tegra X1 on any x86 PC, which is also why the
+  `.nro` carries no compiler.
 
