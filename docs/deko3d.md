@@ -167,9 +167,21 @@ Two things stand between this and a first deko3d-rendered frame, and neither is 
    SDL owns the console's window otherwise. The deko3d renderer needs SDL to keep input and audio and give up video, and the present loop
    to come from deko3d. That is one change in `host/window.cpp`, and it is the same change that lets NVK leave the link.
 2. **`hw_writeback`.** The program that writes a render target back into video memory reads a depth texture, which naga cannot write as
-   GLSL, so it has no module: writebacks do nothing right now, which would leave every page of video memory the game reads afterwards
-   stale. The fix is to split it — a colour-only writeback that compiles today, and a depth one that reads a colour image (the depth
-   target kept as `R32F`) instead of a depth texture — and to have `gpu.cpp` choose per target format.
+   GLSL, so it has no module. That is not a detail: the display step reads the framebuffer *from video memory*, so without writebacks the
+   picture is whatever was in VRAM before. What is written back is a rectangle of a render target (unswizzled into VRAM), and the target
+   is either colour or depth:
+
+   - **Colour** is the common case and can be done on deko3d's own terms: the colour target is created with
+     `DkImageFlags_UsageLoadStore` as well, and a deko-specific program reads it as a *storage image* (`imageLoad`, which naga writes
+     happily) instead of sampling it. No sampler, no depth-texture fetch, no Vulkan/GLSL corner cases.
+   - **Depth** has no such route: a depth image cannot be a storage image, and a depth texture cannot be fetched in GLSL. The two
+     options are a 2D-engine copy from the depth image into an `R32F` image (needs a test — the engine's format conversion may or may
+     not handle `ZF32`), or rendering the fragment's own depth a second time into an `R32F` colour attachment (costs a write per
+     fragment, and only equals the depth buffer where the depth test passed).
+   - Both are deko-only programs in `runtime/src/gs/gpu/deko/`, so `hw.wgsl` and the Vulkan renderer keep their own writeback untouched.
+
+   Until this exists the deko build can draw but the display will show stale video memory; the first console run is worth doing anyway,
+   because everything up to the display (device, passes, pipelines, draws) is exercised by it.
 
 So `PS2_DEKO3D_RENDER=ON` still draws nothing: it boots, opens its device and stays up. It is not a playable build yet.
 
