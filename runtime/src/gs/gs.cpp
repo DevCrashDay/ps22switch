@@ -1197,12 +1197,47 @@ std::uint32_t g_present_frame = 0;
 
 std::uint32_t present_frame() { return g_present_frame; }
 
+// PS2_PRESENT_DEPTH=n (1 to 8, default 2): how many pictures the emulation thread may be ahead of the screen. Every picture of the
+// depth is one more frame the emulation can work on while the window thread records and presents the one before it, and one more
+// frame of input lag.
+std::uint32_t present_depth() {
+    static const std::uint32_t depth = [] {
+        const char *text = std::getenv("PS2_PRESENT_DEPTH");
+        const long value = text ? std::atol(text) : 0;
+        return static_cast<std::uint32_t>(value >= 1 && value <= 8 ? value : 2);
+    }();
+    return depth;
+}
+
 void post_present() {
     part::Scope mark(part::kWaitWindow);
+    // PS2_PRESENT_LOG=1: how the emulation thread's wait for the window thread splits between handing the picture over (a full ring
+    // blocks here) and waiting for the screen to be that many pictures behind. Printed once a second, from the emulation thread.
+    static const bool log = std::getenv("PS2_PRESENT_LOG") != nullptr;
+    double ring_ms = 0, depth_ms = 0;
+    const auto posted_from = std::chrono::steady_clock::now();
     const DisplayRegs regs = display_regs();
     queue::post(queue::kPresent, static_cast<std::uint32_t>(frame_count()), 0, &regs, sizeof regs);
     ++g_posted_presents;
-    for (std::uint32_t done = g_presented.load(); g_posted_presents - done > 2; done = g_presented.load()) queue::wait(g_presented, done);
+    if (log) ring_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - posted_from).count();
+    const auto wait_from = std::chrono::steady_clock::now();
+    const std::uint32_t depth = present_depth();
+    for (std::uint32_t done = g_presented.load(); g_posted_presents - done > depth; done = g_presented.load()) queue::wait(g_presented, done);
+    if (log) {
+        depth_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - wait_from).count();
+        static double ring_total = 0, depth_total = 0;
+        static std::uint32_t count = 0;
+        static auto since = std::chrono::steady_clock::now();
+        ring_total += ring_ms;
+        depth_total += depth_ms;
+        if (++count < 30) return;
+        const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - since).count();
+        std::fprintf(stderr, "[present] per second: %.0f pictures, handing over %.1f ms, waiting for the screen %.1f ms (depth %u), %.1f ms a picture\n",
+                     count / seconds, ring_total / seconds, depth_total / seconds, depth, (ring_total + depth_total) / count);
+        ring_total = depth_total = 0;
+        count = 0;
+        since = std::chrono::steady_clock::now();
+    }
 }
 
 Rendered render_pending(const std::function<void(const DisplayRegs &)> &on_present, double budget_ms) {
