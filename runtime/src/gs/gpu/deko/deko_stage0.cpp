@@ -14,9 +14,9 @@
 #include <deko3d.hpp>
 #include <switch.h>
 
+#include "deko_gpu.hpp"
 #include "dksh.hpp"
 
-#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -29,19 +29,12 @@ namespace {
 using gs::gpu::deko::DkshProgram;
 using gs::gpu::deko::DkshStage_Vert;
 using gs::gpu::deko::dksh_program;
+using gs::gpu::deko::Gpu;
+using gs::gpu::deko::Image;
+using gs::gpu::deko::Swapchain;
 
-// The console's compositor is given three back buffers, as the swap chains that work on it have.
-constexpr std::uint32_t kBuffers = 3;
-// One frame of this test is three commands: this is room for thousands of them, and the GPU reads them from here.
-constexpr std::uint32_t kCmdBytes = 0x10000;
 // A deko3d shader module starts with this: DkshHeader { magic, header_sz, control_sz, code_sz, programs_off, num_programs }.
 constexpr std::uint32_t kDkshMagic = 0x48534B44;
-
-// Where deko3d reports an error it hit (a bad command, an out of memory, a rejected object): on the console the only place to put it is
-// the log, which is ps2run.log in the .nro's folder.
-void log_device_error(void *, const char *context, DkResult result, const char *message) {
-    std::fprintf(stderr, "[deko] device says: %s: %s (%d)\n", context && *context ? context : "error", message && *message ? message : "", int(result));
-}
 
 // PS2_DEKO3D=1 means the default number of frames; PS2_DEKO3D=<n> with n > 1 means n frames, so a run can be made as short or as long
 // as the person watching it wants.
@@ -187,98 +180,44 @@ int deko_stage0(std::uint32_t asked) {
     }
     std::fprintf(stderr, "[deko] window %ux%u\n", unsigned(width), unsigned(height));
 
-    // The device: deko3d's handle on the GPU. Everything else is created from it.
-    dk::UniqueDevice device = dk::DeviceMaker{}.setCbDebug(log_device_error).create();
-    if (!device) {
-        std::fprintf(stderr, "[deko] the device did not open\n");
-        return 1;
-    }
+    // The device, the queue and the command list: deko_gpu.cpp, the layer the WebGPU shim (wgpu_deko.cpp) will stand on.
+    Gpu gpu;
+    if (!gpu.open()) return 1;
     std::fprintf(stderr, "[deko] device open\n");
 
-    // One queue, graphics only: the commands of every frame go through it.
-    dk::UniqueQueue queue = dk::QueueMaker{device}.setFlags(DkQueueFlags_Graphics)
-                                .setCommandMemorySize(512 * 1024).setFlushThreshold(64 * 1024).create();
-    if (!queue) {
-        std::fprintf(stderr, "[deko] the queue did not come up\n");
-        return 1;
-    }
-
-    // Where the command lists are built (the CPU writes them, the GPU reads them afterwards).
-    dk::UniqueMemBlock command_memory = dk::MemBlockMaker{device, kCmdBytes}
-                                            .setFlags(DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached).create();
-    dk::UniqueCmdBuf commands = dk::CmdBufMaker{device}.create();
-    if (!command_memory || !commands) {
-        std::fprintf(stderr, "[deko] no command memory\n");
-        return 1;
-    }
-    dkCmdBufAddMemory(commands, command_memory, 0, kCmdBytes);
-
-    // The back buffers the compositor presents from: they have to be render targets and presentable images at once.
-    std::array<dk::Image, kBuffers> images;
-    std::array<dk::UniqueMemBlock, kBuffers> image_memory;
-    std::array<DkImageView, kBuffers> views;
-    for (std::uint32_t i = 0; i < kBuffers; ++i) {
-        dk::ImageLayout layout;
-        dk::ImageLayoutMaker{device}.setFlags(DkImageFlags_UsageRender | DkImageFlags_UsagePresent)
-            .setFormat(DkImageFormat_RGBA8_Unorm).setDimensions(width, height).setMipLevels(1).initialize(layout);
-        // a memory block is a multiple of the GPU's page size
-        const std::uint64_t bytes = (std::uint64_t(layout.getSize()) + DK_MEMBLOCK_ALIGNMENT - 1) & ~std::uint64_t(DK_MEMBLOCK_ALIGNMENT - 1);
-        image_memory[i] = dk::MemBlockMaker{device, static_cast<std::uint32_t>(bytes)}
-                              .setFlags(DkMemBlockFlags_GpuCached | DkMemBlockFlags_Image).create();
-        if (!image_memory[i]) {
-            std::fprintf(stderr, "[deko] back buffer %u has no memory (%llu bytes)\n", i, static_cast<unsigned long long>(bytes));
-            return 1;
-        }
-        images[i].initialize(layout, image_memory[i], 0);
-        views[i] = dk::ImageView{images[i]};
-    }
-    std::fprintf(stderr, "[deko] %u back buffers of %ux%u\n", kBuffers, unsigned(width), unsigned(height));
-
-    // The swap chain: the handle the compositor presents through, made of those back buffers on that window.
-    std::array<const DkImage *, kBuffers> presentable{};
-    for (std::uint32_t i = 0; i < kBuffers; ++i) presentable[i] = &images[i];
-    dk::UniqueSwapchain swapchain = dk::SwapchainMaker{device, window, presentable}.create();
-    if (!swapchain) {
+    // Three back buffers on the console's own window: render targets and presentable images, acquired one frame at a time.
+    Swapchain swap_chain;
+    if (!swap_chain.create(gpu, window, width, height)) {
         std::fprintf(stderr, "[deko] no swap chain on the default window (the window is taken by something else, or %ux%u is not a size"
                              " it accepts)\n", unsigned(width), unsigned(height));
         return 1;
     }
-    std::fprintf(stderr, "[deko] swap chain made\n");
+    std::fprintf(stderr, "[deko] 3 back buffers of %ux%u, swap chain made\n", unsigned(width), unsigned(height));
 
     // PS2_DEKO3D_DRAW=1: the triangle, which needs the shader path (module, pipeline, viewport, draw) and not the game
     TestDraw draw;
-    if (draw_wanted() && !prepare_draw(device, draw)) return 1;
+    if (draw_wanted() && !prepare_draw(gpu.device(), draw)) return 1;
 
     const auto started = std::chrono::steady_clock::now();
     std::uint32_t presented = 0;
-    DkFence finished{};  // the GPU signals it at the end of each frame, so the next frame may write the commands again
 
     for (std::uint32_t frame = 0; frame < frames; ++frame) {
-        if (frame) {
-            const DkResult waited = dkFenceWait(&finished, 1000000000LL);  // a second
-            if (waited != DkResult_Success) {
-                std::fprintf(stderr, "[deko] frame %u: the GPU did not finish the frame before it (%d)\n", frame, int(waited));
-                return 1;
-            }
-        }
-        // Blocks until a back buffer is free: this is where the console's refresh rate shows up.
-        const int slot = dkQueueAcquireImage(queue, swapchain);
-        if (slot < 0 || slot >= static_cast<int>(kBuffers)) {
-            std::fprintf(stderr, "[deko] frame %u: no back buffer came back (%d)\n", frame, slot);
+        // Blocks until the compositor frees a back buffer: this is where the console's refresh rate shows itself.
+        const std::shared_ptr<Image> target = swap_chain.acquire();
+        if (!target) {
+            std::fprintf(stderr, "[deko] frame %u: no back buffer\n", frame);
             return 1;
         }
         float red = 0.0f, green = 0.0f, blue = 0.0f;
         frame_colour(frame, red, green, blue);
-        dkCmdBufClear(commands);  // the last frame's commands are free to be overwritten (the fence above said so)
-        dkCmdBufBindRenderTarget(commands, &views[slot], nullptr);
+        DkCmdBuf commands = gpu.begin();  // waits for the frame before, which frees the command memory
+        dkCmdBufBindRenderTarget(commands, &target->view, nullptr);
         dkCmdBufClearColorFloat(commands, 0, DkColorMask_RGBA, red, green, blue, 1.0f);
-        if (draw.ready) draw_triangle(commands, views[slot], width, height, draw);
+        if (draw.ready) draw_triangle(commands, target->view, width, height, draw);
         // the frame has to be in memory before the display engine reads the image: the strongest ordering there is, once a frame
         dkCmdBufBarrier(commands, DkBarrier_Full, 0);
-        dkCmdBufSignalFence(commands, &finished, true);
-        dkQueueSubmitCommands(queue, dkCmdBufFinishList(commands));
-        dkQueueFlush(queue);
-        dkQueuePresentImage(queue, swapchain, slot);
+        gpu.submit(false);
+        swap_chain.present();
         ++presented;
         if (frame % 60 == 59) {
             const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
@@ -286,7 +225,7 @@ int deko_stage0(std::uint32_t asked) {
         }
     }
 
-    dkQueueWaitIdle(queue);
+    gpu.wait();
     const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
     std::fprintf(stderr, "[deko] stage 0 done: %u frames presented in %.0f ms (%.1f frames a second)\n", presented, seconds * 1000.0,
                  seconds > 0.0 ? presented / seconds : 0.0);
