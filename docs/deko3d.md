@@ -80,8 +80,20 @@ about 130 lines and proves the shader path on the console before the renderer's 
 Measured (2026-11-04 22:51, same clocks): `[deko] shader modules loaded: 1536 + 1280 bytes of code` — the space reserved for each
 module, which is its code section plus the part of a page deko3d cannot use, on a `DK_SHADER_CODE_ALIGNMENT` boundary; the module
 files themselves are 768 and 512 bytes, the rest of which is the control block that stays in main memory. deko3d accepted both modules
-(no complaint from the device), and the loop still ran 300 frames in 4963 ms, 60.4 a second: a draw in the frame costs the present
-path nothing measurable.
+(no complaint from the device) and the loop ran 300 frames in 4963 ms, 60.4 a second.
+
+**Nothing was drawn in that run**, and neither deko3d nor the shader compiler said a word about it. Two causes, both now fixed, both
+worth knowing before stage 1:
+
+- naga's GLSL writer adjusts the vertex position for *Vulkan* unless told not to: it negates `gl_Position.y` and rewrites `z` as
+  `z * 2 - w`, to move WebGPU's 0..1 depth into Vulkan's -1..1. deko3d's depth is 0..1, so every vertex landed at z = -1, behind the
+  near plane, and the triangle was clipped away. `scripts/wgsl_dksh.py` now passes `--keep-coordinate-space`; the Y axis is the
+  device's business (`DkDeviceFlags_OriginLowerLeft`), not the shader's.
+- deko3d's defaults are not "draw everything": `dkRasterizerStateDefaults` culls back faces, and `dkDepthStencilStateDefaults` turns the
+  depth test *and* depth writes on. A one-winding triangle with no depth target can disappear into either. The test now culls nothing
+  and has depth off; the renderer's own draws must map the PS2's winding and depth state onto these two deliberately.
+
+The frame rate was unaffected by either, which is the other lesson: a draw that produces nothing costs as much as one that draws.
 
 Two things the Vulkan path learned the hard way apply here as well: the display offers exactly three buffers and only mailbox and
 immediate present modes, and the window has to be ours alone. Stage 0 is run before SDL exists for that reason; once stage 1 draws the

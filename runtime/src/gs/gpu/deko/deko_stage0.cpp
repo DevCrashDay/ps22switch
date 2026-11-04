@@ -116,15 +116,19 @@ bool prepare_draw(dk::Device device, TestDraw &draw) {
     return true;
 }
 
-// Everything the triangle needs bound: the shaders, the state (all default: no blending, no depth test, no culling), and the viewport
-// and scissor, which say which part of the image it covers.
+// Everything the triangle needs bound: the shaders, the state, and the viewport and scissor, which say which part of the image it
+// covers. The two state values that are not deko3d's defaults are the ones that silently draw nothing: deko3d culls back faces and has
+// the depth test on by default, and this triangle is one winding order with no depth target bound.
 void draw_triangle(DkCmdBuf cmd, const DkImageView &target, std::uint32_t width, std::uint32_t height, const TestDraw &draw) {
-    dk::RasterizerState rasterizer;
+    dk::RasterizerState rasterizer;  // fill, no culling (the default culls back faces, and a device whose window origin is the top
+    rasterizer.setCullMode(DkFace_None);  // left sees this triangle's winding the other way round)
     dk::MultisampleState multisample;
     dk::ColorState color;
     dk::ColorWriteState color_write;
     dk::BlendState blend;
-    dk::DepthStencilState depth;
+    dk::DepthStencilState depth;  // no depth test, no depth write (the default has both on, and there is no depth target here)
+    depth.setDepthTestEnable(false);
+    depth.setDepthWriteEnable(false);
     DkViewport viewport{0.0f, 0.0f, static_cast<float>(width), static_cast<float>(height), 0.0f, 1.0f};
     DkScissor scissor{0, 0, width, height};
     const DkShader *shaders[] = {&draw.vertex, &draw.fragment};

@@ -14,6 +14,11 @@ uam wants every uniform block, storage block, sampler and image to say its bindi
 the deko3d binding ID. naga does not write bindings, but it does name each block after the binding it came from
 (`_group_0_binding_3_vs`), so this script puts the number back. deko3d allows 16 UBOs, 16 SSBOs, 32 samplers and 8 images per stage,
 which is what the WebGPU bindings of these shaders already fit into.
+
+naga is told `--keep-coordinate-space`. Without it, its GLSL writer adds the adjustment a *Vulkan* driver needs — it negates
+gl_Position.y and rewrites z as `z * 2 - w`, so that WebGPU's 0..1 depth lands in Vulkan's -1..1. deko3d's depth is 0..1 like WebGPU's,
+so that rewrite puts every vertex behind the near plane and nothing is drawn, with no error from anywhere: the first console run of the
+triangle showed exactly that. The Y axis is the device's business instead (`DkDeviceFlags_OriginLowerLeft`), not the shader's.
 """
 
 import argparse
@@ -97,7 +102,7 @@ def compile_program(naga, uam, wgsl_path: Path, wgsl_text: str, entry: str, stag
     ext, uam_stage = STAGES[stage]
     glsl = Path(tmp) / f"{entry}.{ext}"
     dksh = Path(tmp) / f"{entry}.dksh"
-    r = subprocess.run([naga, "--profile", "core450", "--entry-point", entry, str(wgsl_path), str(glsl)],
+    r = subprocess.run([naga, "--profile", "core450", "--keep-coordinate-space", "--entry-point", entry, str(wgsl_path), str(glsl)],
                        capture_output=True, text=True)
     if r.returncode != 0 or not glsl.is_file():
         sys.exit(f"naga failed on {wgsl_path.name}:{entry}:\n{r.stdout}{r.stderr}")
