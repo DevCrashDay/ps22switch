@@ -1883,10 +1883,15 @@ struct WGPUSurfaceImpl {
     std::vector<VkImage> images;
     std::uint32_t index = 0;
     bool acquired = false;
+    std::vector<VkSurfaceFormatKHR> offered;  // what the display's surface really offers, from GetCapabilities
 };
 
 #ifdef __SWITCH__
 // Made again after a resize or VK_ERROR_OUT_OF_DATE_KHR: the old one is kept until the new one exists, then destroyed.
+//
+// The display's surface is a VK_NN_vi_surface and NVK is strict about what it takes: the first console run failed with
+// VK_ERROR_INITIALIZATION_FAILED for a format/transform/composite combination the surface did not really offer, so this walks the
+// combinations it says it has and logs the one that worked instead of guessing once.
 static bool surface_make_swapchain(WGPUSurface s) {
     WGPUDevice d = s->device;
     if (!d) return false;
@@ -1897,52 +1902,98 @@ static bool surface_make_swapchain(WGPUSurface s) {
         extent.width = std::clamp(s->width, caps.minImageExtent.width, caps.maxImageExtent.width);
         extent.height = std::clamp(s->height, caps.minImageExtent.height, caps.maxImageExtent.height);
     }
+    std::uint32_t nf = 0;
+    vkGetPhysicalDeviceSurfaceFormatsKHR(d->adapter->phys, s->surface, &nf, nullptr);
+    std::vector<VkSurfaceFormatKHR> formats(nf);
+    if (nf) vkGetPhysicalDeviceSurfaceFormatsKHR(d->adapter->phys, s->surface, &nf, formats.data());
+    std::uint32_t nm = 0;
+    vkGetPhysicalDeviceSurfacePresentModesKHR(d->adapter->phys, s->surface, &nm, nullptr);
+    std::vector<VkPresentModeKHR> modes(nm);
+    if (nm) vkGetPhysicalDeviceSurfacePresentModesKHR(d->adapter->phys, s->surface, &nm, modes.data());
+    std::string offered;
+    for (const VkSurfaceFormatKHR &f : formats) offered += std::string(offered.empty() ? "" : ", ") + std::to_string(static_cast<int>(f.format)) + "/" + std::to_string(static_cast<int>(f.colorSpace));
+    std::string mode_names;
+    for (VkPresentModeKHR m : modes) mode_names += std::string(mode_names.empty() ? "" : ", ") + std::to_string(static_cast<int>(m));
+    std::fprintf(stderr, "[present] surface: %ux%u, images %u..%u, alpha 0x%x, transform %d (of 0x%x), usage 0x%x, formats [%s], modes [%s]\n", extent.width,
+                 extent.height, caps.minImageCount, caps.maxImageCount, caps.supportedCompositeAlpha, static_cast<int>(caps.currentTransform),
+                 caps.supportedTransforms, caps.supportedUsageFlags, offered.c_str(), mode_names.c_str());
     const std::uint32_t count = std::clamp<std::uint32_t>(3, caps.minImageCount, caps.maxImageCount ? caps.maxImageCount : 3);
-    VkSwapchainCreateInfoKHR ci{VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
-    ci.surface = s->surface;
-    ci.minImageCount = count;
-    ci.imageFormat = s->format;
-    ci.imageColorSpace = s->space;
-    ci.imageExtent = extent;
-    ci.imageArrayLayers = 1;
-    ci.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
-    ci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    ci.preTransform = caps.currentTransform;
-    // libnx's display surface does not take every compositing mode; ask for one it says it supports (opaque first: the picture has no
-    // alpha to show the console's own screen through).
-    ci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
-    for (const VkCompositeAlphaFlagBitsKHR mode : {VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR, VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR,
-                                                   VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR, VK_COMPOSITE_ALPHA_POST_MULTIPLIED_BIT_KHR})
-        if (caps.supportedCompositeAlpha & mode) {
-            ci.compositeAlpha = mode;
-            break;
+    // everything the surface says it can do, in the order we would like: the format gpu.cpp picked first, then the others it offered
+    std::vector<VkSurfaceFormatKHR> want;
+    for (const VkSurfaceFormatKHR &f : formats)
+        if (f.format == s->format) want.push_back(f);
+    for (const VkSurfaceFormatKHR &f : formats) want.push_back(f);
+    if (want.empty()) want.push_back({s->format, s->space});
+    VkCompositeAlphaFlagBitsKHR alphas[4];
+    std::size_t alpha_count = 0;
+    for (const VkCompositeAlphaFlagBitsKHR a : {VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR, VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR, VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR,
+                                                VK_COMPOSITE_ALPHA_POST_MULTIPLIED_BIT_KHR})
+        if (caps.supportedCompositeAlpha & a) alphas[alpha_count++] = a;
+    if (!alpha_count) alphas[alpha_count++] = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+    VkSurfaceTransformFlagBitsKHR transforms[2] = {caps.currentTransform, VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR};
+    VkPresentModeKHR wanted_modes[3] = {s->mode, VK_PRESENT_MODE_FIFO_KHR, VK_PRESENT_MODE_IMMEDIATE_KHR};
+    int attempts = 0, failures[8] = {};
+    int failure_count = 0;
+    for (const VkSurfaceTransformFlagBitsKHR transform : transforms) {
+        if (!(caps.supportedTransforms & transform)) continue;
+        for (const VkSurfaceFormatKHR &f : want) {
+            if (attempts > 40) break;
+            for (std::size_t a = 0; a < alpha_count; ++a) {
+                for (const VkPresentModeKHR mode : wanted_modes) {
+                    bool supported = false;
+                    for (VkPresentModeKHR m : modes) supported |= m == mode;
+                    if (!supported) continue;
+                    VkSwapchainCreateInfoKHR ci{VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
+                    ci.surface = s->surface;
+                    ci.minImageCount = count;
+                    ci.imageFormat = f.format;
+                    ci.imageColorSpace = f.colorSpace;
+                    ci.imageExtent = extent;
+                    ci.imageArrayLayers = 1;
+                    ci.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+                    ci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
+                    ci.preTransform = transform;
+                    ci.compositeAlpha = alphas[a];
+                    ci.presentMode = mode;
+                    ci.clipped = VK_TRUE;
+                    ci.oldSwapchain = s->swapchain;
+                    VkSwapchainKHR fresh = VK_NULL_HANDLE;
+                    ++attempts;
+                    const VkResult r = vkCreateSwapchainKHR(d->device, &ci, nullptr, &fresh);
+                    if (r != VK_SUCCESS) {
+                        if (failure_count < 8) failures[failure_count++] = static_cast<int>(r);
+                        continue;
+                    }
+                    if (s->swapchain) vkDestroySwapchainKHR(d->device, s->swapchain, nullptr);
+                    s->swapchain = fresh;
+                    s->format = f.format;
+                    s->space = f.colorSpace;
+                    s->mode = mode;
+                    std::uint32_t n = 0;
+                    vkGetSwapchainImagesKHR(d->device, s->swapchain, &n, nullptr);
+                    s->images.resize(n);
+                    if (n) vkGetSwapchainImagesKHR(d->device, s->swapchain, &n, s->images.data());
+                    s->width = extent.width;
+                    s->height = extent.height;
+                    s->acquired = false;
+                    VkSemaphoreCreateInfo si{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+                    if (!d->present_signal) vkCreateSemaphore(d->device, &si, nullptr, &d->present_signal);
+                    if (!d->present_wait) vkCreateSemaphore(d->device, &si, nullptr, &d->present_wait);
+                    std::fprintf(stderr, "[present] swap chain: %ux%u, %u images, format %d, mode %d, transform %d, alpha 0x%x (after %d tries)\n", extent.width,
+                                 extent.height, n, static_cast<int>(f.format), static_cast<int>(mode), static_cast<int>(transform), alphas[a], attempts);
+                    return true;
+                }
+            }
         }
-    ci.presentMode = s->mode;
-    ci.clipped = VK_TRUE;
-    ci.oldSwapchain = s->swapchain;
-    std::fprintf(stderr, "[present] surface: %ux%u, images %u..%u, composite alpha 0x%x, transform %d, usage 0x%x\n", extent.width, extent.height,
-                 caps.minImageCount, caps.maxImageCount, caps.supportedCompositeAlpha, static_cast<int>(caps.currentTransform), caps.supportedUsageFlags);
-    VkSwapchainKHR fresh = VK_NULL_HANDLE;
-    if (VkResult r = vkCreateSwapchainKHR(d->device, &ci, nullptr, &fresh); r != VK_SUCCESS) {
-        log_vk("vkCreateSwapchainKHR", r);
-        return false;
     }
-    if (s->swapchain) vkDestroySwapchainKHR(d->device, s->swapchain, nullptr);
-    s->swapchain = fresh;
-    std::uint32_t n = 0;
-    vkGetSwapchainImagesKHR(d->device, s->swapchain, &n, nullptr);
-    s->images.resize(n);
-    if (n) vkGetSwapchainImagesKHR(d->device, s->swapchain, &n, s->images.data());
-    s->width = extent.width;
-    s->height = extent.height;
-    s->acquired = false;
-    VkSemaphoreCreateInfo si{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
-    if (!d->present_signal) vkCreateSemaphore(d->device, &si, nullptr, &d->present_signal);
-    if (!d->present_wait) vkCreateSemaphore(d->device, &si, nullptr, &d->present_wait);
-    std::fprintf(stderr, "[present] swap chain: %ux%u, %u images, %s\n", extent.width, extent.height, n,
-                 s->mode == VK_PRESENT_MODE_MAILBOX_KHR ? "mailbox" : s->mode == VK_PRESENT_MODE_IMMEDIATE_KHR ? "immediate" : "fifo");
-    return true;
+    std::fprintf(stderr, "[present] no swap chain: %d combinations tried, results", attempts);
+    for (int i = 0; i < failure_count; ++i) std::fprintf(stderr, " %d", failures[i]);
+    std::fprintf(stderr, "\n");
+    return false;
 }
+
+// gpu.cpp asks after wgpuSurfaceConfigure whether presenting can work at all: a surface without a swap chain would mean a black screen.
+extern "C" bool wgpuSurfaceHasSwapchain(WGPUSurface s) { return s && s->swapchain; }
 #endif
 
 // gpu.cpp's own call (not WebGPU): a surface on the Switch's display, from libnx's default nwindow.
@@ -1994,28 +2045,40 @@ WGPUStatus wgpuSurfaceGetCapabilities(WGPUSurface s, WGPUAdapter adapter, WGPUSu
     vkGetPhysicalDeviceSurfaceFormatsKHR(adapter->phys, s->surface, &n, nullptr);
     std::vector<VkSurfaceFormatKHR> formats(n);
     if (n) vkGetPhysicalDeviceSurfaceFormatsKHR(adapter->phys, s->surface, &n, formats.data());
-    for (const VkSurfaceFormatKHR &f : formats)
-        if ((f.format == VK_FORMAT_R8G8B8A8_UNORM || f.format == VK_FORMAT_B8G8R8A8_UNORM) && f.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) {
-            s->format = f.format;
-            s->space = f.colorSpace;
-            break;
-        }
+    s->offered = formats;
+    // The blit can only write 8-bit RGBA in either byte order, so offer those the surface really has, unorm first (srgb is a different
+    // VkFormat and the pipeline has to be built for exactly the one the swap chain uses).
+    std::vector<WGPUTextureFormat> mappable;
+    for (const VkFormat f : {VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_B8G8R8A8_UNORM, VK_FORMAT_R8G8B8A8_SRGB, VK_FORMAT_B8G8R8A8_SRGB})
+        for (const VkSurfaceFormatKHR &o : formats)
+            if (o.format == f && o.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) {
+                mappable.push_back(f == VK_FORMAT_R8G8B8A8_UNORM   ? WGPUTextureFormat_RGBA8Unorm
+                                   : f == VK_FORMAT_B8G8R8A8_UNORM ? WGPUTextureFormat_BGRA8Unorm
+                                   : f == VK_FORMAT_R8G8B8A8_SRGB  ? WGPUTextureFormat_RGBA8UnormSrgb
+                                                                   : WGPUTextureFormat_BGRA8UnormSrgb);
+                if (mappable.size() == 1) {  // the format the swap chain will use unless gpu.cpp asks for another one it was offered
+                    s->format = f;
+                    s->space = o.colorSpace;
+                }
+            }
+    if (mappable.empty()) {  // the display is not 8-bit RGBA at all: nothing this renderer can blit into
+        std::fprintf(stderr, "[present] the surface offers no 8-bit RGBA format: showing the picture through SDL\n");
+        return WGPUStatus_Error;
+    }
     std::uint32_t m = 0;
     vkGetPhysicalDeviceSurfacePresentModesKHR(adapter->phys, s->surface, &m, nullptr);
     std::vector<VkPresentModeKHR> modes(m);
     if (m) vkGetPhysicalDeviceSurfacePresentModesKHR(adapter->phys, s->surface, &m, modes.data());
-    // gpu.cpp asks for the format it can blit into and for a present mode; it picks fifo unless immediate or mailbox is offered. Only fifo
-    // is offered here: the display's surface locks the picture to the screen's refresh, which is what a 60 Hz game wants anyway (a drop
-    // to 30 is then even, not tearing), and vkCreateSwapchainKHR accepts it everywhere.
-    auto *format_list = static_cast<WGPUTextureFormat *>(std::malloc(sizeof(WGPUTextureFormat) * 2));
-    format_list[0] = s->format == VK_FORMAT_R8G8B8A8_UNORM ? WGPUTextureFormat_RGBA8Unorm : WGPUTextureFormat_BGRA8Unorm;
-    format_list[1] = s->format == VK_FORMAT_R8G8B8A8_UNORM ? WGPUTextureFormat_BGRA8Unorm : WGPUTextureFormat_RGBA8Unorm;
+    // gpu.cpp picks the first format it likes and fifo unless immediate or mailbox is offered. Only fifo is offered here: the display
+    // locks the picture to the screen's refresh, which a 60 Hz game wants anyway (a drop to 30 is then even, not tearing).
+    auto *format_list = static_cast<WGPUTextureFormat *>(std::malloc(sizeof(WGPUTextureFormat) * mappable.size()));
+    for (std::size_t i = 0; i < mappable.size(); ++i) format_list[i] = mappable[i];
     auto *present_modes = static_cast<WGPUPresentMode *>(std::malloc(sizeof(WGPUPresentMode)));
     present_modes[0] = WGPUPresentMode_Fifo;
     auto *alpha = static_cast<WGPUCompositeAlphaMode *>(std::malloc(sizeof(WGPUCompositeAlphaMode)));
     alpha[0] = WGPUCompositeAlphaMode_Auto;
     caps->usages = WGPUTextureUsage_RenderAttachment;
-    caps->formatCount = 2;
+    caps->formatCount = mappable.size();
     caps->formats = format_list;
     caps->presentModeCount = 1;
     caps->presentModes = present_modes;
@@ -2038,9 +2101,18 @@ void wgpuSurfaceCapabilitiesFreeMembers(WGPUSurfaceCapabilities caps) {
 
 void wgpuSurfaceConfigure(WGPUSurface s, WGPUSurfaceConfiguration const *config) {
     if (!s || !s->surface || !config || !config->device) return;
-    s->device = config->device;
-    const VkFormat format = vk_format(config->format);
-    if (format != VK_FORMAT_UNDEFINED) s->format = format;
+    // pick the format the surface really offers: the blit pipeline is built for what GetCapabilities reported, and the swap chain must
+    // use the same one, or the render pass and the pipeline disagree
+    const VkFormat want = vk_format(config->format);
+    bool offered = false;
+    for (const VkSurfaceFormatKHR &f : s->offered) offered |= f.format == want;
+    if (offered) {
+        s->format = want;
+        for (const VkSurfaceFormatKHR &f : s->offered)
+            if (f.format == want) s->space = f.colorSpace;
+    } else {
+        std::fprintf(stderr, "[present] the surface does not offer format %d; using what it offered instead\n", static_cast<int>(want));
+    }
     s->width = config->width;
     s->height = config->height;
     s->mode = config->presentMode == WGPUPresentMode_Immediate    ? VK_PRESENT_MODE_IMMEDIATE_KHR

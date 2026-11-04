@@ -17,6 +17,8 @@ extern "C" void wgpuRenderPassSetAreaHint(std::uint32_t x, std::uint32_t y, std:
 #if defined(__SWITCH__) && defined(PS2_VULKAN)
 // This shim's own call (vk/wgpu_vk.cpp): a surface on the display itself, for presenting with Vulkan instead of through SDL.
 extern "C" WGPUSurface wgpuCreateViSurface(WGPUInstance instance, void *window);
+// Whether presenting can work at all: a surface whose swap chain could not be made would leave the screen black.
+extern "C" bool wgpuSurfaceHasSwapchain(WGPUSurface surface);
 #endif
 
 #include <algorithm>
@@ -3093,6 +3095,17 @@ bool attach_surface(const SurfaceTarget &target) {
     g_surface_width = target.width;
     g_surface_height = target.height;
     configure_surface();
+#if defined(__SWITCH__) && defined(PS2_VULKAN)
+    // A surface whose swap chain could not be made presents nothing at all, and the SDL path has already been given up by then: the
+    // first console run of PS2_VK_PRESENT=1 ended in a black screen exactly that way. Give the surface up instead, so the window code
+    // keeps showing the picture through SDL.
+    if (target.kind == SurfaceTarget::Vi && !wgpuSurfaceHasSwapchain(g_surface)) {
+        std::fprintf(stderr, "[gpu] the display's swap chain could not be made: showing the picture through SDL instead\n");
+        wgpuSurfaceRelease(g_surface);
+        g_surface = nullptr;
+        return false;
+    }
+#endif
 
     WGPUShaderSourceWGSL source = WGPU_SHADER_SOURCE_WGSL_INIT;
     source.code = view(kBlitShader);
