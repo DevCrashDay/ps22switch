@@ -1419,7 +1419,12 @@ void wgpuComputePassEncoderSetBindGroup(WGPUComputePassEncoder p, std::uint32_t 
 void wgpuComputePassEncoderDispatchWorkgroups(WGPUComputePassEncoder p, std::uint32_t x, std::uint32_t y, std::uint32_t z) {
     if (!x || !y || !z) return;
     vkCmdDispatch(p->encoder->cmd, x, y, z);
-    dispatch_barrier(p->encoder->cmd);  // WebGPU: each dispatch sees what the one before it wrote
+    // WebGPU: each dispatch sees what the one before it wrote. The hardware path's "decode" dispatches are the exception: they only
+    // read video memory and write disjoint ranges of the decoded-texture buffer, which no other decode reads, and the render pass that
+    // consumes them opens with a full barrier (wgpuCommandEncoderBeginRenderPass). Skipping their barriers is worth ~55 barriers a
+    // fight frame on the console (handoff/RENDER_ENGINE_PERFORMANCE.md). Any new pipeline that reads g_decoded must not be named here.
+    if (std::strcmp(p->name, "decode") != 0)
+        dispatch_barrier(p->encoder->cmd);
     time_after(p->encoder->device, p->encoder->cmd, p->name);
 }
 
@@ -2101,6 +2106,7 @@ void wgpuSurfaceCapabilitiesFreeMembers(WGPUSurfaceCapabilities caps) {
 
 void wgpuSurfaceConfigure(WGPUSurface s, WGPUSurfaceConfiguration const *config) {
     if (!s || !s->surface || !config || !config->device) return;
+    s->device = config->device;  // the swap chain is made on it - without this the surface is configured and nothing happens
     // pick the format the surface really offers: the blit pipeline is built for what GetCapabilities reported, and the swap chain must
     // use the same one, or the render pass and the pipeline disagree
     const VkFormat want = vk_format(config->format);
