@@ -123,6 +123,33 @@ After the fix the same profile says the drawing thread's own work is now: `gpu::
 4.3 %, `gs::kick` 4.0 %, the queue ring 4.2 %, `emit_pre` 1.5 %, `flush_batch` 0.7 %. `submit()` - the driver calls themselves - is
 93.6 ms/s, so on the Switch, where every driver call is several times dearer, that is the part to watch next.
 
+## The repeatable run, and the baseline everything is measured against (2026-11-04)
+
+Every verdict in this file until now came from the per-second `[waits]` lines of a session the player drove, and one session went
+57, 58, 60, 45, 40, 29, 25, 22 fps inside itself. Twice that made a change look like a regression or a win when it was the scene
+moving. `build/switch/tests/Z-diagnose/launch-bench.txt` fixes that: it plays the same pad script the PC benchmark plays (boot,
+menus, into a Story Battle fight, then attacks), and stops the game after **2 600 frames**, so every run does the same work and
+`scripts/frame_stats.py frames.csv` turns the per-frame log into one number.
+
+Baseline, build `B0135D90` (render area as the batch box, picture depth 3, two submissions a frame):
+
+| Frames | Scene | Frame time (mean / median / p95) | Frame rate | Shapes a frame |
+|---|---|---|---|---|
+| 0-1 200 | boot and menus | 16.7-20 ms | 48-60 fps | 270-560 |
+| 1 400-1 600 | into the fight | 30.8 ms | 32.4 fps | 10 143 |
+| **1 600-1 900** | **heavy fight** | **47.9 / 48.5 / 52.3 ms** | **20.9 fps** | **18 774** |
+| **2 100-2 500** | **fight, steady** | **33.1 / 33.3 / 36.4 ms** | **30.2 fps** | **12 299** |
+
+The last column is what makes two runs comparable: if a run drew a different number of shapes, the frame rates are not comparable
+and the comparison is worthless. (This also corrects the project's "fights run at 22-27 fps": a fight is 21 fps when it is heavy and
+30 fps when it is not.)
+
+Where the time goes in the steady window, from the same run: GPU busy 546 ms/s (19.5 ms a frame), drawing thread 598 ms/s
+(21.3 ms, of which 124 ms/s = 4.4 ms is the SDL present), `CPU waited` 0, submissions in flight 3, idle in the drawing thread
+371 ms/s; the emulation thread is 58-67 % game code and 14-17 % waiting for the window thread. So the frame is 33 ms and the two
+threads that share it account for about 21 ms each - they are still taking turns rather than overlapping, and in the heavy window
+the emulation thread waits 14 ms of its 48 ms frame for the window thread.
+
 ## Approaches, roughly in order of expected gain per day of work
 
 1. **Texture cache** (GPU, large). The pixel shader decodes every texel from PS2 memory: the swizzle table, the word, the CLUT, four
