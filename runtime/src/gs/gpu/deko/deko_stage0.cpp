@@ -104,7 +104,7 @@ bool prepare_draw(dk::Device device, TestDraw &draw) {
         std::fprintf(stderr, "[deko] the triangle's programs are not in this build (scripts/wgsl_dksh.py)\n");
         return false;
     }
-    draw.code = dk::MemBlockMaker{device, vertex_size + fragment_size}
+    draw.code = dk::MemBlockMaker{device, (vertex_size + fragment_size + DK_MEMBLOCK_ALIGNMENT - 1) & ~(DK_MEMBLOCK_ALIGNMENT - 1)}
                     .setFlags(DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached | DkMemBlockFlags_Code).create();
     if (!draw.code) {
         std::fprintf(stderr, "[deko] no memory for the shader code (%u bytes)\n", vertex_size + fragment_size);
