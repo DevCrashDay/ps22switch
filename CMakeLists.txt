@@ -197,6 +197,11 @@ if(PS2_VULKAN AND NOT EMSCRIPTEN)
                 list(APPEND _nvk_libs ${lib})
             endif()
         endforeach()
+        if(PS2_DEKO3D_RENDER)
+            # Nothing of ours goes through Vulkan here, but NVK stays linked for now: devkitPro's SDL2 pulls Mesa's zink (through the NVK
+            # SDK's libEGL.a) and zink needs the NVK symbols. Dropping them means the window layer stops using SDL's renderer, which is
+            # the job of the stage that takes the display over (docs/deko3d.md).
+        endif()
         target_link_libraries(ps2runtime PUBLIC -Wl,--start-group ${_nvk_libs} -Wl,--end-group nx stdc++ m -pthread
             -Wl,-u,vk_icdGetInstanceProcAddr -Wl,-u,vk_icdNegotiateLoaderICDInterfaceVersion)
     else()

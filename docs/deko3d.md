@@ -167,6 +167,10 @@ and the PS2's own cull/ZTST state — the triangle test already showed how silen
 origin in `hw_fs`, which must match what the Vulkan path produced. Both are cheapest to check with a screenshot comparison against the
 Vulkan build.
 
+One finding for stage 3: **NVK cannot simply be dropped from the link yet.** Trying it fails in devkitPro's own SDL2, whose static
+`libEGL.a` (from the NVK SDK) contains Mesa's zink, and zink calls `nvk_loaderless_GetInstanceProcAddr` and the `vk_*` helpers. So the
+stage that removes NVK is the same one that stops using SDL's renderer and takes the display with deko3d — the two are one change.
+
 ## Prior art
 
 `ref-nether/` (NetherSX2's source, on this machine as a reference, not built) already has a complete deko3d backend —
