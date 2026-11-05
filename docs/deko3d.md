@@ -125,6 +125,13 @@ What it produced (2026-11-04, naga 29, uam 1.1.0):
 | `hw_load_color` | compute (storage image) | 3 328 |
 | `blit` `vs` / `fs` | vertex / fragment | 768 / 37 376 |
 | `triangle_vs` / `triangle_fs` | vertex / fragment | 768 / 512 |
+| `upload` / `copy_read` / `copy_write` (`gs.wgsl`) | compute | 5 888 / 4 352 / 4 608 |
+| `load_clut` / `display` / `decode` (`gs.wgsl`) | compute | 11 520 / 4 608 / 3 072 |
+| `snapshot` / `resolve` (`gs.wgsl`) | compute | 512 / 512 |
+
+`gs.wgsl`'s `raster` is the one program with no deko3d module, and the hardware path does not use it: it draws with `hw.wgsl`. The other
+eight of `gs.wgsl` are not optional though — uploads, local copies, CLUT loads, texture decoding and the **display** all run on them, and
+the display is where the picture on the screen comes from.
 
 `hw_writeback` is the one that does not translate: it reads VRAM back through a `textureLoad` of a *depth* texture, and naga cannot
 write that as GLSL at all ("`textureLoad` from depth textures is not supported in GLSL"). Nothing is lost that a deko3d renderer needs:
