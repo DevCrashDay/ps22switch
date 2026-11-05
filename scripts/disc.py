@@ -1,10 +1,29 @@
 import argparse
 import fnmatch
 import os
+import shutil
 import struct
 import sys
+import zipfile
 
 SECTOR = 2048
+MAX_DIRECTORY = 16 << 20  # no real directory is near this (a record is at least 34 bytes); the runtime's disc.cpp uses the same
+
+
+def warn(message):
+    print('disc.py: ' + message, file=sys.stderr)
+
+
+def safe_name(name):
+    # An ISO 9660 name is raw bytes from the image: one that is "." or "..", or holds a path separator, a drive colon or a
+    # control byte, would make a path outside the destination folder. Real discs use only letters, digits, "_" and ".".
+    return name not in ('', '.', '..') and not any(c in '/\\:' or ord(c) < 32 for c in name)
+
+
+def inside(destination, path):
+    base = os.path.realpath(destination)
+    target = os.path.realpath(os.path.join(base, path))
+    return os.path.commonpath([base, target]) == base
 
 
 class Layer:
@@ -18,6 +37,7 @@ class Layer:
 
 class Image:
     def __init__(self, path):
+        self.path = path
         self.file = open(path, 'rb')
         self.size = os.path.getsize(path)
         self.layers = [Layer(0, 0, self.pvd(16))]
@@ -39,16 +59,35 @@ class Image:
 
     def files(self):
         for layer in self.layers:
-            yield from self.walk(layer, layer.root[0], layer.root[1], '')
+            lba, size = layer.root
+            if size < 34:
+                sec = self.read(layer.base + lba, 1)
+                if len(sec) >= 34 and sec[0] >= 34 and struct.unpack_from('<I', sec, 2)[0] == lba:
+                    size = struct.unpack_from('<I', sec, 10)[0]
+            yield from self.walk(layer, lba, size, '', 0, set())
 
-    def walk(self, layer, lba, size, prefix):
+    def walk(self, layer, lba, size, prefix, depth, seen):
+        # A damaged or crafted image: a directory that points back at a parent is walked once, one that is too deep, too large or
+        # whose records run past its end is left out with a warning, and one past the end of the file stops with an error.
+        if depth > 16 or layer.base + lba in seen:
+            return
+        seen.add(layer.base + lba)
+        if size > MAX_DIRECTORY:
+            warn('damaged directory %r at sector %d: too large (left out)' % (prefix, layer.base + lba))
+            return
         data = self.read(layer.base + lba, (size + SECTOR - 1) // SECTOR)
+        if len(data) < size:
+            sys.exit('%s: the disc image ends early (truncated rip or copy?)' % self.path)
         offset = 0
         while offset < size:
             length = data[offset]
             if length == 0:
                 offset = (offset // SECTOR + 1) * SECTOR
                 continue
+            # ISO 9660 (ECMA-119 9.1): a directory record is 33 bytes plus the name, all inside the directory
+            if length < 34 or offset + length > len(data) or 33 + data[offset + 32] > length:
+                warn('damaged directory %r at sector %d: a record runs past its end (left out)' % (prefix, layer.base + lba))
+                return
             record = data[offset:offset + length]
             offset += length
             extent, extent_size = struct.unpack_from('<I', record, 2)[0], struct.unpack_from('<I', record, 10)[0]
@@ -56,9 +95,12 @@ class Image:
             if name in (b'\x00', b'\x01'):
                 continue
             name = name.decode('ascii', 'replace').split(';')[0]
+            if not safe_name(name):
+                warn('unsafe name %r in %r left out' % (name, prefix))
+                continue
             path = prefix + name
             if record[25] & 2:
-                yield from self.walk(layer, extent, extent_size, path + '/')
+                yield from self.walk(layer, extent, extent_size, path + '/', depth + 1, seen)
             else:
                 yield path, layer, layer.base + extent, extent_size
 
@@ -77,6 +119,10 @@ class Image:
             left = size
             while left:
                 chunk = self.file.read(min(left, 1 << 22))
+                if not chunk:
+                    out.close()
+                    os.remove(destination)
+                    sys.exit('%s: the disc image ends early (truncated rip or copy?) in %s' % (self.path, path))
                 out.write(chunk)
                 left -= len(chunk)
 
@@ -104,6 +150,8 @@ def extract(image, destination, patterns, limit):
         if not patterns and limit and size > limit:
             print('left in the image: %s (%d MiB)' % (path, size >> 20))
             continue
+        if not inside(destination, path):
+            sys.exit('refusing to write outside %s: %r' % (destination, path))
         image.copy(entry, os.path.join(destination, path))
         count += 1
     print('%d files extracted to %s' % (count, destination))
@@ -122,27 +170,92 @@ def modules(image, destination):
             found.append((path.replace('/', '_'), sector, 0, size))
         elif head[:4] == b'AFS\0':
             count = struct.unpack_from('<I', head, 4)[0]
-            table = read_at(image, sector, 8, count * 8)
-            for index in range(count):
+            table = read_at(image, sector, 8, min(count * 8, max(size - 8, 0)))
+            for index in range(len(table) // 8):
                 offset, length = struct.unpack_from('<II', table, index * 8)
                 if offset + 4 <= size and read_at(image, sector, offset, 4) == b'SNR2':
                     found.append(('%s_%04d' % (path.replace('/', '_'), index), sector, offset, length))
     os.makedirs(destination, exist_ok=True)
     for name, sector, offset, length in found:
+        if not inside(destination, name + '.snr'):
+            sys.exit('refusing to write outside %s: %r' % (destination, name))
         with open(os.path.join(destination, name + '.snr'), 'wb') as out:
             out.write(read_at(image, sector, offset, length))
     print('%d relocatable modules (SNR2, xff2) extracted to %s' % (len(found), destination))
 
 
+RAW_SECTOR = 2352  # a CD dumped as BIN: sync (12 bytes), header (4), [subheader (8) in mode 2], 2048 bytes of data, error codes
+SYNC = b'\x00' + b'\xff' * 10 + b'\x00'
+
+
+def open_source(source):
+    """The stream of the image that `source` stands for: an .iso/.bin/.img as it is, a .cue (the file its FILE line names), or the
+    biggest .iso (else .bin, else .img) inside a .zip."""
+    lower = source.lower()
+    if lower.endswith('.zip'):
+        archive = zipfile.ZipFile(source)
+        members = archive.infolist()
+        for ending in ('.iso', '.bin', '.img'):
+            found = [m for m in members if m.filename.lower().endswith(ending)]
+            if found:
+                return archive.open(max(found, key=lambda m: m.file_size))
+        sys.exit('no .iso, .bin or .img inside the archive')
+    if lower.endswith('.cue'):
+        with open(source, errors='replace') as cue:
+            for line in cue:
+                line = line.strip()
+                if not line.upper().startswith('FILE'):
+                    continue
+                parts = line.split('"')
+                # FILE "name with spaces.bin" BINARY, or FILE name.bin BINARY
+                name = parts[1] if len(parts) >= 3 else (line.split()[1] if len(line.split()) >= 2 else '')
+                path = os.path.join(os.path.dirname(source), name.replace('\\', os.sep))
+                if not name or not os.path.isfile(path):
+                    sys.exit('the cue sheet names a file that is not next to it: ' + name)
+                return open(path, 'rb')
+        sys.exit('the cue sheet names no file')
+    return open(source, 'rb')
+
+
+def to_iso(source, target):
+    """Write `source` as a plain .iso with 2048-byte sectors. A CD dumped with 2352-byte sectors has the data cut out of every
+    sector (the data track only: the copy ends at the first sector without the sync pattern, e.g. where audio tracks begin);
+    anything else is copied as it is. The file appears only when the whole copy worked."""
+    part = target + '.part'
+    try:
+        with open_source(source) as src, open(part, 'wb') as dst:
+            first = src.read(RAW_SECTOR)
+            if len(first) < RAW_SECTOR or first[:12] != SYNC:
+                dst.write(first)
+                shutil.copyfileobj(src, dst, 1 << 24)
+            else:
+                # the mode byte of the header: 1 = 2048 bytes follow the header, 2 (XA) = an 8-byte subheader comes first
+                start = 16 if first[15] == 1 else 24
+                sector = first
+                while len(sector) == RAW_SECTOR and sector[:12] == SYNC:
+                    dst.write(sector[start:start + SECTOR])
+                    sector = src.read(RAW_SECTOR)
+        os.replace(part, target)
+    finally:
+        if os.path.exists(part):
+            os.remove(part)
+
+
 def main():
     sys.stdout.reconfigure(newline='\n')
     parser = argparse.ArgumentParser(description='Read files from PS2 CD and DVD images, including both layers of a DVD9.')
-    parser.add_argument('command', choices=['info', 'list', 'extract', 'modules'])
+    parser.add_argument('command', choices=['info', 'list', 'extract', 'modules', 'iso'])
     parser.add_argument('image')
     parser.add_argument('destination', nargs='?')
     parser.add_argument('patterns', nargs='*', help='paths or globs to extract, everything below --limit if omitted')
     parser.add_argument('--limit', type=int, default=64, help='MiB; larger files stay in the image unless named')
     args = parser.parse_args()
+    if args.command == 'iso':
+        # iso <source> <target.iso>: source is an .iso, .bin, .img, .cue or a .zip holding one (follows upstream 0d72093)
+        if not args.destination:
+            parser.error('iso needs the .iso file to write')
+        to_iso(args.image, args.destination)
+        return
     image = Image(args.image)
     if args.command == 'info':
         info(image)

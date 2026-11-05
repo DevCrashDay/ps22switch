@@ -113,29 +113,11 @@ fs::path with_suffix(fs::path p, const char *suffix) {
 
 // ---- files ----
 
-// The finished file appears in one step: the bytes go to "<file>.tmp", which replaces the target. A reader (F8, another program)
-// never sees half a file, and a crash in the middle leaves no broken state behind.
+// The finished file appears in one step (os::replace_file in ps2/os.hpp): the bytes go to "<file>.tmp", are forced to the disk, and
+// the finished file then replaces the target, with a few retries when a virus scanner holds it for a moment. A reader (F8, another
+// program) never sees half a file, and a crash in the middle leaves no broken state behind.
 bool write_whole(const fs::path &target, const void *data, std::size_t size, std::string &why) {
-    const fs::path temp = with_suffix(target, ".tmp");
-    std::error_code error;
-    {
-        std::ofstream out(temp, std::ios::binary | std::ios::trunc);
-        if (out) out.write(static_cast<const char *>(data), static_cast<std::streamsize>(size));
-        if (out) out.flush();
-        if (!out) {
-            why = "cannot write " + os::utf8(temp);
-            out.close();
-            fs::remove(temp, error);
-            return false;
-        }
-    }
-    fs::rename(temp, target, error);
-    if (error) {
-        why = "cannot replace " + os::utf8(target) + ": " + error.message();
-        fs::remove(temp, error);
-        return false;
-    }
-    return true;
+    return os::replace_file(os::utf8(target), data, size, &why);
 }
 
 bool read_whole(const fs::path &file, std::vector<std::uint8_t> &out) {
@@ -580,7 +562,8 @@ bool looks_like_state(const std::vector<std::uint8_t> &data) {
     std::uint32_t version = 0;
     std::memcpy(&version, data.data() + sizeof kStateMagic, sizeof version);
     static const char kEnd[8] = {'e', 'n', 'd', 0, 0, 0, 0, 0};
-    return (version == kStateVersion || version == 4) && std::memcmp(data.data() + data.size() - 8, kEnd, 8) == 0;  // 4: before the HLE replies
+    // 4: before the HLE replies; every version machine_state() can load is accepted, so quick saves made before an update still load
+    return version >= 4 && version <= kStateVersion && std::memcmp(data.data() + data.size() - 8, kEnd, 8) == 0;
 }
 
 // A state does not hold the memory card, so a quick save has a copy of the card beside it (<state>.ps2). Loading a state never

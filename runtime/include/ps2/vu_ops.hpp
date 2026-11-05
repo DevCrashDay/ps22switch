@@ -4,7 +4,9 @@
 #include "fpu.hpp"
 #include "vu.hpp"
 
-#if defined(__SSE2__)
+#if defined(__SSE4_1__)
+#include <smmintrin.h>
+#elif defined(__SSE2__)
 #include <emmintrin.h>
 #elif defined(__ARM_NEON)
 #include <arm_neon.h>
@@ -24,13 +26,17 @@ namespace ps2::vu {
 void kick(int unit, std::uint32_t address);
 std::uint32_t top();
 std::uint32_t itop();
+std::uint32_t itop(int unit);  // VU0 reads VIF0; the no-argument form retains the VU1 live-library ABI.
 void interpret(int unit, std::uint32_t pc);
+// AOT VU0 checks for a host stop at the same interval as the reference loop.
+bool stopped();
 
 using ProgramFn = void (*)(Vu0Regs &r, std::uint8_t *mem);
 
 struct Program {
     std::uint64_t key;
     ProgramFn function;
+    int unit = 1;
 };
 
 void register_programs(const Program *programs, std::uint32_t count);
@@ -48,6 +54,7 @@ inline std::uint32_t lower_major(std::uint32_t lo) { return lo >> 25; }
 // Flag reads bypass the one-instruction VI delay seen by branch operands.
 inline bool branch_delay_exempt(std::uint32_t lo) {
     switch (lower_major(lo)) {
+    case 0x04:  // ILW does not incur branch VI delay
     case 0x10: case 0x12: case 0x13: case 0x14: case 0x16: case 0x17: case 0x18: case 0x1A: case 0x1B: case 0x1C: case 0x21: case 0x25: return true;
     default: return false;
     }
@@ -55,6 +62,15 @@ inline bool branch_delay_exempt(std::uint32_t lo) {
 inline bool is_branch(std::uint32_t lo) {
     const std::uint32_t op = lower_major(lo);
     return op == 0x20 || op == 0x21 || op == 0x24 || op == 0x25 || (op >= 0x28 && op <= 0x2F && op != 0x2A && op != 0x2B);
+}
+// A branch whose delay slot holds another branch: the compiled and the Wasm code leave it to the interpreter (upstream c243416).
+inline bool branch_in_delay_slot(const std::uint8_t *code, std::uint32_t mask, std::uint32_t pc) {
+    std::uint32_t lo, hi, next_lo, next_hi;
+    std::memcpy(&lo, code + (pc & mask), 4);
+    std::memcpy(&hi, code + ((pc + 4u) & mask), 4);
+    std::memcpy(&next_lo, code + ((pc + 8u) & mask), 4);
+    std::memcpy(&next_hi, code + ((pc + 12u) & mask), 4);
+    return !(hi & 0x80000000u) && is_branch(lo) && !(next_hi & 0x80000000u) && is_branch(next_lo);
 }
 inline bool is_jump_register(std::uint32_t lo) { return lower_major(lo) == 0x24 || lower_major(lo) == 0x25; }
 inline bool is_unconditional(std::uint32_t lo) { return lower_major(lo) == 0x20 || lower_major(lo) == 0x21; }
@@ -584,7 +600,20 @@ PS2_VU_INLINE v4u vfix_generic(v4u x) {
     const v4i normal = (v4f)clamped >= (v4f)(v4i){0x00800000, 0x00800000, 0x00800000, 0x00800000};
     return (x & 0x80000000u) | (v4u)(clamped & normal);
 }
-#if defined(__SSE2__)
+#if defined(__SSE4_1__)
+// The same on every one of the 2^32 inputs (checked one by one against vfix_generic), as integer operations only. The magnitude is
+// cut at the largest float with an unsigned minimum (an exponent of 255, NaNs included, ends up at 0x7F7FFFFF), everything below the
+// smallest normal number is zeroed, and the sign is put back. Compared with the float version below (MINPS and CMPPS on the
+// magnitude) it has the same six instructions, but the chain from input to output is five cycles long instead of eleven: the
+// vector programs are one long chain of such steps (every add and multiply ends in one), which is where their time goes.
+PS2_VU_INLINE v4u vfix(v4u x) {
+    const __m128i xi = (__m128i)x;
+    const __m128i magnitude = _mm_and_si128(xi, _mm_set1_epi32(0x7FFFFFFF));
+    const __m128i clamped = _mm_min_epu32(magnitude, _mm_set1_epi32(0x7F7FFFFF));
+    const __m128i normal = _mm_cmpgt_epi32(clamped, _mm_set1_epi32(0x007FFFFF));
+    return (v4u)_mm_or_si128(_mm_and_si128(xi, _mm_set1_epi32(static_cast<int>(0x80000000u))), _mm_and_si128(clamped, normal));
+}
+#elif defined(__SSE2__)
 // The same on every one of the 2^32 inputs (checked one by one against vfix_generic), in fewer instructions: the SSE2 integer
 // minimum only exists for 16-bit lanes and takes four instructions for 32 bits, but MINPS on the magnitude read as a float does the
 // cut for all the cases. It hands back its second operand when the first is a NaN (an exponent of 255 with a mantissa) and the
@@ -614,11 +643,10 @@ PS2_VU_INLINE v4u vsub(v4u a, v4u b) { return vsubn(vfix(a), vfix(b)); }
 PS2_VU_INLINE v4u vmul(v4u a, v4u b) { return vmuln(vfix(a), vfix(b)); }
 PS2_VU_INLINE v4u vmadd(v4u acc, v4u a, v4u b) { return vmaddn(vfix(acc), vfix(a), vfix(b)); }
 PS2_VU_INLINE v4u vmsub(v4u acc, v4u a, v4u b) { return vmsubn(vfix(acc), vfix(a), vfix(b)); }
+// The order of MAX and MINI (fp::order_key): sign and magnitude, -0 equal to +0, denormals not flushed (they must come out as they went in).
 PS2_VU_INLINE v4i vkey(v4u x) {
-    const v4u zero = (v4u)((x & 0x7F800000u) == 0u);
-    const v4u f = (x & ~zero) | (x & 0x80000000u & zero);
-    const v4i m = (v4i)(f & 0x7FFFFFFFu);
-    const v4i negative = (v4i)((f & 0x80000000u) != 0u);
+    const v4i m = (v4i)(x & 0x7FFFFFFFu);
+    const v4i negative = (v4i)((x & 0x80000000u) != 0u);
     return (m & ~negative) | (-m & negative);
 }
 PS2_VU_INLINE v4u vmax(v4u a, v4u b) {
@@ -809,7 +837,8 @@ struct FlagPipe {
     }
 };
 
-PS2_VU_INLINE std::uint8_t *qword(std::uint8_t *mem, std::uint32_t index) { return mem + (index & 1023u) * 16u; }
+template <std::uint32_t Mask = 1023u>
+PS2_VU_INLINE std::uint8_t *qword(std::uint8_t *mem, std::uint32_t index) { return mem + (index & Mask) * 16u; }
 PS2_VU_INLINE void set_vi(Vu0Regs &r, unsigned i, std::uint32_t v) {
     if (i) r.vi[i] = static_cast<std::uint16_t>(v);
 }

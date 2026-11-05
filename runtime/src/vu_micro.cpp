@@ -14,7 +14,9 @@
 
 #include "ps2/state.hpp"
 
+#include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -42,6 +44,11 @@ struct Unit {
     // What a branch reads of the integer registers: the values from before the
     // previous instruction when that one wrote them (see BranchView).
     const std::uint16_t *branch_vi = nullptr;
+    // FSSET waits for the upper instruction of its pair: the sticky flags it
+    // sets replace those of the status that instruction writes (Metal Gear
+    // Solid 3 clears them next to an OPMSUB before testing its collision
+    // triangles). Follows upstream b7371e8.
+    std::int32_t fsset = -1;
 };
 
 Vu0Regs g_vu1;
@@ -433,28 +440,40 @@ void store_vi(Vu0Regs &r, unsigned index, std::uint32_t value) {
     if (index) r.vi[index] = static_cast<std::uint16_t>(value);
 }
 
+// A packet that runs past the end of the data memory goes on at its start; the queue wants it in one piece.
+__attribute__((noinline)) void xgkick_wrapped(Unit &u, std::uint32_t first, std::uint32_t count) {
+    std::uint8_t buffer[16 * 1024 + 16];
+    const std::uint32_t head = u.data_qwords - first;
+    std::memcpy(buffer, u.data + first * 16, head * 16);
+    std::memcpy(buffer + head * 16, u.data, (count - head) * 16);
+    gif::transfer(1, buffer, count);
+}
+
+// The packet is only measured here (one 8-byte read per GIF tag); the bytes are handed over where they lie in the data memory,
+// which gif::transfer copies before it returns, so nothing is copied twice and no 16 KiB buffer is set up for each kick.
 void xgkick(Unit &u, std::uint32_t address) {
     if (g_reference_dry) return;
-    std::uint8_t buffer[16 * 1024 + 16];
-    std::uint32_t q = address & (u.data_qwords - 1), count = 0;
+    const std::uint32_t qwords = u.data_qwords, first = address & (qwords - 1);
+    std::uint32_t q = first, count = 0;
     bool done = false;
-    while (!done && count < u.data_qwords) {
-        Reg128 tag;
-        std::memcpy(&tag, qword(u, q), 16);
-        std::memcpy(buffer + count * 16, &tag, 16);
+    while (!done && count < qwords) {
+        std::uint64_t tag;
+        std::memcpy(&tag, qword(u, q), 8);
         ++q;
         ++count;
-        const std::uint32_t nloop = static_cast<std::uint32_t>(tag.d[0]) & 0x7FFFu;
-        const bool eop = (tag.d[0] >> 15) & 1u;
-        const std::uint32_t flg = static_cast<std::uint32_t>(tag.d[0] >> 58) & 3u;
-        std::uint32_t nreg = static_cast<std::uint32_t>(tag.d[0] >> 60) & 0xFu;
+        const std::uint32_t nloop = static_cast<std::uint32_t>(tag) & 0x7FFFu;
+        const bool eop = (tag >> 15) & 1u;
+        const std::uint32_t flg = static_cast<std::uint32_t>(tag >> 58) & 3u;
+        std::uint32_t nreg = static_cast<std::uint32_t>(tag >> 60) & 0xFu;
         if (!nreg) nreg = 16;
-        std::uint32_t body = flg == 0 ? nloop * nreg : flg == 1 ? (nloop * nreg + 1) / 2 : nloop;
-        for (std::uint32_t i = 0; i < body && count < u.data_qwords; ++i, ++q, ++count)
-            std::memcpy(buffer + count * 16, qword(u, q), 16);
+        const std::uint32_t body = flg == 0 ? nloop * nreg : flg == 1 ? (nloop * nreg + 1) / 2 : nloop;
+        const std::uint32_t take = std::min(body, qwords - count);
+        q += take;
+        count += take;
         done = eop;
     }
-    gif::transfer(1, buffer, count);
+    if (first + count <= qwords) gif::transfer(1, u.data + first * 16, count);
+    else xgkick_wrapped(u, first, count);
 }
 
 // A VU branch that reads an integer register the instruction right before it
@@ -635,14 +654,17 @@ void lower(Unit &u, std::uint32_t w, std::uint32_t pc, std::uint32_t &npc, bool 
     case 0x13: store_vi(r, 1, ((clip_flags() | w) & 0xFFFFFFu) == 0xFFFFFFu ? 1u : 0u); break;
     case 0x14: store_vi(r, it, (status_flags() & 0xFFFu) == ((((w >> 10) & 0x800u) | (w & 0x7FFu))) ? 1u : 0u); break;
     case 0x15:
+        if (u.pipe) {
+            u.fsset = static_cast<std::int32_t>((((w >> 10) & 0x800u) | (w & 0x7FFu)) & 0xFC0u);
+            break;
+        }
         r.status = (status_flags() & 0x3Fu) | ((((w >> 10) & 0x800u) | (w & 0x7FFu)) & 0xFC0u);
-        if (u.pipe) u.pipe->force_mac(r.mac, r.status);
         break;
     case 0x16: store_vi(r, it, status_flags() & (((w >> 10) & 0x800u) | (w & 0x7FFu))); break;
-    case 0x17: store_vi(r, it, ((status_flags() | (((w >> 10) & 0x800u) | (w & 0x7FFu))) & 0xFFFu) == 0xFFFu ? 1u : 0u); break;
+    case 0x17: store_vi(r, it, (status_flags() & 0xFFFu) | (((w >> 10) & 0x800u) | (w & 0x7FFu))); break;
     case 0x18: store_vi(r, it, (mac_flags_now() & 0xFFFFu) == r.vi[is] ? 1u : 0u); break;
     case 0x1A: store_vi(r, it, mac_flags_now() & r.vi[is]); break;
-    case 0x1B: store_vi(r, it, ((mac_flags_now() | r.vi[is]) & 0xFFFFu) == 0xFFFFu ? 1u : 0u); break;
+    case 0x1B: store_vi(r, it, (mac_flags_now() & 0xFFFFu) | r.vi[is]); break;
     case 0x1C: store_vi(r, it, clip_flags() & 0xFFFu); break;
     case 0x20: branch_to(target); break;
     case 0x21: store_vi(r, it, (pc + 16u) / 8u); branch_to(target); break;
@@ -684,6 +706,83 @@ void set_tops(std::uint32_t top, std::uint32_t itop) {
 void run_fast(int n, std::uint32_t address);
 
 std::unordered_map<std::uint64_t, ProgramFn> g_programs;
+std::unordered_map<std::uint64_t, ProgramFn> g_vu0_programs;
+void run_reference(int n, std::uint32_t address);
+struct Vu0Entry {
+    std::uint32_t generation = 0;
+    std::uint64_t key = 0;
+    ProgramFn function = nullptr;
+};
+Vu0Entry g_vu0_entries[512];
+std::unordered_set<std::uint64_t> g_vu0_rejected;
+std::uint64_t g_vu0_compiled = 0, g_vu0_interpreted = 0, g_vu0_checked = 0, g_vu0_mismatches = 0;
+
+ProgramFn lookup_vu0(std::uint32_t address) {
+    address &= 4095u;
+    Vu0Entry &e = g_vu0_entries[address >> 3];
+    if (e.generation == g_generation[0]) return e.function;
+    e.generation = g_generation[0];
+    e.key = program_key(g_vu0_code, reachable(g_vu0_code, 4095u, address), address);
+    const auto it = g_vu0_programs.find(e.key);
+    e.function = it == g_vu0_programs.end() || g_vu0_rejected.count(e.key) ? nullptr : it->second;
+    static const std::string record = ps2::os::env("PS2_VU0_RECORD");
+    if (!e.function && !record.empty()) {
+        char name[64];
+        std::snprintf(name, sizeof name, "%016llX_%04X.bin", static_cast<unsigned long long>(e.key), address);
+        const auto path = ps2::os::path(record) / name;
+        if (!std::filesystem::exists(path)) {
+            std::filesystem::create_directories(ps2::os::path(record));
+            std::ofstream(path, std::ios::binary).write(reinterpret_cast<const char *>(g_vu0_code), 4096);
+        }
+    }
+    return e.function;
+}
+
+bool same_vu0_regs(const Vu0Regs &a, const Vu0Regs &b) {
+    // Compare architectural state, excluding compiler/ABI-dependent padding.
+    return std::memcmp(a.vf, b.vf, sizeof a.vf) == 0 && std::memcmp(&a.acc, &b.acc, sizeof a.acc) == 0 &&
+           std::memcmp(a.vi, b.vi, sizeof a.vi) == 0 && a.q == b.q && a.p == b.p && a.i == b.i && a.r == b.r &&
+           a.mac == b.mac && a.status == b.status && a.clip == b.clip && a.cmsar0 == b.cmsar0 && a.tpc == b.tpc;
+}
+
+bool stopped() { return ps2::halted(); }
+
+bool run_compiled_vu0(std::uint32_t address) {
+    const ProgramFn fn = lookup_vu0(address);
+    static const bool interpret_only = std::getenv("PS2_VU0_INTERPRET") != nullptr;
+    if (!fn || interpret_only) return false;
+    static const bool verify = std::getenv("PS2_VU0_VERIFY") != nullptr;
+    if (!verify) { fn(g_cpu.vu0, g_vu0_mem); return true; }
+    // Both executions start from identical state. Retain the exact result on a
+    // mismatch and blacklist the program, so verification never installs bad state.
+    const Vu0Regs before = g_cpu.vu0;
+    std::uint8_t memory[4096], after_memory[4096];
+    std::memcpy(memory, g_vu0_mem, sizeof memory);
+    fn(g_cpu.vu0, g_vu0_mem);
+    const Vu0Regs after = g_cpu.vu0;
+    std::memcpy(after_memory, g_vu0_mem, sizeof after_memory);
+    g_cpu.vu0 = before;
+    std::memcpy(g_vu0_mem, memory, sizeof memory);
+    run_reference(0, address);
+    auto &checked = g_vu0_checked;
+    auto &mismatches = g_vu0_mismatches;
+    ++checked;
+    const bool registers_match = same_vu0_regs(after, g_cpu.vu0);
+    if (!registers_match || std::memcmp(after_memory, g_vu0_mem, sizeof after_memory)) {
+        ++mismatches;
+        Vu0Entry &e = g_vu0_entries[(address & 4095u) >> 3];
+        std::fprintf(stderr, "[vu0-check] key %016llX entry %04X mismatch: regs %d mem %d; using reference\n",
+                     static_cast<unsigned long long>(e.key), address,
+                     !registers_match,
+                     std::memcmp(after_memory, g_vu0_mem, sizeof after_memory) != 0);
+        g_vu0_rejected.insert(e.key);
+        for (Vu0Entry &entry : g_vu0_entries) entry.generation = 0;
+    }
+    if (checked == 1 || checked % 10000 == 0)
+        std::fprintf(stderr, "[vu0-check-summary] %llu calls, %llu mismatches\n", static_cast<unsigned long long>(checked), static_cast<unsigned long long>(mismatches));
+    return true;
+}
+
 
 struct Candidate {
     std::vector<std::uint32_t> runs;
@@ -744,7 +843,9 @@ void code_changed(int unit) {
 
 void register_programs(const Program *programs, std::uint32_t count) {
     for (std::uint32_t i = 0; i < count; ++i)
-        if (programs[i].function) g_programs[programs[i].key] = programs[i].function;
+        if (programs[i].function) (programs[i].unit == 0 ? g_vu0_programs : g_programs)[programs[i].key] = programs[i].function;
+    for (Vu0Entry &entry : g_vu0_entries) entry.generation = 0;
+    if (count > 0) std::fprintf(stderr, "[vu1] Statically registered %u compiled vector programs\n", count);
 }
 
 // Programs the background thread compiled and loaded (vu_live.cpp) join the table of built-in ones. A program the build knew keeps
@@ -766,6 +867,7 @@ void kick(int unit, std::uint32_t address) {
 
 std::uint32_t top() { return g_top; }
 std::uint32_t itop() { return g_itop; }
+std::uint32_t itop(int unit) { return unit == 0 ? vif::itop(0) : g_itop; }
 
 ProgramFn lookup(std::uint32_t address);
 
@@ -827,7 +929,7 @@ void interpret(int unit, std::uint32_t pc) {
         return;
     }
     if (unit != 1) {
-        run_entry(unit, pc);
+        run_reference(unit, pc);
         return;
     }
     if (g_chaining) {
@@ -835,13 +937,87 @@ void interpret(int unit, std::uint32_t pc) {
         return;
     }
     g_chaining = true;
+    // The plain case (no checking, timing, counting or tracing switch, no JIT) goes straight to the program the entry cache already knows:
+    // what run_entry and lookup would do for it, without their set-up. Anything else (a new program, a changed code memory, a program
+    // that is not compiled) takes the long way.
+    static const bool plain = std::getenv("PS2_VU_INTERPRET") == nullptr && std::getenv("PS2_VU_COUNT") == nullptr && std::getenv("PS2_VU_CHECK") == nullptr &&
+                              std::getenv("PS2_VU_TIME") == nullptr && std::getenv("PS2_TRACE_VU1RUN") == nullptr && jit::mode() == 0;
     for (;;) {
-        run_entry(1, pc);
+        if (plain && !live::ready()) {
+            const EntryCache &e = g_entries[(pc & 16383u) >> 3];
+            if (e.generation == g_generation[1] && e.function) {
+                g_trace_vu1_pc = pc;
+                e.function(g_vu1, g_vu1_mem);
+            } else {
+                run_entry(1, pc);
+            }
+        } else {
+            run_entry(1, pc);
+        }
         if (g_chained < 0) break;
         pc = static_cast<std::uint32_t>(g_chained);
         g_chained = -1;
     }
     g_chaining = false;
+}
+
+// PS2_VU_TIME=1: the time stamp counter ticks spent in each compiled vector program, printed when the runner ends (a headless
+// run of N frames from a state: the same work every time, so two builds can be compared program by program).
+std::uint64_t time_stamp() {
+#if defined(__x86_64__) || defined(__i386__)
+    return __builtin_ia32_rdtsc();
+#else
+    return static_cast<std::uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count());
+#endif
+}
+
+struct TimeRow {
+    std::uint64_t calls = 0, ticks = 0;
+};
+
+std::unordered_map<std::uint64_t, TimeRow> &time_rows() {
+    static std::unordered_map<std::uint64_t, TimeRow> rows;
+    return rows;
+}
+
+std::chrono::steady_clock::time_point &time_start() {
+    static std::chrono::steady_clock::time_point start;
+    return start;
+}
+std::uint64_t &time_first_stamp() {
+    static std::uint64_t v = 0;
+    return v;
+}
+std::uint64_t &time_last_stamp() {
+    static std::uint64_t v = 0;
+    return v;
+}
+
+void time_report() {
+    time_last_stamp() = time_stamp();
+    std::uint64_t calls = 0, ticks = 0;
+    std::vector<std::pair<std::uint64_t, TimeRow>> sorted(time_rows().begin(), time_rows().end());
+    for (const auto &[k, row] : sorted) {
+        calls += row.calls;
+        ticks += row.ticks;
+    }
+    std::sort(sorted.begin(), sorted.end(), [](const auto &a, const auto &b) { return a.second.ticks > b.second.ticks; });
+    const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - time_start()).count();
+    std::fprintf(stderr, "[vu-time] %zu programs, %llu calls, %llu ticks in compiled programs (%.3f ticks per nanosecond of run time)\n", sorted.size(), static_cast<unsigned long long>(calls),
+                 static_cast<unsigned long long>(ticks), static_cast<double>(time_first_stamp()) > 0 ? static_cast<double>(time_last_stamp() - time_first_stamp()) / (seconds * 1e9) : 0.0);
+    static const std::size_t rows = std::max<long>(12, std::atol(std::getenv("PS2_VU_TIME")));  // PS2_VU_TIME=1 lists 12 programs, PS2_VU_TIME=9999 all of them
+    for (std::size_t i = 0; i < sorted.size() && i < rows; ++i)
+        std::fprintf(stderr, "[vu-time] %016llX calls %llu ticks %llu (%llu per call)\n", static_cast<unsigned long long>(sorted[i].first),
+                     static_cast<unsigned long long>(sorted[i].second.calls), static_cast<unsigned long long>(sorted[i].second.ticks),
+                     static_cast<unsigned long long>(sorted[i].second.ticks / std::max<std::uint64_t>(1, sorted[i].second.calls)));
+}
+
+void time_note(std::uint64_t key, std::uint64_t ticks) {
+    static const bool registered = (std::atexit(time_report), time_start() = std::chrono::steady_clock::now(), time_first_stamp() = time_stamp(), true);
+    (void)registered;
+    TimeRow &row = time_rows()[key];
+    ++row.calls;
+    row.ticks += ticks;
 }
 
 void run_entry(int unit, std::uint32_t pc) {
@@ -908,6 +1084,13 @@ void run_entry(int unit, std::uint32_t pc) {
                 g_vu1 = after;
                 std::memcpy(g_vu1_mem, run_mem, sizeof g_vu1_mem);
                 if (escape >= 0) interpret(1, static_cast<std::uint32_t>(escape));
+                return;
+            }
+            static const bool timed = std::getenv("PS2_VU_TIME") != nullptr;
+            if (timed) {
+                const std::uint64_t t0 = time_stamp();
+                fn(g_vu1, g_vu1_mem);
+                time_note(g_entries[(pc & 16383u) >> 3].key, time_stamp() - t0);
                 return;
             }
             if (jit && jit != fn && ++sampled % 32 == 0) check_jit(fn, jit);
@@ -1037,6 +1220,11 @@ void run_fast(int n, std::uint32_t address) {
             set_flags(r, out.value, out.dest);
             pipe.set_mac(r.mac, r.status);
         }
+        if (u.fsset >= 0) {
+            r.status = (r.status & 0x3Fu) | static_cast<std::uint32_t>(u.fsset);
+            pipe.force_mac(r.mac, r.status);
+            u.fsset = -1;
+        }
         if (out.has_clip) {
             r.clip = out.clip;
             pipe.set_clip(out.clip, pipe.t);
@@ -1069,11 +1257,29 @@ void run_fast(int n, std::uint32_t address) {
 }
 
 void run(int n, std::uint32_t address) {
-    static const bool exact = std::getenv("PS2_VU_EXACT") != nullptr;
-    if (n == 1 && !exact) {
-        interpret(n, address);
-        return;
+    if (n == 0) {
+        static const bool report = [] {
+            if (std::getenv("PS2_VU0_STATS") || std::getenv("PS2_VU0_VERIFY")) std::atexit([] {
+                std::fprintf(stderr, "[vu0] compiled %llu interpreted %llu checked %llu mismatches %llu\n",
+                    static_cast<unsigned long long>(g_vu0_compiled), static_cast<unsigned long long>(g_vu0_interpreted),
+                    static_cast<unsigned long long>(g_vu0_checked), static_cast<unsigned long long>(g_vu0_mismatches));
+            });
+            return true;
+        }();
+        (void)report;
+        const bool compiled = run_compiled_vu0(address);
+        if (compiled) ++g_vu0_compiled; else ++g_vu0_interpreted;
+        static const bool stats = std::getenv("PS2_VU0_STATS") != nullptr;
+        if (stats && (g_vu0_compiled + g_vu0_interpreted) % 1000000 == 0)
+            std::fprintf(stderr, "[vu0] compiled %llu interpreted %llu\n", static_cast<unsigned long long>(g_vu0_compiled), static_cast<unsigned long long>(g_vu0_interpreted));
+        if (compiled) return;
     }
+    static const bool exact = std::getenv("PS2_VU_EXACT") != nullptr;
+    if (n == 1 && !exact) { interpret(n, address); return; }
+    run_reference(n, address);
+}
+
+void run_reference(int n, std::uint32_t address) {
     Unit u = unit_of(n);
     Vu0Regs &r = *u.regs;
     if (g_scan[n]) scan_flags(n, u.code, u.code_mask + 1);
@@ -1127,6 +1333,11 @@ void run(int n, std::uint32_t address) {
         view.commit(was, lo, !(hi & 0x80000000u));
         commit(r, out);
         if (out.target >= 0 && out.flags) pipe.set_mac(r.mac, r.status);
+        if (u.fsset >= 0) {
+            r.status = (r.status & 0x3Fu) | static_cast<std::uint32_t>(u.fsset);
+            pipe.force_mac(r.mac, r.status);
+            u.fsset = -1;
+        }
         if (out.has_clip) {
             r.clip = out.clip;
             pipe.set_clip(out.clip, pipe.t);

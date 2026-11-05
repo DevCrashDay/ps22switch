@@ -222,14 +222,25 @@ fn read_pixel(psm: u32, bp: u32, bw: u32, x: u32, y: u32) -> u32 {
     return read_sample(psm, bp, bw, x, y, 0u);
 }
 
+// Changes the bits of one pixel that is only part of a word (16-bit and 24-bit formats, 8- and 4-bit uploads) while the threads
+// of its neighbours change theirs: `old` is what the pixel's bits are now (shifted down, as load_at gives them), `value` what they
+// become. One atomic XOR flips exactly the bits that differ, whatever the neighbours do to their own bits in the meantime; the
+// earlier atomic AND followed by an atomic OR cost two read-modify-write trips to memory (lane glow, docs/speed.md). Nothing is
+// written when nothing changes.
+fn store_diff(l: Loc, k: u32, old: u32, value: u32) {
+    let flip = (old ^ value) & l.mask;
+    if (flip != 0u) {
+        atomicXor(&vram[l.word * SCALE * SCALE + k], flip << l.shift);
+    }
+}
+
 fn store(l: Loc, k: u32, value: u32) {
     let w = l.word * SCALE * SCALE + k;
     if (l.mask == 0xFFFFFFFFu) {
         atomicStore(&vram[w], value);
         return;
     }
-    atomicAnd(&vram[w], ~(l.mask << l.shift));
-    atomicOr(&vram[w], (value & l.mask) << l.shift);
+    store_diff(l, k, (atomicLoad(&vram[w]) >> l.shift) & l.mask, value);
 }
 
 fn write_sample(psm: u32, bp: u32, bw: u32, x: u32, y: u32, k: u32, value: u32) {
@@ -413,7 +424,25 @@ fn display(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (psm == PSMCT16 || psm == PSMCT16S) {
         c = ((c & 0x1Fu) << 3u) | ((c & 0x3E0u) << 6u) | ((c & 0x7C00u) << 9u);
     }
-    scratch[prm(8u) + gid.y * w + gid.x] = c | 0xFF000000u;
+    c = c | 0xFF000000u;
+    // The second read circuit (prm 9..18): its rectangle goes over the picture of the main one (PMODE ALP is 0xFF, all of it shows).
+    if (prm(9u) != 0u) {
+        let lx = i32(gid.x) - bitcast<i32>(prm(15u)) * i32(SCALE);
+        let ly = i32(gid.y) - bitcast<i32>(prm(16u)) * i32(SCALE);
+        if (lx >= 0 && ly >= 0 && u32(lx) < prm(17u) * SCALE && u32(ly) < prm(18u) * SCALE) {
+            var oy = u32(ly);
+            if (prm(7u) != 0u) {
+                oy = oy / 2u;
+            }
+            let opsm = prm(12u);
+            var o = read_sample(opsm, prm(10u), prm(11u), prm(13u) + u32(lx) / SCALE, prm(14u) + oy / SCALE, (oy % SCALE) * SCALE + u32(lx) % SCALE);
+            if (opsm == PSMCT16 || opsm == PSMCT16S) {
+                o = ((o & 0x1Fu) << 3u) | ((o & 0x3E0u) << 6u) | ((o & 0x7C00u) << 9u);
+            }
+            c = o | 0xFF000000u;
+        }
+    }
+    scratch[prm(8u) + gid.y * w + gid.x] = c;
 }
 
 struct Setup {
@@ -707,7 +736,7 @@ fn write_frame(s: Setup, l: Loc, k: u32, c: u32, mask: u32) {
             if ((mask & 0x80000000u) != 0u) {
                 m16 = m16 | 0x8000u;
             }
-            store(l, k, (pack16(c) & ~m16) | (old & m16));
+            store_diff(l, k, old, (pack16(c) & ~m16) | (old & m16));
         }
         case 0x01u {
             let l32 = Loc(l.word, 0u, 0xFFFFFFFFu);
@@ -716,6 +745,11 @@ fn write_frame(s: Setup, l: Loc, k: u32, c: u32, mask: u32) {
             store(l32, k, (c & ~m) | (old & m));
         }
         default {
+            if (l.mask != 0xFFFFFFFFu) {
+                let old = load_at(l, k);
+                store_diff(l, k, old, (c & ~mask) | (old & mask));
+                return;
+            }
             var v = c;
             if (mask != 0u) {
                 let old = load_at(l, k);
