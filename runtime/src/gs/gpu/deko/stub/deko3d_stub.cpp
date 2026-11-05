@@ -43,6 +43,7 @@ struct ImageState {
 }
 
 static int g_failures = 0;
+static int g_in_flight = 0;  // submitted, and not yet waited for
 static std::map<const void *, stub::ShaderState> g_shaders;
 static std::map<const void *, stub::ImageState> g_images;
 static std::uint32_t g_shader_loads = 0;
@@ -96,6 +97,7 @@ void dkQueueWaitIdle(DkQueue) {}
 
 void dkQueueSubmitCommands(DkQueue, DkCmdList cmds) {
     if (!cmds) fail("submitting an empty command list");
+    g_in_flight = 1;
 }
 
 void dkQueueFlush(DkQueue) {}
@@ -108,6 +110,7 @@ void dkQueuePresentImage(DkQueue, DkSwapchain, int slot) {
 
 DkResult dkFenceWait(DkFence *obj, int64_t) {
     if (obj) std::memset(obj, 0, sizeof *obj);
+    g_in_flight = 0;
     return DkResult_Success;
 }
 
@@ -174,6 +177,7 @@ DkCmdList dkCmdBufFinishList(DkCmdBuf buf) {
 void dkCmdBufClear(DkCmdBuf buf) {
     auto *b = reinterpret_cast<stub::CmdBuf *>(buf);
     if (!b) return;
+    if (g_in_flight) fail("clearing command memory the GPU is still reading: the frame it belongs to has not finished");
     b->binds = b->draws = b->dispatches = b->barriers = b->copies = b->calls = 0;
 }
 

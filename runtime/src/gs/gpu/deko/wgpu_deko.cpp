@@ -874,6 +874,10 @@ WGPUCommandEncoder wgpuDeviceCreateCommandEncoder(WGPUDevice d, WGPUCommandEncod
     // Each encoder records into a slot of the device's command memory (made once, reused every frame): gpu.cpp keeps several encoders
     // alive and submits them in one go, so each needs its own memory, but allocating a memory block per encoder would churn hundreds of
     // kilobytes a frame.
+    // The command memory of the frame before may still be in the GPU's hands: clearing it now is what a use-after-free looks like on this
+    // hardware. Gpu::wait() waits for the fence of the last submission, so the slots are free to write again - which is also the one frame
+    // of latency a single command buffer costs. (A ring with a fence per slot would remove the wait; see docs/deko3d.md.)
+    d->gpu.wait();
     WGPUDeviceImpl::CommandSlot *slot = d->take_slot();
     if (!slot) {
         delete e;
