@@ -556,6 +556,7 @@ bool load_program(WGPUDeviceImpl *d, const std::string &entry, DkShader &shader)
             return dkShaderIsValid(&shader);
         }
     const ps2::gs::gpu::deko::DkshProgram *program = ps2::gs::gpu::deko::dksh_program(entry.c_str());
+    trace("  %s: module %p, %zu words", entry.c_str(), static_cast<const void *>(program), program ? program->count : 0);
     if (!program || !program->words || program->count < 6) {
         std::fprintf(stderr, "[deko] no compiled module for %s: that program cannot run (scripts/wgsl_dksh.py)\n", entry.c_str());
         return false;
@@ -571,7 +572,9 @@ bool load_program(WGPUDeviceImpl *d, const std::string &entry, DkShader &shader)
         std::fprintf(stderr, "[deko] no room left for the shader %s\n", entry.c_str());
         return false;
     }
+    trace("  %s: block %p + %u, %u bytes of code", entry.c_str(), static_cast<void *>(d->code_memory->cpu), d->code_used, code_size);
     std::memcpy(d->code_memory->cpu + d->code_used, reinterpret_cast<const std::uint8_t *>(words) + control_size, code_size);
+    trace("  %s: copied", entry.c_str());
     DkShaderMaker maker;
     dkShaderMakerDefaults(&maker, d->code_memory->block, d->code_used);
     maker.control = words;
