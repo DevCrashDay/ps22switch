@@ -40,6 +40,14 @@ namespace {
 
 WGPUStringView text(const char *s) { return WGPUStringView{s, std::strlen(s)}; }
 
+// WebGPU's WGPU_STRLEN (SIZE_MAX) means "the length is strlen's": gpu.cpp's view() passes exactly that for every name and entry point,
+// and a string view taken at face value is a string of SIZE_MAX characters, which is what made std::string::assign throw
+// (basic_string::_M_replace) inside the first compute pipeline.
+std::string as_string(WGPUStringView v) {
+    if (!v.data) return std::string();
+    return v.length == WGPU_STRLEN ? std::string(v.data) : std::string(v.data, v.length);
+}
+
 // A hard fault prints nothing, and on the console the only evidence is how far the log got: this writes one line before each object-making
 // call, for the first hundred or so, so the last line of ps2run.log names the call that killed it. PS2_DEKO3D_TRACE=0 turns it off.
 std::uint32_t g_traced = 0;
@@ -772,10 +780,8 @@ WGPUComputePipeline wgpuDeviceCreateComputePipeline(WGPUDevice d, WGPUComputePip
     on_big_stack([&] {
         try {
             auto *p = new WGPUComputePipelineImpl;
-            trace("  pipeline object made");
-            if (descriptor->compute.entryPoint.data)
-                p->entry_point.assign(descriptor->compute.entryPoint.data, descriptor->compute.entryPoint.length);
-            trace("  entry point named");
+            p->entry_point = as_string(descriptor->compute.entryPoint);
+            trace("  entry point named: %s (%zu characters)", p->entry_point.c_str(), p->entry_point.size());
             p->ready = load_program(d, p->entry_point, p->shader);
             result = p;
         } catch (const std::exception &e) {
@@ -794,10 +800,8 @@ WGPURenderPipeline wgpuDeviceCreateRenderPipeline(WGPUDevice d, WGPURenderPipeli
     on_big_stack([&] {
     try {
     auto *p = new WGPURenderPipelineImpl;
-    if (descriptor->vertex.entryPoint.data)
-        p->vertex_entry.assign(descriptor->vertex.entryPoint.data, descriptor->vertex.entryPoint.length);
-    if (descriptor->fragment && descriptor->fragment->entryPoint.data)
-        p->fragment_entry.assign(descriptor->fragment->entryPoint.data, descriptor->fragment->entryPoint.length);
+    p->vertex_entry = as_string(descriptor->vertex.entryPoint);
+    if (descriptor->fragment) p->fragment_entry = as_string(descriptor->fragment->entryPoint);
     p->primitive = to_primitive(descriptor->primitive.topology);
     // The fixed state deko3d has to be told explicitly, from the pipeline's description.
     p->rasterizer.setCullMode(to_face(descriptor->primitive.cullMode)).setFrontFace(to_front_face(descriptor->primitive.frontFace));
