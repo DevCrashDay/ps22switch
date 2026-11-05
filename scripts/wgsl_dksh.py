@@ -33,7 +33,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 DEKO_DIR = ROOT / "runtime" / "src" / "gs" / "gpu" / "deko"
-SHADERS = [ROOT / "runtime" / "src" / "gs" / "gpu" / "hw.wgsl", ROOT / "runtime" / "src" / "gs" / "gpu" / "blit.wgsl",
+SHADERS = [ROOT / "runtime" / "src" / "gs" / "gpu" / "hw.wgsl", ROOT / "runtime" / "src" / "gs" / "gpu" / "gs.wgsl",
+           ROOT / "runtime" / "src" / "gs" / "gpu" / "blit.wgsl",
            DEKO_DIR / "stage_draw.wgsl"]
 OUT = DEKO_DIR / "dksh_table.cpp"
 
@@ -44,6 +45,10 @@ STAGES = {"vert": ("vert", "vert"), "frag": ("frag", "frag"), "comp": ("comp", "
 # writeback next to it is a separate program and compiles, which is what matters: only the depth half of the writeback is missing.
 WANTED = {
     "hw.wgsl": ("hw_vs", "hw_full_vs", "hw_fs", "hw_fs_single", "hw_load_depth", "hw_load_color", "hw_writeback"),
+    # the hardware path still uses these for video memory: uploads, the two halves of a local copy, CLUT loads, texture decoding, the
+    # display (which is where the picture on the screen comes from), the snapshot and the resolve. `raster` is not needed: hw.wgsl draws
+    # the triangles on this path.
+    "gs.wgsl": ("upload", "copy_read", "copy_write", "load_clut", "display", "decode", "snapshot", "resolve"),
     "blit.wgsl": ("vs", "fs"),
     "stage_draw.wgsl": ("triangle_vs", "triangle_fs"),
 }
