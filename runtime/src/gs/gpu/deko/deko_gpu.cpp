@@ -70,6 +70,11 @@ void Gpu::close() {
 
 std::shared_ptr<Memory> Gpu::allocate(std::uint64_t bytes, std::uint32_t flags) {
     if (!m_device || !bytes) return nullptr;
+    // deko3d aborts rather than returning null when it cannot make a block, so a line before each of the first ones says how far the
+    // renderer's memory setup got, and with which size, if one of them is the end of the log.
+    static std::uint32_t traced = 0;
+    if (traced < 40) std::fprintf(stderr, "[deko] memory block %u: %llu bytes, flags 0x%x\n", ++traced,
+                                   static_cast<unsigned long long>(bytes), flags);
     auto memory = std::make_shared<Memory>();
     memory->size = align_up(bytes, DK_MEMBLOCK_ALIGNMENT);
     memory->block = dk::MemBlockMaker{m_device, memory->size}.setFlags(flags).create();

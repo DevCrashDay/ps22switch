@@ -38,6 +38,24 @@ namespace {
 
 WGPUStringView text(const char *s) { return WGPUStringView{s, std::strlen(s)}; }
 
+// A hard fault prints nothing, and on the console the only evidence is how far the log got: this writes one line before each object-making
+// call, for the first hundred or so, so the last line of ps2run.log names the call that killed it. PS2_DEKO3D_TRACE=0 turns it off.
+std::uint32_t g_traced = 0;
+
+bool trace_on() {
+    const char *off = std::getenv("PS2_DEKO3D_TRACE");
+    return !off || std::strcmp(off, "0") != 0;
+}
+
+template <typename... Args>
+void trace(const char *what, Args... args) {
+    if (!trace_on() || g_traced >= 120) return;
+    ++g_traced;
+    std::fprintf(stderr, "[deko] #%u ", g_traced);
+    std::fprintf(stderr, what, args...);
+    std::fputc('\n', stderr);
+}
+
 // One line the first time each distinct message is seen, so a missing call says so once rather than thousands of times a second.
 void log_once(const char *what) {
     static std::vector<std::string> said;
@@ -351,7 +369,10 @@ void wgpuDeviceRelease(WGPUDevice d) {
     delete d;
 }
 
-WGPUQueue wgpuDeviceGetQueue(WGPUDevice d) { return d ? d->queue.get() : nullptr; }
+WGPUQueue wgpuDeviceGetQueue(WGPUDevice d) {
+    trace("get queue");
+    return d ? d->queue.get() : nullptr;
+}
 
 WGPUBool wgpuDevicePoll(WGPUDevice d, WGPUBool wait, WGPUSubmissionIndex const *) {
     if (d && wait) d->gpu.wait();
@@ -363,6 +384,7 @@ WGPUBool wgpuDevicePoll(WGPUDevice d, WGPUBool wait, WGPUSubmissionIndex const *
 // ---------------------------------------------------------------------------------------------------------------------------------
 
 WGPUBuffer wgpuDeviceCreateBuffer(WGPUDevice d, WGPUBufferDescriptor const *descriptor) {
+    trace("create buffer, %llu bytes", static_cast<unsigned long long>(descriptor->size));
     auto *b = new WGPUBufferImpl;
     b->device = d;
     b->size = descriptor->size;
@@ -419,6 +441,7 @@ void wgpuBufferUnmap(WGPUBuffer b) {
 // ---------------------------------------------------------------------------------------------------------------------------------
 
 WGPUTexture wgpuDeviceCreateTexture(WGPUDevice d, WGPUTextureDescriptor const *descriptor) {
+    trace("create texture %ux%u, format %d", unsigned(descriptor->size.width), unsigned(descriptor->size.height), int(descriptor->format));
     ps2::gs::gpu::deko::Format format{};
     if (!to_deko_format(descriptor->format, format) || descriptor->dimension != WGPUTextureDimension_2D) {
         d->error("a texture format or dimension this renderer does not use: " + std::to_string(int(descriptor->format)));
@@ -441,6 +464,7 @@ WGPUTexture wgpuDeviceCreateTexture(WGPUDevice d, WGPUTextureDescriptor const *d
 void wgpuTextureRelease(WGPUTexture t) { delete t; }  // the images are shared pointers: the last owner frees the memory
 
 WGPUTextureView wgpuTextureCreateView(WGPUTexture t, WGPUTextureViewDescriptor const *) {
+    trace("create view");
     if (!t) return nullptr;
     auto *v = new WGPUTextureViewImpl;
     v->device = t->device;
@@ -649,6 +673,7 @@ void bind_group(DkCmdBuf cmd, const WGPUBindGroupImpl *group, bool compute, std:
 }
 
 WGPUBindGroupLayout wgpuDeviceCreateBindGroupLayout(WGPUDevice, WGPUBindGroupLayoutDescriptor const *descriptor) {
+    trace("create bind group layout, %zu entries", static_cast<std::size_t>(descriptor->entryCount));
     auto *l = new WGPUBindGroupLayoutImpl;
     for (std::size_t i = 0; i < descriptor->entryCount; ++i) {
         const WGPUBindGroupLayoutEntry &e = descriptor->entries[i];
@@ -666,6 +691,7 @@ WGPUBindGroupLayout wgpuDeviceCreateBindGroupLayout(WGPUDevice, WGPUBindGroupLay
 void wgpuBindGroupLayoutRelease(WGPUBindGroupLayout l) { delete l; }
 
 WGPUPipelineLayout wgpuDeviceCreatePipelineLayout(WGPUDevice, WGPUPipelineLayoutDescriptor const *descriptor) {
+    trace("create pipeline layout");
     auto *p = new WGPUPipelineLayoutImpl;
     for (std::size_t i = 0; i < descriptor->bindGroupLayoutCount; ++i) p->groups.push_back(descriptor->bindGroupLayouts[i]);
     return p;
@@ -674,6 +700,7 @@ WGPUPipelineLayout wgpuDeviceCreatePipelineLayout(WGPUDevice, WGPUPipelineLayout
 void wgpuPipelineLayoutRelease(WGPUPipelineLayout p) { delete p; }
 
 WGPUBindGroup wgpuDeviceCreateBindGroup(WGPUDevice, WGPUBindGroupDescriptor const *descriptor) {
+    trace("create bind group, %zu entries", static_cast<std::size_t>(descriptor->entryCount));
     auto *g = new WGPUBindGroupImpl;
     g->layout = descriptor->layout;
     for (std::size_t i = 0; i < descriptor->entryCount; ++i) {
@@ -696,6 +723,7 @@ WGPUBindGroup wgpuDeviceCreateBindGroup(WGPUDevice, WGPUBindGroupDescriptor cons
 void wgpuBindGroupRelease(WGPUBindGroup g) { delete g; }
 
 WGPUShaderModule wgpuDeviceCreateShaderModule(WGPUDevice, WGPUShaderModuleDescriptor const *) {
+    trace("create shader module");
     // The module itself is only a handle: a pipeline names the entry point, and that name finds the module uam compiled
     // (dksh_table.cpp). Nothing is compiled or even parsed here.
     return new WGPUShaderModuleImpl;
@@ -704,6 +732,8 @@ WGPUShaderModule wgpuDeviceCreateShaderModule(WGPUDevice, WGPUShaderModuleDescri
 void wgpuShaderModuleRelease(WGPUShaderModule m) { delete m; }
 
 WGPUComputePipeline wgpuDeviceCreateComputePipeline(WGPUDevice d, WGPUComputePipelineDescriptor const *descriptor) {
+    trace("create compute pipeline, entry point %.*s", int(descriptor->compute.entryPoint.length),
+          descriptor->compute.entryPoint.data ? descriptor->compute.entryPoint.data : "");
     auto *p = new WGPUComputePipelineImpl;
     if (descriptor->compute.entryPoint.data)
         p->entry_point.assign(descriptor->compute.entryPoint.data, descriptor->compute.entryPoint.length);
@@ -714,6 +744,8 @@ WGPUComputePipeline wgpuDeviceCreateComputePipeline(WGPUDevice d, WGPUComputePip
 void wgpuComputePipelineRelease(WGPUComputePipeline p) { delete p; }
 
 WGPURenderPipeline wgpuDeviceCreateRenderPipeline(WGPUDevice d, WGPURenderPipelineDescriptor const *descriptor) {
+    trace("create render pipeline, vertex %.*s", int(descriptor->vertex.entryPoint.length),
+          descriptor->vertex.entryPoint.data ? descriptor->vertex.entryPoint.data : "");
     auto *p = new WGPURenderPipelineImpl;
     if (descriptor->vertex.entryPoint.data)
         p->vertex_entry.assign(descriptor->vertex.entryPoint.data, descriptor->vertex.entryPoint.length);
@@ -752,6 +784,7 @@ void wgpuRenderPipelineRelease(WGPURenderPipeline p) { delete p; }
 // ---------------------------------------------------------------------------------------------------------------------------------
 
 WGPUCommandEncoder wgpuDeviceCreateCommandEncoder(WGPUDevice d, WGPUCommandEncoderDescriptor const *) {
+    trace("create command encoder");
     auto *e = new WGPUCommandEncoderImpl;
     e->device = d;
     // Each encoder records into a slot of the device's command memory (made once, reused every frame): gpu.cpp keeps several encoders
@@ -834,6 +867,7 @@ void wgpuComputePassEncoderEnd(WGPUComputePassEncoder) {}
 void wgpuComputePassEncoderRelease(WGPUComputePassEncoder p) { delete p; }
 
 WGPURenderPassEncoder wgpuCommandEncoderBeginRenderPass(WGPUCommandEncoder e, WGPURenderPassDescriptor const *descriptor) {
+    trace("begin render pass");
     auto *p = new WGPURenderPassEncoderImpl;
     p->encoder = e;
     // deko3d's attachments are the images themselves: there is no load or store, so a "load" pass simply finds the image as it was and a
@@ -928,6 +962,7 @@ WGPUCommandBuffer wgpuCommandEncoderFinish(WGPUCommandEncoder e, WGPUCommandBuff
 void wgpuCommandBufferRelease(WGPUCommandBuffer c) { delete c; }  // its memory is held by the device until the GPU is done with it
 
 void wgpuQueueSubmit(WGPUQueue queue, std::size_t count, WGPUCommandBuffer const *commands) {
+    trace("submit %zu command buffers", static_cast<std::size_t>(count));
     if (!queue || !count) return;
     WGPUDeviceImpl *d = queue->device;
     // One list per frame on the device's queue: the previous frame is finished first, which also frees its command memory.
@@ -1001,6 +1036,7 @@ void wgpuSurfaceCapabilitiesFreeMembers(WGPUSurfaceCapabilities caps) {
 }
 
 void wgpuSurfaceConfigure(WGPUSurface s, WGPUSurfaceConfiguration const *config) {
+    trace("configure surface %ux%u", config ? unsigned(config->width) : 0u, config ? unsigned(config->height) : 0u);
     if (!s || !config || !config->device) return;
     s->device = config->device;
     s->width = config->width ? config->width : 1280;
