@@ -19,6 +19,7 @@
 
 #include <chrono>
 #include <memory>
+#include <vector>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -57,9 +58,15 @@ bool draw_wanted() {
 // PS2_DEKO3D_DRAW=2 loads one of the *compute* programs (the smallest, `snapshot`) and nothing else, then leaves. It answers a question
 // the game run cannot: whether deko3d on this console takes a compute shader module from uam at all, with no buffers, no render pass and
 // no game memory in the way.
+// 2: the smallest compute program, in a block sized just for it.
+// 3: `upload` - the program the game dies on - in a 256 KiB code block, the size the game's device uses, so that the test reproduces the
+//    game's allocation and nothing else.
 const char *compute_test_wanted() {
     const char *setting = std::getenv("PS2_DEKO3D_DRAW");
-    return setting && std::strcmp(setting, "2") == 0 ? "snapshot" : nullptr;
+    if (!setting) return nullptr;
+    if (std::strcmp(setting, "2") == 0) return "snapshot";
+    if (std::strcmp(setting, "3") == 0) return "upload";
+    return nullptr;
 }
 
 // A DKSH module is two sections: the control block, which stays in main memory (dkShaderInitialize keeps the pointer), and the code,
@@ -205,31 +212,42 @@ int deko_stage0(std::uint32_t asked) {
     std::fprintf(stderr, "[deko] 3 back buffers of %ux%u, swap chain made\n", unsigned(width), unsigned(height));
 
     if (const char *entry = compute_test_wanted()) {
-        // One compute module through the same loader the renderer uses, then out: no swap chain, no passes, nothing else.
-        const DkshProgram *program = dksh_program(entry);
-        if (!program) {
-            std::fprintf(stderr, "[deko] compute test: there is no module called %s\n", entry);
-            return 1;
-        }
-        const std::uint32_t size = module_size(program);
-        std::shared_ptr<Memory> code = gpu.allocate(size, DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached | DkMemBlockFlags_Code);
+        // The modules the game's init loads first, into one 256 KiB code block - the size the game's device uses - one after the other,
+        // so that a crash says which module and which offset ended it. No passes, no dispatch, no buffers: just the loader deko3d's
+        // dkShaderInitialize is behind. PS2_DEKO3D_DRAW=3 loads this list; =2 loads only the first (the smallest program).
+        std::vector<const char *> entries{entry};
+        if (std::strcmp(entry, "snapshot") != 0) entries = {entry};
+        if (std::getenv("PS2_DEKO3D_DRAW") && std::strcmp(std::getenv("PS2_DEKO3D_DRAW"), "3") == 0)
+            entries = {"snapshot", "upload", "display", "load_clut"};
+        std::shared_ptr<Memory> code = gpu.allocate(256 * 1024, DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached | DkMemBlockFlags_Code);
         if (!code) {
             std::fprintf(stderr, "[deko] compute test: no memory for the code\n");
             return 1;
         }
-        DkShader shader{};
-        const std::uint32_t control_size = program->words[2], code_bytes = program->words[3];
-        std::memcpy(code->cpu, reinterpret_cast<const std::uint8_t *>(program->words) + control_size, code_bytes);
-        std::fprintf(stderr, "[deko] compute test: %s, %u bytes of code, control %u\n", entry, code_bytes, control_size);
-        DkShaderMaker maker;
-        dkShaderMakerDefaults(&maker, code->block, 0);
-        maker.control = program->words;
-        dkShaderInitialize(&shader, &maker);
-        std::fprintf(stderr, "[deko] compute test: deko3d took it, valid %d, stage %d (compute is %d)\n", int(dkShaderIsValid(&shader)),
-                     int(dkShaderGetStage(&shader)), int(DkStage_Compute));
-        return 0;
+        std::fprintf(stderr, "[deko] compute test: code block %p, %u bytes\n", static_cast<void *>(code->cpu), code->size);
+        std::uint32_t offset = 0;
+        for (const char *name : entries) {
+            const DkshProgram *program = dksh_program(name);
+            if (!program) {
+                std::fprintf(stderr, "[deko] compute test: there is no module called %s\n", name);
+                return 1;
+            }
+            const std::uint32_t control_size = program->words[2], code_bytes = program->words[3];
+            std::fprintf(stderr, "[deko] compute test: %s, %u bytes of code + %u of control, at %u\n", name, code_bytes, control_size, offset);
+            std::memcpy(code->cpu + offset, reinterpret_cast<const std::uint8_t *>(program->words) + control_size, code_bytes);
+            DkShaderMaker maker;
+            dkShaderMakerDefaults(&maker, code->block, offset);
+            maker.control = program->words;
+            DkShader shader{};
+            dkShaderInitialize(&shader, &maker);
+            std::fprintf(stderr, "[deko] compute test: %s took, valid %d, stage %d\n", name, int(dkShaderIsValid(&shader)),
+                         int(dkShaderGetStage(&shader)));
+            offset += (code_bytes + DK_SHADER_CODE_UNUSABLE_SIZE + DK_SHADER_CODE_ALIGNMENT - 1) & ~(DK_SHADER_CODE_ALIGNMENT - 1);
+        }
+        std::fprintf(stderr, "[deko] compute test: done\n");
+        std::fflush(stderr);
+        std::_Exit(0);  // no deko3d teardown: the answer is printed, and a crash while unwinding would look like a failure
     }
-
     // PS2_DEKO3D_DRAW=1: the triangle, which needs the shader path (module, pipeline, viewport, draw) and not the game
     TestDraw draw;
     if (draw_wanted() && !prepare_draw(gpu.device(), draw)) return 1;
