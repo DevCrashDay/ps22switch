@@ -1002,6 +1002,9 @@ void wgpuSurfaceConfigure(WGPUSurface s, WGPUSurfaceConfiguration const *config)
     s->device = config->device;
     s->width = config->width ? config->width : 1280;
     s->height = config->height ? config->height : 720;
+    // The console's display is the default window; the window layer hands the surface a Vi target and no window handle, because there is
+    // no handle on this platform - the window is libnx's.
+    if (!s->window) s->window = nwindowGetDefault();
     if (!s->swapchain.create(s->device->gpu, s->window, s->width, s->height)) {
         s->device->error("the swap chain could not be made on the console's window");
         return;
