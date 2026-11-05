@@ -1169,8 +1169,11 @@ void wgpuSurfaceGetCurrentTexture(WGPUSurface s, WGPUSurfaceTexture *texture) {
     texture->texture = nullptr;
     texture->status = WGPUSurfaceGetCurrentTextureStatus_Error;
     if (!s || !s->swapchain.ok()) return;
-    // Blocks until the compositor frees a back buffer.
+    // Blocks until the compositor frees a back buffer. If the log ends on the line before this call, that is where it waits.
+    static std::uint32_t acquires = 0;
+    if (acquires < 4) std::fprintf(stderr, "[deko] acquire #%u: waiting for a back buffer\n", acquires + 1);
     const std::shared_ptr<ps2::gs::gpu::deko::Image> image = s->swapchain.acquire();
+    if (acquires < 4) std::fprintf(stderr, "[deko] acquire #%u: got one\n", ++acquires);
     if (!image) return;
     auto *t = new WGPUTextureImpl;
     t->device = s->device;
@@ -1187,8 +1190,11 @@ void wgpuSurfaceGetCurrentTexture(WGPUSurface s, WGPUSurfaceTexture *texture) {
 WGPUStatus wgpuSurfacePresent(WGPUSurface s) {
     std::lock_guard<std::recursive_mutex> hold(g_lock);
     if (!s || !s->swapchain.ok() || !s->acquired) return WGPUStatus_Error;
+    static std::uint32_t presents = 0;
+    if (presents < 4) std::fprintf(stderr, "[deko] present #%u\n", presents + 1);
     s->acquired = false;
     s->swapchain.present();
+    if (presents < 4) std::fprintf(stderr, "[deko] present #%u done\n", ++presents);
     return WGPUStatus_Success;
 }
 

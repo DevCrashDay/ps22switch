@@ -133,8 +133,13 @@ void Gpu::submit(bool wait_for_it) {
 
 void Gpu::wait() {
     if (!m_pending) return;
+    static std::uint32_t waits = 0;
+    const bool loud = waits < 4;
+    if (loud) std::fprintf(stderr, "[deko] waiting for submission #%u\n", ++waits);
     const DkResult result = dkFenceWait(&m_fence, 4000000000LL);  // four seconds
     if (result != DkResult_Success) std::fprintf(stderr, "[deko] the GPU did not finish a submission (%d)\n", int(result));
+    if (loud) std::fprintf(stderr, "[deko] submission #%u finished, queue %s\n", waits,
+                           dkQueueIsInErrorState(m_queue) ? "IN ERROR" : "healthy");
     m_pending = false;
 }
 
