@@ -25,6 +25,7 @@
 #include <webgpu/wgpu.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -86,6 +87,8 @@ struct WGPUDeviceImpl {
     std::shared_ptr<ps2::gs::gpu::deko::Memory> descriptors;
     std::uint32_t image_count = 0, sampler_count = 0;
     bool default_sampler = false;  // the sampler slot 0: what a binding that samples a texture uses
+    // What the shim has actually done, for the log: a frame rate and a count of the work is the first thing a run should say.
+    std::uint32_t submits = 0, passes = 0, draws = 0, dispatches = 0;
     void error(std::string message);
 };
 
@@ -801,6 +804,7 @@ void wgpuComputePassEncoderSetBindGroup(WGPUComputePassEncoder p, std::uint32_t,
 
 void wgpuComputePassEncoderDispatchWorkgroups(WGPUComputePassEncoder p, std::uint32_t x, std::uint32_t y, std::uint32_t z) {
     if (!p || !p->pipeline || !p->pipeline->ready || !x || !y || !z) return;
+    ++p->encoder->device->dispatches;
     DkCmdBuf cmd = p->encoder->commands;
     dkCmdBufDispatchCompute(cmd, x, y, z);
     // WebGPU: each dispatch sees what the one before it wrote.
@@ -816,6 +820,7 @@ WGPURenderPassEncoder wgpuCommandEncoderBeginRenderPass(WGPUCommandEncoder e, WG
     // deko3d's attachments are the images themselves: there is no load or store, so a "load" pass simply finds the image as it was and a
     // "clear" is an explicit clear on it. That is also why the hardware path's separate depth-load pass works unchanged.
     DkCmdBuf cmd = e->commands;
+    ++e->device->passes;
     DkImageView color_view{}, depth_view{};
     const DkImageView *color = nullptr, *depth = nullptr;
     if (descriptor->colorAttachmentCount && descriptor->colorAttachments[0].view && descriptor->colorAttachments[0].view->texture &&
@@ -880,6 +885,7 @@ void wgpuRenderPassEncoderSetBlendConstant(WGPURenderPassEncoder p, WGPUColor co
 void wgpuRenderPassEncoderDraw(WGPURenderPassEncoder p, std::uint32_t vertices, std::uint32_t instances, std::uint32_t first_vertex,
                               std::uint32_t first_instance) {
     if (!p || !p->pipeline || !p->pipeline->ready || !vertices) return;
+    ++p->encoder->device->draws;
     dkCmdBufDraw(p->encoder->commands, p->pipeline->primitive, vertices, instances, first_vertex, first_instance);
 }
 
@@ -917,6 +923,14 @@ void wgpuQueueSubmit(WGPUQueue queue, std::size_t count, WGPUCommandBuffer const
     // The queue waited for the frame before this one in Gpu::begin(), so every slot that was in flight is free: the next frame's encoders
     // take them again.
     d->free_slots();
+    ++d->submits;
+    if (d->submits % 60 == 0) {
+        static double started = 0.0;
+        const double now = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+        if (started == 0.0) started = now;
+        std::fprintf(stderr, "[deko] %u submissions in %.1f s (%.1f a second): %u passes, %u draws, %u dispatches\n", d->submits, now - started,
+                     d->submits / (now - started), d->passes, d->draws, d->dispatches);
+    }
 }
 
 WGPUFuture wgpuQueueOnSubmittedWorkDone(WGPUQueue queue, WGPUQueueWorkDoneCallbackInfo info) {
