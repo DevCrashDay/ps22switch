@@ -16,6 +16,7 @@
 // done yet — the next slice puts them on deko3d commands.
 
 #include <deko3d.hpp>
+#include <pthread.h>
 #include <switch.h>
 
 #include "deko_gpu.hpp"
@@ -27,6 +28,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <functional>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
@@ -621,6 +623,32 @@ bool texture_handle(WGPUDeviceImpl *d, WGPUTextureImpl *texture, bool storage, D
     return true;
 }
 
+// Work that loads a shader module on a big stack. gpu::init runs on the emulation thread on the Switch, whose stack is small (libnx's
+// pthread default is 128 KiB, and the emulator is already several frames deep when the graphics side initialises); the same module load on
+// the main thread - which is where the bring-up test does it - works. The Vulkan shim wraps NVK's shader compiler in exactly this for
+// exactly this reason.
+void on_big_stack(const std::function<void()> &work) {
+#ifdef __SWITCH__
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, 1u << 20);
+    pthread_t thread;
+    auto *job = new std::function<void()>(work);
+    if (pthread_create(&thread, &attr, [](void *arg) -> void * {
+            (*static_cast<std::function<void()> *>(arg))();
+            return nullptr;
+        }, job) == 0) {
+        pthread_join(thread, nullptr);
+    } else {
+        work();
+    }
+    delete job;
+    pthread_attr_destroy(&attr);
+#else
+    work();
+#endif
+}
+
 // The stage a bind group's buffers go to, as deko3d's per-stage binding.
 constexpr DkStage kBufferStages[] = {DkStage_Vertex, DkStage_Fragment, DkStage_Compute};
 
@@ -740,11 +768,21 @@ void wgpuShaderModuleRelease(WGPUShaderModule m) { delete m; }
 WGPUComputePipeline wgpuDeviceCreateComputePipeline(WGPUDevice d, WGPUComputePipelineDescriptor const *descriptor) {
     trace("create compute pipeline, entry point %.*s", int(descriptor->compute.entryPoint.length),
           descriptor->compute.entryPoint.data ? descriptor->compute.entryPoint.data : "");
-    auto *p = new WGPUComputePipelineImpl;
-    if (descriptor->compute.entryPoint.data)
-        p->entry_point.assign(descriptor->compute.entryPoint.data, descriptor->compute.entryPoint.length);
-    p->ready = load_program(d, p->entry_point, p->shader);
-    return p;
+    WGPUComputePipeline result = nullptr;
+    on_big_stack([&] {
+        try {
+            auto *p = new WGPUComputePipelineImpl;
+            trace("  pipeline object made");
+            if (descriptor->compute.entryPoint.data)
+                p->entry_point.assign(descriptor->compute.entryPoint.data, descriptor->compute.entryPoint.length);
+            trace("  entry point named");
+            p->ready = load_program(d, p->entry_point, p->shader);
+            result = p;
+        } catch (const std::exception &e) {
+            std::fprintf(stderr, "[deko] a compute pipeline could not be made: %s\n", e.what());
+        }
+    });
+    return result;
 }
 
 void wgpuComputePipelineRelease(WGPUComputePipeline p) { delete p; }
@@ -752,6 +790,9 @@ void wgpuComputePipelineRelease(WGPUComputePipeline p) { delete p; }
 WGPURenderPipeline wgpuDeviceCreateRenderPipeline(WGPUDevice d, WGPURenderPipelineDescriptor const *descriptor) {
     trace("create render pipeline, vertex %.*s", int(descriptor->vertex.entryPoint.length),
           descriptor->vertex.entryPoint.data ? descriptor->vertex.entryPoint.data : "");
+    WGPURenderPipeline result = nullptr;
+    on_big_stack([&] {
+    try {
     auto *p = new WGPURenderPipelineImpl;
     if (descriptor->vertex.entryPoint.data)
         p->vertex_entry.assign(descriptor->vertex.entryPoint.data, descriptor->vertex.entryPoint.length);
@@ -780,7 +821,12 @@ WGPURenderPipeline wgpuDeviceCreateRenderPipeline(WGPUDevice d, WGPURenderPipeli
         }
     }
     p->ready = load_program(d, p->vertex_entry, p->vertex) && load_program(d, p->fragment_entry, p->fragment);
-    return p;
+    result = p;
+    } catch (const std::exception &e) {
+        std::fprintf(stderr, "[deko] a render pipeline could not be made: %s\n", e.what());
+    }
+    });
+    return result;
 }
 
 void wgpuRenderPipelineRelease(WGPURenderPipeline p) { delete p; }
