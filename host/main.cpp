@@ -5,6 +5,7 @@
 #include "ps2/deko_stage0.h"
 #include "thread.hpp"
 #include "switch_clock.hpp"
+#include "switch_crash.hpp"
 
 #ifdef PS2_WINDOW
 #include "window.hpp"
@@ -691,6 +692,7 @@ int main(int argc, char **argv) {
         if (fileno(out) != 1) dup2(fileno(out), 1);
     }
     if (fileno(stderr) != 2) dup2(fileno(stderr), 2);
+    switch_crash_report();  // host/switch_crash.cpp: from here on, a CPU fault names itself in the log instead of cutting it short
     std::vector<std::string> switch_args;
     std::vector<char *> switch_argv;
     if (argc < 2) {

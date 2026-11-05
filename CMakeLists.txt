@@ -308,7 +308,7 @@ if(PS2_GENERATED)
 
     add_executable(ps2run host/main.cpp)
     if(NINTENDO_SWITCH)
-        target_sources(ps2run PRIVATE host/switch_clock.cpp)
+        target_sources(ps2run PRIVATE host/switch_clock.cpp host/switch_crash.cpp)
     endif()
     target_link_libraries(ps2run PRIVATE ps2game ps2runtime)
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")

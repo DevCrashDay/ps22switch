@@ -222,7 +222,7 @@ stage that removes NVK is the same one that stops using SDL's renderer and takes
 
 ## Where stage 1 stands (2026-11-05)
 
-Built, committed, and **not yet run on the console**:
+Built, committed, and run on the console (below). The files it is made of:
 
 - `runtime/src/gs/gpu/deko/deko_gpu.cpp` — device, queue, command memory, buffers, images, the swap chain on the console's window.
 - `runtime/src/gs/gpu/deko/wgpu_deko.cpp` — the 63 WebGPU calls `gpu.cpp` makes, on deko3d: buffers (memcpy writes, barrier readbacks),
@@ -236,17 +236,69 @@ Built, committed, and **not yet run on the console**:
 - `host/window.cpp` — the display is deko3d's; SDL keeps input and sound.
 - `CMakeLists.txt` — `-DPS2_DEKO3D_RENDER=ON` swaps the Vulkan shim for this one. The Vulkan build is unchanged and still links.
 
-What the first console run has to answer, and what each answer means:
+What the first runs said (`build/switch/tests/J-deko-render`, 2026-11-05):
+
+```
+[deko] device open (deko3d)
+[gpu] 9 shaders compiled in 251 ms                  11 modules, ~51 KiB of the 256 KiB code block
+[deko] surface configured: 1280x720, three back buffers
+[window] presenting through WebGPU
+[gs] SetGsCrt interlace 1 mode 0x2 field 1
+[deko] memory block 18: 131072 bytes                the first frame's command memory
+[deko] first submission: the renderer is running through deko3d
+[deko] acquire #1: waiting for a back buffer
+[deko] acquire #1: got one
+[deko] waiting for submission #1
+[deko] submission #1 finished, queue healthy
+```
+
+That is a working deko3d renderer up to and including its first submitted frame: the device, the queue, every pipeline, the swap chain on
+the console's own window, and a command list the GPU executed (the fence signalled, the queue stayed healthy). The game boots as far as
+`SetGsCrt` before any of it, so the emulation side is unaffected.
+
+Then the program faulted — a data abort, which prints nothing: the system's error screen and the home menu. It is a CPU fault, not the
+GPU: the GPU had finished the submission and reported nothing wrong. It happens between that fence and the first `present`, and both of
+those print whenever they are reached.
+
+Why the log could not say where: `trace()` stops after 120 lines, and all 120 are spent setting the device up.
+
+### Reading a fault
+
+Two things cover the frames themselves now.
+
+**The fault names itself.** libnx already catches the abort: it copies the registers into `__nx_exceptiondump` and then calls
+`__libnx_exception_handler` — a weak symbol nobody defined, so the dump was thrown away. `host/switch_crash.cpp` defines it, so a fault
+writes its kind, the address it touched, the program counter and the frame pointer chain into `ps2run.log`, as offsets from a function
+called `crash_marker`, which do not depend on where the console loaded the program. `scripts/switch_crash.py` turns them into names:
+
+```
+python scripts/switch_crash.py build/switch/tests/J-deko-render/ps2run.log
+```
+
+It finds `crash_marker` in the `.elf` (the Release build keeps its debug information, so the answer includes file and line), adds each
+offset back and names the function. A run made with the handler prints `[crash] a fault in the CPU prints its registers and call chain
+here` as its first line; a log without that line came from an older `.nro`.
+
+**The frame path traces itself.** `[deko] >` lines cover the recording and hand-over of the first frames — the encoder taking command
+memory, each pass, each binding with its address and size, each image descriptor handle, the dispatch, the list being finished and given
+to the queue, the acquire and the present — up to 1500 lines, which is several frames' worth, because the line before the crash is the
+answer. `PS2_DEKO3D_TRACE=0` turns both traces off.
+
+What the next run answers, and what each answer means:
 
 | in `ps2run.log` | meaning |
 | --- | --- |
-| no `[deko]` line at all | the display handover failed before deko3d (SDL without video, or the VI surface) |
-| `device open`, no `surface configured` | the swap chain on the console's window |
-| `no compiled module for hw_writeback_depth` | expected; the depth writeback is the one program without a module |
-| `S skipped` climbing in the periodic line | this game *does* need that program, so a depth writeback has to be built |
-| `S skipped` staying 0 | the gap does not matter for this game |
-| `D draws` climbing | the renderer is running end to end through the shim; the rate in that line is the first number against the 30.2 fps Vulkan baseline |
+| `[crash]` whose pc is in `wgpu_deko.cpp` or `deko_gpu.cpp` | the shim's own fault: the named function and line are the fix |
+| `[crash]` whose pc is in `wgpuDeviceCreateRenderPipeline` | a render pipeline made in the middle of a frame (`hw_pipeline` does that the first time a blend/depth key is drawn) |
+| `[crash]` whose pc is in `memcpy`/`std::string`/`shared_ptr` | the caller in the chain (`#0`, `#1`) handed it a bad or freed pointer |
+| `[crash]` with the touched address near 0 | a null dereference: an object `gpu.cpp` handed over that the shim never made |
+| `no thread for the shader work (…)` | `pthread_create` failed and the module load ran on the calling thread's stack — a fault right there is a stack overflow |
+| `the image descriptor table is full` | the code that keeps one descriptor per image regressed |
+| `[deko] >` lines ending at `encoder: …` / `finish: …` / `submit …` | the fault is in that call, and the next line is missing because it never returned |
+| `present #1` and then a crash | the fault is after the picture reached the screen: `wgpuTextureViewRelease`/`wgpuTextureRelease` of the frame's objects |
+| the periodic `N submissions in T s` line | the renderer is running: that rate is the number to compare with the 30.2 fps Vulkan baseline, and `S skipped` says whether this game needs the depth writeback |
 
-The last functional gap is the depth writeback. The two shapes it can take — a 2D-engine copy of the depth image into an `R32F` image the
-writeback program can read, or a `R32F` mirror target written by the fragment shader — both need a console to try, and neither is worth
-building before a run says whether this game reads its depth buffer back at all.
+The last functional gap is still the depth writeback. The two shapes it can take — a 2D-engine copy of the depth image into an `R32F`
+image the writeback program can read, or an `R32F` mirror target written by the fragment shader — both need a console to try, and neither
+is worth building before a run says whether this game reads its depth buffer back at all.
+

@@ -36,6 +36,10 @@ struct Image {
     DkImageView view{};
     Format format = Format::Rgba8Unorm;
     std::uint32_t width = 0, height = 0;
+    // Its two entries in the device's descriptor tables, made on first use: one for reading it as a texture (a handle and a sampler),
+    // one for writing it as a storage image. They belong to the image and not to the WebGPU texture object, because gpu.cpp makes a new
+    // texture object for the same screen image every frame and the table has a thousand entries.
+    std::uint32_t image_slot = 0xFFFFFFFFu, storage_slot = 0xFFFFFFFFu;
 };
 
 // The device, the queue and the command list a frame is recorded into. One Gpu per program.

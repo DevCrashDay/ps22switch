@@ -79,6 +79,25 @@ void log_once(const char *what) {
     std::fprintf(stderr, "[deko] %s\n", what);
 }
 
+// The trace above stops after 120 lines, and every one of those is spent setting the device up: by the time the first frame is recorded
+// there is nothing left, so a fault in the frame path used to leave a log ending at the last thing the device was told rather than the
+// last thing the shim did. These lines cover the recording and hand-over of the first frames instead, and they say which call is next
+// (the line before the crash is the answer). PS2_DEKO3D_TRACE=0 turns them off with the others.
+std::uint32_t g_staged = 0;
+constexpr std::uint32_t kStageLines = 1500;
+
+template <typename... Args>
+void stage(const char *what, Args... args) {
+    if (!trace_on() || g_staged >= kStageLines) return;
+    if (++g_staged == kStageLines) {
+        std::fprintf(stderr, "[deko] (no more frame traces after %u lines)\n", kStageLines);
+        return;
+    }
+    std::fprintf(stderr, "[deko] > ");
+    std::fprintf(stderr, what, args...);
+    std::fputc('\n', stderr);
+}
+
 }
 
 // ---------------------------------------------------------------------------------------------------------------------------------
@@ -144,9 +163,8 @@ struct WGPUTextureImpl {
     std::shared_ptr<ps2::gs::gpu::deko::Image> image;
     WGPUTextureFormat format = WGPUTextureFormat_Undefined;
     std::uint32_t width = 0, height = 0;
-    // Its descriptors in the device's table, made when it is first bound: an image used as a storage image needs a different
-    // descriptor from the same image sampled as a texture, and the colour target is both.
-    std::uint32_t image_slot = 0xFFFFFFFFu, storage_slot = 0xFFFFFFFFu;
+    // Its two entries in the device's descriptor tables, made on first use (see deko::Image: they belong to the image, not to this
+    // object, because the same screen image becomes a new texture object every frame).
     bool borrowed = false;                   // a swap chain back buffer: the swap chain owns it
 };
 
@@ -483,8 +501,9 @@ WGPUTexture wgpuDeviceCreateTexture(WGPUDevice d, WGPUTextureDescriptor const *d
     t->height = descriptor->size.height;
     t->image = d->gpu.image(t->width, t->height, format, to_deko_flags(descriptor->usage));
     if (!t->image) {
+        const std::string message = "no memory for a texture of " + std::to_string(t->width) + "x" + std::to_string(t->height);
         delete t;
-        d->error("no memory for a texture of " + std::to_string(t->width) + "x" + std::to_string(t->height));
+        d->error(message);
         return nullptr;
     }
     return t;
@@ -622,20 +641,22 @@ bool load_program(WGPUDeviceImpl *d, const std::string &entry, DkShader &shader)
     return true;
 }
 
-// The handle of a texture's view in the device's descriptor tables: an image descriptor for a storage image (what a compute program
-// writes), an image plus the default sampler for one that is sampled. deko3d binds textures and images by handle, and a handle is an
-// index into those tables.
-bool texture_handle(WGPUDeviceImpl *d, WGPUTextureImpl *texture, bool storage, DkResHandle &handle) {
-    if (!texture || !texture->image || !d->descriptors) return false;
+// The handle of an image in the device's descriptor tables: an image descriptor for a storage image (what a compute program writes), an
+// image plus the default sampler for one that is read. deko3d binds textures and images by handle, and a handle is an index into those
+// tables - which is why the index is kept on the image itself: the same screen image is handed to gpu.cpp as a new texture object every
+// frame, and one entry per object would fill the thousand-entry table after a thousand frames.
+bool texture_handle(WGPUDeviceImpl *d, const std::shared_ptr<ps2::gs::gpu::deko::Image> &image, bool storage, DkResHandle &handle) {
+    if (!image || !d->descriptors) return false;
     auto *images = reinterpret_cast<DkImageDescriptor *>(d->descriptors->cpu);
-    std::uint32_t *slot = storage ? &texture->storage_slot : &texture->image_slot;
+    std::uint32_t *slot = storage ? &image->storage_slot : &image->image_slot;
     if (*slot == 0xFFFFFFFFu) {
         if (d->image_count >= 1024) {
             log_once("the image descriptor table is full");
             return false;
         }
         *slot = d->image_count++;
-        dkImageDescriptorInitialize(&images[*slot], &texture->image->view, storage, false);
+        dkImageDescriptorInitialize(&images[*slot], &image->view, storage, false);
+        stage("  texture: %s gets descriptor %u", storage ? "written" : "read", *slot);
     }
     if (storage) {
         handle = dkMakeImageHandle(*slot);
@@ -660,15 +681,19 @@ void on_big_stack(const std::function<void()> &work) {
 #ifdef __SWITCH__
     pthread_attr_t attr;
     pthread_attr_init(&attr);
-    pthread_attr_setstacksize(&attr, 1u << 20);
+    pthread_attr_setstacksize(&attr, 1u << 21);
     pthread_t thread;
     auto *job = new std::function<void()>(work);
-    if (pthread_create(&thread, &attr, [](void *arg) -> void * {
+    const int created = pthread_create(&thread, &attr, [](void *arg) -> void * {
             (*static_cast<std::function<void()> *>(arg))();
             return nullptr;
-        }, job) == 0) {
+        }, job);
+    if (created == 0) {
         pthread_join(thread, nullptr);
     } else {
+        // Out of threads: the work runs here instead, on the stack this thread has. On the console's window thread that stack is small,
+        // and a shader module load on it is a fault with no message - so it says here that it did.
+        std::fprintf(stderr, "[deko] no thread for the shader work (%d): it runs on this thread's stack instead\n", created);
         work();
     }
     delete job;
@@ -681,10 +706,17 @@ void on_big_stack(const std::function<void()> &work) {
 // The stage a bind group's buffers go to, as deko3d's per-stage binding.
 constexpr DkStage kBufferStages[] = {DkStage_Vertex, DkStage_Fragment, DkStage_Compute};
 
+// How much of the frame path the traces above cover: a few of each, because a frame has thousands of binds and draws and the lines that
+// matter are the last ones (the picture's hand-over to the screen comes after the frame's own work).
+bool first_of(std::uint32_t &count, std::uint32_t many) { return ++count <= many; }
+
 // Binds a group's buffers (by address, dynamic offset included) and storage images at the binding numbers the shaders use. deko3d has no
 // descriptor sets for buffers, so this is where the Vulkan version's per-draw set binding disappears.
 void bind_group(DkCmdBuf cmd, const WGPUBindGroupImpl *group, bool compute, std::size_t offset_count, const std::uint32_t *offsets) {
     if (!group) return;
+    static std::uint32_t groups = 0;
+    const bool loud = first_of(groups, 24);
+    if (loud) stage("  group of %zu entries, %s", group->entries.size(), compute ? "compute" : "render");
     std::size_t next_offset = 0;
     for (const WGPUBindGroupImpl::Entry &entry : group->entries) {
         // A dynamic offset comes from the pass's list, in the order the layout marks the entries dynamic.
@@ -698,9 +730,20 @@ void bind_group(DkCmdBuf cmd, const WGPUBindGroupImpl *group, bool compute, std:
             ++next_offset;
         }
         if (entry.is_buffer) {
-            if (!entry.buffer || !entry.buffer->memory) continue;
+            if (!entry.buffer || !entry.buffer->memory) {
+                if (loud) stage("  binding %u: no buffer", entry.binding);
+                continue;
+            }
             const std::uint64_t offset = entry.offset + dynamic;
-            const std::uint64_t size = entry.size == WGPU_WHOLE_SIZE || entry.size == 0 ? entry.buffer->size - offset : entry.size;
+            // A binding at or past the end of its buffer would otherwise wrap into a range of gigabytes: deko3d takes the size on trust,
+            // and the shader would read whatever follows the buffer.
+            if (offset >= entry.buffer->size) {
+                if (loud) stage("  binding %u: offset %llu past the end of %llu bytes", entry.binding,
+                                static_cast<unsigned long long>(offset), static_cast<unsigned long long>(entry.buffer->size));
+                continue;
+            }
+            std::uint64_t size = entry.size == WGPU_WHOLE_SIZE || entry.size == 0 ? entry.buffer->size - offset : entry.size;
+            size = std::min(size, entry.buffer->size - offset);
             // deko3d's uniform and storage buffers are separate namespaces, and only the layout knows which one this binding is: a
             // uniform buffer is limited to 64 KiB, so binding video memory at a uniform slot is an error the device would report (or
             // worse, a list it rejects).
@@ -708,26 +751,35 @@ void bind_group(DkCmdBuf cmd, const WGPUBindGroupImpl *group, bool compute, std:
             if (group->layout)
                 for (const WGPUBindGroupLayoutImpl::Entry &l : group->layout->entries)
                     if (l.binding == entry.binding) uniform = l.uniform;
-            const DkBufExtents extents{entry.buffer->memory->gpu + offset, static_cast<std::uint32_t>(uniform ? std::min<std::uint64_t>(size, DK_UNIFORM_BUF_MAX_SIZE) : size)};
-            for (DkStage stage : kBufferStages) {
-                if (compute && stage != DkStage_Compute) continue;
-                if (!compute && stage == DkStage_Compute) continue;
-                if (uniform) dkCmdBufBindUniformBuffers(cmd, stage, entry.binding, &extents, 1);
-                else dkCmdBufBindStorageBuffers(cmd, stage, entry.binding, &extents, 1);
+            const DkBufExtents extents{entry.buffer->memory->gpu + offset,
+                                       static_cast<std::uint32_t>(uniform ? std::min<std::uint64_t>(size, DK_UNIFORM_BUF_MAX_SIZE) : size)};
+            if (loud) stage("  binding %u: %s at 0x%llx, %u bytes", entry.binding, uniform ? "uniform" : "storage",
+                            static_cast<unsigned long long>(extents.addr), extents.size);
+            for (DkStage where : kBufferStages) {
+                if (compute && where != DkStage_Compute) continue;
+                if (!compute && where == DkStage_Compute) continue;
+                if (uniform) dkCmdBufBindUniformBuffers(cmd, where, entry.binding, &extents, 1);
+                else dkCmdBufBindStorageBuffers(cmd, where, entry.binding, &extents, 1);
             }
-        } else if (entry.texture && entry.texture->texture) {
+        } else if (entry.texture && entry.texture->image) {
             // The layout says whether this binding is a storage image (a compute program writing it) or a sampled texture.
             bool storage = false;
             if (group->layout)
                 for (const WGPUBindGroupLayoutImpl::Entry &l : group->layout->entries)
                     if (l.binding == entry.binding) storage = l.storage_texture;
             DkResHandle handle = 0;
-            if (!texture_handle(entry.texture->texture->device, entry.texture->texture, storage, handle)) continue;
-            for (DkStage stage : kBufferStages) {
-                if (compute && stage != DkStage_Compute) continue;
-                if (!compute && stage == DkStage_Compute) continue;
-                if (storage) dkCmdBufBindImages(cmd, stage, entry.binding, &handle, 1);
-                else dkCmdBufBindTextures(cmd, stage, entry.binding, &handle, 1);
+            // Through the view, never through its texture object: a view outlives the object it was made from (gpu.cpp releases the
+            // screen's texture every frame and keeps what it drew with).
+            if (!texture_handle(entry.texture->device, entry.texture->image, storage, handle)) {
+                if (loud) stage("  binding %u: no image handle", entry.binding);
+                continue;
+            }
+            if (loud) stage("  binding %u: %s handle 0x%x", entry.binding, storage ? "image" : "texture", unsigned(handle));
+            for (DkStage where : kBufferStages) {
+                if (compute && where != DkStage_Compute) continue;
+                if (!compute && where == DkStage_Compute) continue;
+                if (storage) dkCmdBufBindImages(cmd, where, entry.binding, &handle, 1);
+                else dkCmdBufBindTextures(cmd, where, entry.binding, &handle, 1);
             }
         }
     }
@@ -877,7 +929,9 @@ WGPUCommandEncoder wgpuDeviceCreateCommandEncoder(WGPUDevice d, WGPUCommandEncod
     // The command memory of the frame before may still be in the GPU's hands: clearing it now is what a use-after-free looks like on this
     // hardware. Gpu::wait() waits for the fence of the last submission, so the slots are free to write again - which is also the one frame
     // of latency a single command buffer costs. (A ring with a fence per slot would remove the wait; see docs/deko3d.md.)
+    stage("encoder: waiting for the GPU to finish the last submission");
     d->gpu.wait();
+    stage("encoder: it has; taking command memory");
     WGPUDeviceImpl::CommandSlot *slot = d->take_slot();
     if (!slot) {
         delete e;
@@ -885,6 +939,7 @@ WGPUCommandEncoder wgpuDeviceCreateCommandEncoder(WGPUDevice d, WGPUCommandEncod
         return nullptr;
     }
     if (!slot->memory) {
+        stage("encoder: no memory in this slot yet, making 128 KiB of it");
         slot->memory = d->gpu.allocate(128 * 1024, DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached);
         if (!slot->memory) {
             slot->busy = false;
@@ -893,16 +948,20 @@ WGPUCommandEncoder wgpuDeviceCreateCommandEncoder(WGPUDevice d, WGPUCommandEncod
             return nullptr;
         }
         slot->commands = dk::CmdBufMaker{d->gpu.device()}.create();
+        stage("encoder: command buffer made, adding its memory");
         dkCmdBufAddMemory(slot->commands, slot->memory->block, 0, slot->memory->size);
+        stage("encoder: command buffer ready");
     }
     e->memory = slot->memory;
     e->commands = slot->commands;
     e->commands.clear();
     // The image and sampler tables, and the invalidate that makes newly written descriptors visible to the shaders.
     constexpr std::uint32_t kImages = 1024, kSamplers = 256;
+    stage("encoder: binding the descriptor tables at 0x%llx", static_cast<unsigned long long>(d->descriptors->gpu));
     dkCmdBufBindImageDescriptorSet(e->commands, d->descriptors->gpu, kImages);
     dkCmdBufBindSamplerDescriptorSet(e->commands, d->descriptors->gpu + kImages * sizeof(DkImageDescriptor), kSamplers);
     dkCmdBufBarrier(e->commands, DkBarrier_None, DkInvalidateFlags_Descriptors);
+    stage("encoder: recording can start");
     return e;
 }
 
@@ -925,6 +984,8 @@ WGPUQuerySet wgpuDeviceCreateQuerySet(WGPUDevice, WGPUQuerySetDescriptor const *
 
 WGPUComputePassEncoder wgpuCommandEncoderBeginComputePass(WGPUCommandEncoder e, WGPUComputePassDescriptor const *) {
     std::lock_guard<std::recursive_mutex> hold(g_lock);
+    static std::uint32_t passes_begun = 0;
+    if (first_of(passes_begun, 24)) stage("compute pass %u: begins", passes_begun);
     auto *p = new WGPUComputePassEncoderImpl;
     p->encoder = e;
     return p;
@@ -934,6 +995,8 @@ void wgpuComputePassEncoderSetPipeline(WGPUComputePassEncoder p, WGPUComputePipe
     std::lock_guard<std::recursive_mutex> hold(g_lock);
     p->pipeline = pipeline;
     if (!pipeline || !pipeline->ready) return;
+    static std::uint32_t pipelines_bound = 0;
+    if (first_of(pipelines_bound, 24)) stage("compute pass: pipeline %s", pipeline->entry_point.c_str());
     const DkShader *shaders[] = {&pipeline->shader};
     dkCmdBufBindShaders(p->encoder->commands, DkStageFlag_Compute, shaders, 1);
 }
@@ -951,6 +1014,8 @@ void wgpuComputePassEncoderDispatchWorkgroups(WGPUComputePassEncoder p, std::uin
     if (p && p->pipeline && !p->pipeline->ready) ++p->encoder->device->skipped;
     if (!p || !p->pipeline || !p->pipeline->ready || !x || !y || !z) return;
     ++p->encoder->device->dispatches;
+    static std::uint32_t dispatched = 0;
+    if (first_of(dispatched, 24)) stage("dispatch: %ux%ux%u", x, y, z);
     DkCmdBuf cmd = p->encoder->commands;
     dkCmdBufDispatchCompute(cmd, x, y, z);
     // WebGPU: each dispatch sees what the one before it wrote.
@@ -963,6 +1028,8 @@ void wgpuComputePassEncoderRelease(WGPUComputePassEncoder p) { delete p; }
 WGPURenderPassEncoder wgpuCommandEncoderBeginRenderPass(WGPUCommandEncoder e, WGPURenderPassDescriptor const *descriptor) {
     std::lock_guard<std::recursive_mutex> hold(g_lock);
     trace("begin render pass");
+    static std::uint32_t passes_begun = 0;
+    const bool loud = first_of(passes_begun, 24);
     auto *p = new WGPURenderPassEncoderImpl;
     p->encoder = e;
     // deko3d's attachments are the images themselves: there is no load or store, so a "load" pass simply finds the image as it was and a
@@ -984,6 +1051,8 @@ WGPURenderPassEncoder wgpuCommandEncoderBeginRenderPass(WGPUCommandEncoder e, WG
         depth = &depth_view;
     }
     dkCmdBufBindRenderTargets(cmd, &color, color ? 1u : 0u, depth);
+    if (loud) stage("render pass %u: %ux%u colour %s, depth %s", passes_begun, p->width, p->height, color ? "bound" : "none",
+                    depth ? "bound" : "none");
     if (color && descriptor->colorAttachments[0].loadOp == WGPULoadOp_Clear) {
         const WGPUColor c = descriptor->colorAttachments[0].clearValue;
         dkCmdBufClearColorFloat(cmd, 0, DkColorMask_RGBA, static_cast<float>(c.r), static_cast<float>(c.g), static_cast<float>(c.b),
@@ -1000,6 +1069,8 @@ void wgpuRenderPassEncoderSetPipeline(WGPURenderPassEncoder p, WGPURenderPipelin
     std::lock_guard<std::recursive_mutex> hold(g_lock);
     p->pipeline = pipeline;
     if (!pipeline || !pipeline->ready) return;
+    static std::uint32_t pipelines_bound = 0;
+    if (first_of(pipelines_bound, 24)) stage("render pass: pipeline %s + %s", pipeline->vertex_entry.c_str(), pipeline->fragment_entry.c_str());
     DkCmdBuf cmd = p->encoder->commands;
     const DkShader *shaders[] = {&pipeline->vertex, &pipeline->fragment};
     dkCmdBufBindShaders(cmd, DkStageFlag_Vertex | DkStageFlag_Fragment, shaders, 2);
@@ -1040,6 +1111,8 @@ void wgpuRenderPassEncoderDraw(WGPURenderPassEncoder p, std::uint32_t vertices, 
     std::lock_guard<std::recursive_mutex> hold(g_lock);
     if (!p || !p->pipeline || !p->pipeline->ready || !vertices) return;
     ++p->encoder->device->draws;
+    static std::uint32_t drawn = 0;
+    if (first_of(drawn, 8)) stage("draw: %u vertices from %u, %u instance(s)", vertices, first_vertex, instances);
     dkCmdBufDraw(p->encoder->commands, p->pipeline->primitive, vertices, instances, first_vertex, first_instance);
 }
 
@@ -1056,7 +1129,9 @@ WGPUCommandBuffer wgpuCommandEncoderFinish(WGPUCommandEncoder e, WGPUCommandBuff
     if (!e) return nullptr;
     auto *c = new WGPUCommandBufferImpl;
     c->memory = e->memory;
+    stage("finish: closing the list at 0x%llx", static_cast<unsigned long long>(e->memory->gpu));
     c->list = dkCmdBufFinishList(e->commands);
+    stage("finish: the list is 0x%llx", static_cast<unsigned long long>(c->list));
     e->commands = nullptr;  // the command buffer owns the list now; gpu.cpp releases the encoder itself
     e->memory = nullptr;
     return c;
@@ -1069,19 +1144,31 @@ void wgpuQueueSubmit(WGPUQueue queue, std::size_t count, WGPUCommandBuffer const
     trace("submit %zu command buffers", static_cast<std::size_t>(count));
     if (!queue || !count) return;
     WGPUDeviceImpl *d = queue->device;
+    stage("submit %u: %zu list(s), starting the frame's list", d->submits + 1, count);
     // One list per frame on the device's queue: the previous frame is finished first, which also frees its command memory.
     DkCmdBuf main = d->gpu.begin();
+    // The frame wrote image and sampler descriptors while it recorded, and deko3d's L2 does not see them until it is told: one invalidate
+    // here covers every descriptor the frame made, which the one at the top of an encoder's list does not (it runs before them).
+    dkCmdBufBarrier(main, DkBarrier_None, DkInvalidateFlags_Descriptors);
     d->retired.clear();
     for (std::size_t i = 0; i < count; ++i) {
-        if (!commands[i] || !commands[i]->list) continue;
+        if (!commands[i] || !commands[i]->list) {
+            stage("submit %u: list %zu of %zu is empty", d->submits + 1, i + 1, count);
+            continue;
+        }
+        stage("submit %u: calling list %zu of %zu (0x%llx)", d->submits + 1, i + 1, count,
+              static_cast<unsigned long long>(commands[i]->list));
         dkCmdBufCallList(main, commands[i]->list);
         d->retired.push_back(commands[i]->memory);
     }
+    stage("submit %u: handing it to the queue", d->submits + 1);
     d->gpu.submit(false);
+    stage("submit %u: the queue has it", d->submits + 1);
     // The queue waited for the frame before this one in Gpu::begin(), so every slot that was in flight is free: the next frame's encoders
     // take them again.
     d->free_slots();
     ++d->submits;
+    stage("submit %u: command memory free again", d->submits);
     if (d->submits == 1) std::fprintf(stderr, "[deko] first submission: the renderer is running through deko3d\n");
     if (d->submits % 60 == 0) {
         static double started = 0.0;
