@@ -298,7 +298,43 @@ What the next run answers, and what each answer means:
 | `present #1` and then a crash | the fault is after the picture reached the screen: `wgpuTextureViewRelease`/`wgpuTextureRelease` of the frame's objects |
 | the periodic `N submissions in T s` line | the renderer is running: that rate is the number to compare with the 30.2 fps Vulkan baseline, and `S skipped` says whether this game needs the depth writeback |
 
+### What the fault was
+
+The traces and the dump answered it in one run. The last lines before the crash:
+
+```
+[deko] > compute pass: pipeline display
+[deko] > dispatch: 80x56x1
+[deko] > render pass 4: 1280x720 colour bound, depth none
+[crash] the program hit a fault
+[crash] the address it touched: 0x4e51d1002, the instruction's exception syndrome: 0x92000007
+[crash] pc 0x4e124787c (+0x99617c), ...
+  0xa4087c  bind_group+0x14c    [wgpu_deko.cpp:726]
+```
+
+`0x92000007` is a read from an address that is not mapped, in `bind_group`, in the pass that puts the picture on the screen (`render pass:
+pipeline …` never printed, so it died inside that call). The address was not memory at all: it was what a *freed* bind group layout had
+left behind in the heap.
+
+`gpu.cpp` releases a layout as soon as the bind group and the pipeline made from it exist, which WebGPU allows because those objects keep
+it alive; the shim kept a raw pointer and read the layout's entries at every bind. Every group in the renderer had that dangling
+pointer — the blit group's was simply the first whose freed memory had been written over by something else.
+
+Fixed by keeping what the API says to keep: bind group layouts, buffers and texture views are reference-counted, a bind group takes a
+reference to each (a pipeline layout takes one to its layouts too), and a view copies its image and size instead of pointing at the
+texture object — which `gpu.cpp` releases while keeping the view, the same pattern.
+
+`scripts/deko_harness.py` now builds those sources with AddressSanitizer, and the harness ends by doing exactly what `gpu.cpp` does:
+create a group, release its layout, its pipeline layout and one of its buffers, then bind it and dispatch. Taking that reference back out
+makes the harness report `heap-use-after-free` in `bind_group` and fail, so this class of fault is caught on the PC from now on.
+
+The blit needed one more thing: deko3d's depth state defaults enable the depth test and the depth write, and a pipeline that has no depth
+state must not inherit them (the blit draws into the screen with no depth buffer bound).
+
 The last functional gap is still the depth writeback. The two shapes it can take — a 2D-engine copy of the depth image into an `R32F`
 image the writeback program can read, or an `R32F` mirror target written by the fragment shader — both need a console to try, and neither
-is worth building before a run says whether this game reads its depth buffer back at all.
+is worth building before a run says whether this game reads its depth buffer back at all. That run is the next one: with the frames
+reaching the screen, the periodic `[deko] N submissions in T s` line reports `S skipped`, which is exactly that question.
+
+
 

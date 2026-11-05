@@ -331,6 +331,62 @@ int main() {
     check(wgpuBufferGetConstMappedRange(readback, 0, 4096) != nullptr, "a mapped range");
     wgpuBufferUnmap(readback);
 
+    // --- what gpu.cpp does with lifetimes, which WebGPU allows: it releases the layout, the pipeline layout and the buffer as soon as the
+    // group and the pipeline that were made from them exist, because those keep them alive. The shim used to read the freed layout at
+    // every bind, and the blit group's was the first one that faulted on the console (a data abort in bind_group, 0x4e51d1002); here it
+    // is a use-after-free that --asan reports. Binding the group with a dynamic offset needs the layout's flags (uniform, dynamic) and
+    // the buffer's bytes, so both have to still be there.
+    {
+        WGPUBindGroupLayoutEntry late[2] = {WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT, WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT};
+        late[0].binding = 0;
+        late[0].visibility = WGPUShaderStage_Compute;
+        late[0].buffer.type = WGPUBufferBindingType_ReadOnlyStorage;
+        late[1].binding = 1;
+        late[1].visibility = WGPUShaderStage_Fragment;
+        late[1].buffer.type = WGPUBufferBindingType_Uniform;
+        late[1].buffer.hasDynamicOffset = true;  // the frame's parameters, as gpu.cpp binds them
+        WGPUBindGroupLayoutDescriptor late_layout_descriptor = WGPU_BIND_GROUP_LAYOUT_DESCRIPTOR_INIT;
+        late_layout_descriptor.entryCount = 2;
+        late_layout_descriptor.entries = late;
+        WGPUBindGroupLayout born = wgpuDeviceCreateBindGroupLayout(device, &late_layout_descriptor);
+        WGPUPipelineLayoutDescriptor late_pipeline_descriptor = WGPU_PIPELINE_LAYOUT_DESCRIPTOR_INIT;
+        late_pipeline_descriptor.bindGroupLayoutCount = 1;
+        late_pipeline_descriptor.bindGroupLayouts = &born;
+        WGPUPipelineLayout late_pipeline_layout = wgpuDeviceCreatePipelineLayout(device, &late_pipeline_descriptor);
+        WGPUBuffer short_lived = make_buffer(device, 4096, WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst);
+        WGPUBindGroupEntry late_entries[2] = {WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT};
+        late_entries[0].binding = 0;
+        late_entries[0].buffer = buffers[1];
+        late_entries[0].size = WGPU_WHOLE_SIZE;
+        late_entries[1].binding = 1;
+        late_entries[1].buffer = short_lived;
+        late_entries[1].size = 4096;
+        WGPUBindGroupDescriptor late_group_descriptor = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
+        late_group_descriptor.layout = born;
+        late_group_descriptor.entryCount = 2;
+        late_group_descriptor.entries = late_entries;
+        WGPUBindGroup late_group = wgpuDeviceCreateBindGroup(device, &late_group_descriptor);
+        check(late_group != nullptr, "a bind group");
+        wgpuPipelineLayoutRelease(late_pipeline_layout);
+        wgpuBindGroupLayoutRelease(born);
+        wgpuBufferRelease(short_lived);
+        WGPUCommandEncoder late_encoder = wgpuDeviceCreateCommandEncoder(device, nullptr);
+        WGPUComputePassEncoder late_pass = wgpuCommandEncoderBeginComputePass(late_encoder, nullptr);
+        wgpuComputePassEncoderSetPipeline(late_pass, compute[0]);
+        std::uint32_t late_offset = 1024;
+        wgpuComputePassEncoderSetBindGroup(late_pass, 0, late_group, 1, &late_offset);
+        wgpuComputePassEncoderDispatchWorkgroups(late_pass, 1, 1, 1);
+        wgpuComputePassEncoderEnd(late_pass);
+        wgpuComputePassEncoderRelease(late_pass);
+        WGPUCommandBuffer late_command = wgpuCommandEncoderFinish(late_encoder, nullptr);
+        check(late_command != nullptr, "a command buffer from a group whose layout and buffer are gone");
+        wgpuQueueSubmit(queue, 1, &late_command);
+        wgpuCommandBufferRelease(late_command);
+        wgpuCommandEncoderRelease(late_encoder);
+        wgpuDevicePoll(device, true, nullptr);
+        wgpuBindGroupRelease(late_group);
+    }
+
     // --- the surface, the swap chain and present, as the window layer drives them ---
     WGPUSurface surface = wgpuCreateViSurface(instance, nullptr);
     check(surface != nullptr, "a surface");

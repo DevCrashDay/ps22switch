@@ -156,6 +156,9 @@ struct WGPUBufferImpl {
     std::uint64_t size = 0;
     bool map_read = false;
     bool mapped = false;
+    // A bind group keeps the buffer it names alive, as WebGPU says it must: gpu.cpp releases a buffer the moment it has handed it over
+    // (ensure_capacity does exactly that when the arena grows), and a raw pointer there would be read after it was freed.
+    std::uint32_t refs = 1;
 };
 
 struct WGPUTextureImpl {
@@ -170,8 +173,12 @@ struct WGPUTextureImpl {
 
 struct WGPUTextureViewImpl {
     WGPUDeviceImpl *device = nullptr;
-    WGPUTextureImpl *texture = nullptr;  // for its size and format; the image below is what keeps it valid
+    // Everything the view needs is copied out of the texture when it is made. It used to point at the texture, which gpu.cpp releases
+    // while keeping the view: the picture's own target is exactly that pattern (wgpuSurfaceGetCurrentTexture, a view of it, then
+    // wgpuTextureRelease after the frame is submitted).
     std::shared_ptr<ps2::gs::gpu::deko::Image> image;
+    std::uint32_t width = 0, height = 0;
+    std::uint32_t refs = 1;  // a bind group or a render pass keeps the view it names alive
 };
 
 struct WGPUBindGroupLayoutImpl {
@@ -184,6 +191,10 @@ struct WGPUBindGroupLayoutImpl {
         WGPUTextureFormat format = WGPUTextureFormat_Undefined;
     };
     std::vector<Entry> entries;
+    // The bind group and pipeline layout that were given this one keep it alive. gpu.cpp releases a layout as soon as the group and the
+    // pipeline it made from it exist, which WebGPU allows because the objects keep it: without this the shim read a freed layout at every
+    // bind, and the blit group's was the first to fault (0x4e51d1002, wgpu_deko.cpp:726).
+    std::uint32_t refs = 1;
 };
 
 struct WGPUPipelineLayoutImpl {
@@ -443,7 +454,10 @@ WGPUBuffer wgpuDeviceCreateBuffer(WGPUDevice d, WGPUBufferDescriptor const *desc
     return b;
 }
 
-void wgpuBufferRelease(WGPUBuffer b) { delete b; }
+void wgpuBufferRelease(WGPUBuffer b) {
+    std::lock_guard<std::recursive_mutex> hold(g_lock);
+    if (b && --b->refs == 0) delete b;  // a bind group that names it still owns a reference
+}
 
 void wgpuQueueWriteBuffer(WGPUQueue queue, WGPUBuffer buffer, std::uint64_t offset, void const *data, std::size_t size) {
     std::lock_guard<std::recursive_mutex> hold(g_lock);
@@ -517,12 +531,18 @@ WGPUTextureView wgpuTextureCreateView(WGPUTexture t, WGPUTextureViewDescriptor c
     if (!t) return nullptr;
     auto *v = new WGPUTextureViewImpl;
     v->device = t->device;
-    v->texture = t;
-    v->image = t->image;  // the view outlives the texture object in gpu.cpp, so it holds the image itself
+    // The view outlives the texture object (gpu.cpp releases the screen's texture the frame after it drew with a view of it), so it takes
+    // what it needs: the image, and the size.
+    v->image = t->image;
+    v->width = t->width;
+    v->height = t->height;
     return v;
 }
 
-void wgpuTextureViewRelease(WGPUTextureView v) { delete v; }
+void wgpuTextureViewRelease(WGPUTextureView v) {
+    std::lock_guard<std::recursive_mutex> hold(g_lock);
+    if (v && --v->refs == 0) delete v;  // a bind group or a render pass that used it still owns a reference
+}
 
 // ---------------------------------------------------------------------------------------------------------------------------------
 // Bind groups, layouts and pipelines
@@ -804,23 +824,39 @@ WGPUBindGroupLayout wgpuDeviceCreateBindGroupLayout(WGPUDevice, WGPUBindGroupLay
     return l;
 }
 
-void wgpuBindGroupLayoutRelease(WGPUBindGroupLayout l) { delete l; }
+void wgpuBindGroupLayoutRelease(WGPUBindGroupLayout l) {
+    std::lock_guard<std::recursive_mutex> hold(g_lock);
+    if (l && --l->refs == 0) delete l;  // the groups and pipeline layouts made from it still own a reference
+}
 
 WGPUPipelineLayout wgpuDeviceCreatePipelineLayout(WGPUDevice, WGPUPipelineLayoutDescriptor const *descriptor) {
     std::lock_guard<std::recursive_mutex> hold(g_lock);
     trace("create pipeline layout");
     auto *p = new WGPUPipelineLayoutImpl;
-    for (std::size_t i = 0; i < descriptor->bindGroupLayoutCount; ++i) p->groups.push_back(descriptor->bindGroupLayouts[i]);
+    for (std::size_t i = 0; i < descriptor->bindGroupLayoutCount; ++i) {
+        WGPUBindGroupLayoutImpl *layout = descriptor->bindGroupLayouts[i];
+        if (layout) ++layout->refs;
+        p->groups.push_back(layout);
+    }
     return p;
 }
 
-void wgpuPipelineLayoutRelease(WGPUPipelineLayout p) { delete p; }
+void wgpuPipelineLayoutRelease(WGPUPipelineLayout p) {
+    std::lock_guard<std::recursive_mutex> hold(g_lock);
+    if (!p) return;
+    for (WGPUBindGroupLayoutImpl *layout : p->groups)
+        if (layout && --layout->refs == 0) delete layout;
+    delete p;
+}
 
 WGPUBindGroup wgpuDeviceCreateBindGroup(WGPUDevice, WGPUBindGroupDescriptor const *descriptor) {
     std::lock_guard<std::recursive_mutex> hold(g_lock);
     trace("create bind group, %zu entries", static_cast<std::size_t>(descriptor->entryCount));
     auto *g = new WGPUBindGroupImpl;
+    // Everything this group keeps a pointer to is held: gpu.cpp releases the layout, the buffers and the views as soon as it has made the
+    // group, which WebGPU allows because the group keeps them alive.
     g->layout = descriptor->layout;
+    if (g->layout) ++g->layout->refs;
     for (std::size_t i = 0; i < descriptor->entryCount; ++i) {
         const WGPUBindGroupEntry &e = descriptor->entries[i];
         WGPUBindGroupImpl::Entry entry;
@@ -830,15 +866,29 @@ WGPUBindGroup wgpuDeviceCreateBindGroup(WGPUDevice, WGPUBindGroupDescriptor cons
             entry.buffer = e.buffer;
             entry.offset = e.offset;
             entry.size = e.size;
+            ++e.buffer->refs;
         } else {
             entry.texture = e.textureView;
+            if (entry.texture) ++entry.texture->refs;
         }
         g->entries.push_back(entry);
     }
     return g;
 }
 
-void wgpuBindGroupRelease(WGPUBindGroup g) { delete g; }
+void wgpuBindGroupRelease(WGPUBindGroup g) {
+    std::lock_guard<std::recursive_mutex> hold(g_lock);
+    if (!g) return;
+    for (const WGPUBindGroupImpl::Entry &entry : g->entries) {
+        if (entry.is_buffer) {
+            if (entry.buffer && --entry.buffer->refs == 0) delete entry.buffer;
+        } else if (entry.texture && --entry.texture->refs == 0) {
+            delete entry.texture;
+        }
+    }
+    if (g->layout && --g->layout->refs == 0) delete g->layout;
+    delete g;
+}
 
 WGPUShaderModule wgpuDeviceCreateShaderModule(WGPUDevice, WGPUShaderModuleDescriptor const *) {
     std::lock_guard<std::recursive_mutex> hold(g_lock);
@@ -884,6 +934,10 @@ WGPURenderPipeline wgpuDeviceCreateRenderPipeline(WGPUDevice d, WGPURenderPipeli
     p->primitive = to_primitive(descriptor->primitive.topology);
     // The fixed state deko3d has to be told explicitly, from the pipeline's description.
     p->rasterizer.setCullMode(to_face(descriptor->primitive.cullMode)).setFrontFace(to_front_face(descriptor->primitive.frontFace));
+    // deko3d's defaults enable the depth test *and* the depth write, and a pipeline that says nothing about depth must not inherit them:
+    // the blit that puts the picture on the screen has no depth state and draws with no depth buffer bound, and a depth test with nothing
+    // to test against is not a thing the hardware likes.
+    p->depth.setDepthTestEnable(false).setDepthWriteEnable(false);
     if (descriptor->depthStencil) {
         p->depth.setDepthCompareOp(to_compare(descriptor->depthStencil->depthCompare));
         p->depth.setDepthTestEnable(descriptor->depthStencil->depthCompare != WGPUCompareFunction_Always);
@@ -1038,16 +1092,16 @@ WGPURenderPassEncoder wgpuCommandEncoderBeginRenderPass(WGPUCommandEncoder e, WG
     ++e->device->passes;
     DkImageView color_view{}, depth_view{};
     const DkImageView *color = nullptr, *depth = nullptr;
-    if (descriptor->colorAttachmentCount && descriptor->colorAttachments[0].view && descriptor->colorAttachments[0].view->texture &&
-        descriptor->colorAttachments[0].view->texture->image) {
-        color_view = descriptor->colorAttachments[0].view->texture->image->view;
+    // Only through the view, which owns its image: gpu.cpp releases the screen's texture object as soon as the frame is handed over.
+    if (descriptor->colorAttachmentCount && descriptor->colorAttachments[0].view && descriptor->colorAttachments[0].view->image) {
+        color_view = descriptor->colorAttachments[0].view->image->view;
         color = &color_view;
-        p->width = descriptor->colorAttachments[0].view->texture->width;
-        p->height = descriptor->colorAttachments[0].view->texture->height;
+        p->width = descriptor->colorAttachments[0].view->width;
+        p->height = descriptor->colorAttachments[0].view->height;
     }
     const WGPURenderPassDepthStencilAttachment *d = descriptor->depthStencilAttachment;
-    if (d && d->view && d->view->texture && d->view->texture->image) {
-        depth_view = d->view->texture->image->view;
+    if (d && d->view && d->view->image) {
+        depth_view = d->view->image->view;
         depth = &depth_view;
     }
     dkCmdBufBindRenderTargets(cmd, &color, color ? 1u : 0u, depth);
