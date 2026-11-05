@@ -66,9 +66,12 @@ struct WGPUQueueImpl;
 struct WGPUDeviceImpl {
     ps2::gs::gpu::deko::Gpu gpu;
     std::unique_ptr<WGPUQueueImpl> queue;
-    // The code of every shader module made on this device, one module after the other in one Code memory block.
+    // The code of every shader module made on this device, one module after the other in one Code memory block, and what has been
+    // loaded into it already: gpu.cpp makes a render pipeline for every combination of blend, depth and write mask, and they all share
+    // the same few programs, so a module must be loaded once and not once per pipeline.
     std::shared_ptr<ps2::gs::gpu::deko::Memory> code_memory;
     std::uint32_t code_used = 0;
+    std::vector<std::pair<std::string, DkShader>> loaded;
     // Command memory the GPU may still be reading: freed when it has finished with it.
     std::vector<std::shared_ptr<ps2::gs::gpu::deko::Memory>> retired;
     // Command memory, reused: one slot per command buffer that is being recorded, handed out again once the GPU has finished the
@@ -78,7 +81,7 @@ struct WGPUDeviceImpl {
         dk::CmdBuf commands;
         bool busy = false;
     };
-    static constexpr std::uint32_t kCommandSlots = 8;
+    static constexpr std::uint32_t kCommandSlots = 32;
     CommandSlot slots[kCommandSlots];
     std::uint32_t slots_used = 0;
     CommandSlot *take_slot();
@@ -523,6 +526,11 @@ DkPrimitive to_primitive(WGPUPrimitiveTopology topology) {
 // One DKSH module into the device's code memory, ready for dkShaderInitialize. False when uam has no module for that entry point, which
 // is a program this renderer cannot draw with (hw_writeback reads a depth texture, which naga cannot write as GLSL at all).
 bool load_program(WGPUDeviceImpl *d, const std::string &entry, DkShader &shader) {
+    for (const auto &pair : d->loaded)
+        if (pair.first == entry) {  // already in the code block: a pipeline is a new use of the same module, not a new copy
+            shader = pair.second;
+            return dkShaderIsValid(&shader);
+        }
     const ps2::gs::gpu::deko::DkshProgram *program = ps2::gs::gpu::deko::dksh_program(entry.c_str());
     if (!program || !program->words || program->count < 6) {
         std::fprintf(stderr, "[deko] no compiled module for %s: that program cannot run (scripts/wgsl_dksh.py)\n", entry.c_str());
@@ -549,6 +557,7 @@ bool load_program(WGPUDeviceImpl *d, const std::string &entry, DkShader &shader)
         std::fprintf(stderr, "[deko] deko3d rejected the shader %s\n", entry.c_str());
         return false;
     }
+    d->loaded.emplace_back(entry, shader);
     return true;
 }
 
@@ -605,12 +614,19 @@ void bind_group(DkCmdBuf cmd, const WGPUBindGroupImpl *group, bool compute, std:
             if (!entry.buffer || !entry.buffer->memory) continue;
             const std::uint64_t offset = entry.offset + dynamic;
             const std::uint64_t size = entry.size == WGPU_WHOLE_SIZE || entry.size == 0 ? entry.buffer->size - offset : entry.size;
-            DkBufExtents extents{entry.buffer->memory->gpu + offset, static_cast<std::uint32_t>(size)};
+            // deko3d's uniform and storage buffers are separate namespaces, and only the layout knows which one this binding is: a
+            // uniform buffer is limited to 64 KiB, so binding video memory at a uniform slot is an error the device would report (or
+            // worse, a list it rejects).
+            bool uniform = false;
+            if (group->layout)
+                for (const WGPUBindGroupLayoutImpl::Entry &l : group->layout->entries)
+                    if (l.binding == entry.binding) uniform = l.uniform;
+            const DkBufExtents extents{entry.buffer->memory->gpu + offset, static_cast<std::uint32_t>(uniform ? std::min<std::uint64_t>(size, DK_UNIFORM_BUF_MAX_SIZE) : size)};
             for (DkStage stage : kBufferStages) {
                 if (compute && stage != DkStage_Compute) continue;
                 if (!compute && stage == DkStage_Compute) continue;
-                dkCmdBufBindStorageBuffers(cmd, stage, entry.binding, &extents, 1);
-                dkCmdBufBindUniformBuffers(cmd, stage, entry.binding, &extents, 1);
+                if (uniform) dkCmdBufBindUniformBuffers(cmd, stage, entry.binding, &extents, 1);
+                else dkCmdBufBindStorageBuffers(cmd, stage, entry.binding, &extents, 1);
             }
         } else if (entry.texture && entry.texture->texture) {
             // The layout says whether this binding is a storage image (a compute program writing it) or a sampled texture.
