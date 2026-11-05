@@ -70,6 +70,18 @@ struct WGPUDeviceImpl {
     std::uint32_t code_used = 0;
     // Command memory the GPU may still be reading: freed when it has finished with it.
     std::vector<std::shared_ptr<ps2::gs::gpu::deko::Memory>> retired;
+    // Command memory, reused: one slot per command buffer that is being recorded, handed out again once the GPU has finished the
+    // frame they were submitted in (the queue waits for the previous frame before recording another).
+    struct CommandSlot {
+        std::shared_ptr<ps2::gs::gpu::deko::Memory> memory;
+        dk::CmdBuf commands;
+        bool busy = false;
+    };
+    static constexpr std::uint32_t kCommandSlots = 8;
+    CommandSlot slots[kCommandSlots];
+    std::uint32_t slots_used = 0;
+    CommandSlot *take_slot();
+    void free_slots();
     // Image and sampler descriptors: deko3d binds images by handle, and a handle is an index into these two tables.
     std::shared_ptr<ps2::gs::gpu::deko::Memory> descriptors;
     std::uint32_t image_count = 0, sampler_count = 0;
@@ -102,7 +114,8 @@ struct WGPUTextureImpl {
 
 struct WGPUTextureViewImpl {
     WGPUDeviceImpl *device = nullptr;
-    WGPUTextureImpl *texture = nullptr;
+    WGPUTextureImpl *texture = nullptr;  // for its size and format; the image below is what keeps it valid
+    std::shared_ptr<ps2::gs::gpu::deko::Image> image;
 };
 
 struct WGPUBindGroupLayoutImpl {
@@ -217,6 +230,21 @@ std::uint32_t to_deko_flags(WGPUTextureUsage usage) {
 }
 
 void WGPUDeviceImpl::error(std::string message) { WGPUDeviceImpl_error(this, message); }
+
+WGPUDeviceImpl::CommandSlot *WGPUDeviceImpl::take_slot() {
+    for (CommandSlot &slot : slots)
+        if (!slot.busy) {
+            slot.busy = true;
+            ++slots_used;
+            return &slot;
+        }
+    return nullptr;  // every slot is still recording or in flight: the caller cannot record another list
+}
+
+void WGPUDeviceImpl::free_slots() {
+    for (CommandSlot &slot : slots) slot.busy = false;
+    slots_used = 0;
+}
 
 extern "C" {
 
@@ -411,6 +439,7 @@ WGPUTextureView wgpuTextureCreateView(WGPUTexture t, WGPUTextureViewDescriptor c
     auto *v = new WGPUTextureViewImpl;
     v->device = t->device;
     v->texture = t;
+    v->image = t->image;  // the view outlives the texture object in gpu.cpp, so it holds the image itself
     return v;
 }
 
@@ -677,7 +706,7 @@ WGPURenderPipeline wgpuDeviceCreateRenderPipeline(WGPUDevice d, WGPURenderPipeli
     if (descriptor->depthStencil) {
         p->depth.setDepthCompareOp(to_compare(descriptor->depthStencil->depthCompare));
         p->depth.setDepthTestEnable(descriptor->depthStencil->depthCompare != WGPUCompareFunction_Always);
-        p->depth.setDepthWriteEnable(descriptor->depthStencil->depthWriteEnabled);
+        p->depth.setDepthWriteEnable(descriptor->depthStencil->depthWriteEnabled == WGPUOptionalBool_True);
     }
     if (descriptor->fragment) {
         for (std::uint32_t i = 0; i < descriptor->fragment->targetCount; ++i) {
@@ -706,15 +735,29 @@ void wgpuRenderPipelineRelease(WGPURenderPipeline p) { delete p; }
 WGPUCommandEncoder wgpuDeviceCreateCommandEncoder(WGPUDevice d, WGPUCommandEncoderDescriptor const *) {
     auto *e = new WGPUCommandEncoderImpl;
     e->device = d;
-    // Each encoder records into its own memory: gpu.cpp keeps several encoders alive and submits them in one go.
-    e->memory = d->gpu.allocate(256 * 1024, DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached);
-    if (!e->memory) {
+    // Each encoder records into a slot of the device's command memory (made once, reused every frame): gpu.cpp keeps several encoders
+    // alive and submits them in one go, so each needs its own memory, but allocating a memory block per encoder would churn hundreds of
+    // kilobytes a frame.
+    WGPUDeviceImpl::CommandSlot *slot = d->take_slot();
+    if (!slot) {
         delete e;
-        d->error("no command memory for an encoder");
+        d->error("no free command memory for an encoder");
         return nullptr;
     }
-    e->commands = dk::CmdBufMaker{d->gpu.device()}.create();
-    dkCmdBufAddMemory(e->commands, e->memory->block, 0, e->memory->size);
+    if (!slot->memory) {
+        slot->memory = d->gpu.allocate(128 * 1024, DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached);
+        if (!slot->memory) {
+            slot->busy = false;
+            delete e;
+            d->error("no command memory for an encoder");
+            return nullptr;
+        }
+        slot->commands = dk::CmdBufMaker{d->gpu.device()}.create();
+        dkCmdBufAddMemory(slot->commands, slot->memory->block, 0, slot->memory->size);
+    }
+    e->memory = slot->memory;
+    e->commands = slot->commands;
+    e->commands.clear();
     // The image and sampler tables, and the invalidate that makes newly written descriptors visible to the shaders.
     constexpr std::uint32_t kImages = 1024, kSamplers = 256;
     dkCmdBufBindImageDescriptorSet(e->commands, d->descriptors->gpu, kImages);
@@ -871,6 +914,9 @@ void wgpuQueueSubmit(WGPUQueue queue, std::size_t count, WGPUCommandBuffer const
         d->retired.push_back(commands[i]->memory);
     }
     d->gpu.submit(false);
+    // The queue waited for the frame before this one in Gpu::begin(), so every slot that was in flight is free: the next frame's encoders
+    // take them again.
+    d->free_slots();
 }
 
 WGPUFuture wgpuQueueOnSubmittedWorkDone(WGPUQueue queue, WGPUQueueWorkDoneCallbackInfo info) {
