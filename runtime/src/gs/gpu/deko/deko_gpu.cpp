@@ -38,8 +38,10 @@ bool Gpu::open(std::uint32_t command_bytes) {
         return false;
     }
     // Graphics and compute: the renderer draws with both (the memory moves are compute programs).
+    // 64 KiB of per-warp scratch: deko3d's default is 2 KiB, and the compute programs say how much they need (uam's `upload` asks for
+    // exactly 2 KiB, which left no room at all).
     m_queue = dk::QueueMaker{m_device}.setFlags(DkQueueFlags_Graphics | DkQueueFlags_Compute)
-                  .setCommandMemorySize(512 * 1024).setFlushThreshold(64 * 1024).create();
+                  .setCommandMemorySize(512 * 1024).setFlushThreshold(64 * 1024).setPerWarpScratchMemorySize(64 * 1024).create();
     if (!m_queue) {
         std::fprintf(stderr, "[deko] the queue did not come up\n");
         close();

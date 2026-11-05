@@ -575,13 +575,16 @@ bool load_program(WGPUDeviceImpl *d, const std::string &entry, DkShader &shader)
     DkShaderMaker maker;
     dkShaderMakerDefaults(&maker, d->code_memory->block, d->code_used);
     maker.control = words;
+    trace("  %s: control %u bytes, code %u bytes into the block at %u", entry.c_str(), control_size, code_size, d->code_used);
     dkShaderInitialize(&shader, &maker);
+    trace("  %s: deko3d took it", entry.c_str());
     d->code_used += slot;
     if (!dkShaderIsValid(&shader)) {
         std::fprintf(stderr, "[deko] deko3d rejected the shader %s\n", entry.c_str());
         return false;
     }
     d->loaded.emplace_back(entry, shader);
+    trace("  %s: cached, %zu modules", entry.c_str(), d->loaded.size());
     return true;
 }
 

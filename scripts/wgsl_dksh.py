@@ -165,7 +165,8 @@ def main():
         "namespace {",
     ]
     for n, (_, _, words) in enumerate(programs):
-        lines.append(f"const std::uint32_t kProgram{n}[] = {{")
+        # deko3d reads a module's control block from this address: keep it aligned like the file format's own sections
+        lines.append(f"alignas(256) const std::uint32_t kProgram{n}[] = {{")
         for i in range(0, len(words), 12):
             lines.append("    " + ", ".join(f"0x{w:08x}" for w in words[i:i + 12]) + ",")
         lines.append("};")
