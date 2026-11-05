@@ -219,3 +219,34 @@ stage that removes NVK is the same one that stops using SDL's renderer and takes
   shader has to be compiled on the console. Ours do not: uam produces bytecode for the Tegra X1 on any x86 PC, which is also why the
   `.nro` carries no compiler.
 
+
+## Where stage 1 stands (2026-11-05)
+
+Built, committed, and **not yet run on the console**:
+
+- `runtime/src/gs/gpu/deko/deko_gpu.cpp` — device, queue, command memory, buffers, images, the swap chain on the console's window.
+- `runtime/src/gs/gpu/deko/wgpu_deko.cpp` — the 63 WebGPU calls `gpu.cpp` makes, on deko3d: buffers (memcpy writes, barrier readbacks),
+  textures and views, bind groups that bind buffers by address and textures by descriptor handle, compute pipelines and dispatches,
+  render pipelines with the fixed state mapped from their description, render passes with clear, viewport, scissor, blend constant and
+  draws, command encoders with reused command memory, the surface and present, and a periodic line saying what it did:
+  `[deko] N submissions in T s (R a second): P passes, D draws, K dispatches, S skipped (no module)`.
+- `runtime/src/gs/gpu/deko/dksh_table.cpp` — every program the renderer uses, compiled for the Tegra X1 by `scripts/wgsl_dksh.py`:
+  `hw.wgsl`'s six (one of them the colour writeback), `gs.wgsl`'s eight, `blit.wgsl`'s two, the bring-up triangle. Only
+  `hw_writeback_depth` (depth read) and `gs.wgsl`'s `raster` (unused on this path) have no module.
+- `host/window.cpp` — the display is deko3d's; SDL keeps input and sound.
+- `CMakeLists.txt` — `-DPS2_DEKO3D_RENDER=ON` swaps the Vulkan shim for this one. The Vulkan build is unchanged and still links.
+
+What the first console run has to answer, and what each answer means:
+
+| in `ps2run.log` | meaning |
+| --- | --- |
+| no `[deko]` line at all | the display handover failed before deko3d (SDL without video, or the VI surface) |
+| `device open`, no `surface configured` | the swap chain on the console's window |
+| `no compiled module for hw_writeback_depth` | expected; the depth writeback is the one program without a module |
+| `S skipped` climbing in the periodic line | this game *does* need that program, so a depth writeback has to be built |
+| `S skipped` staying 0 | the gap does not matter for this game |
+| `D draws` climbing | the renderer is running end to end through the shim; the rate in that line is the first number against the 30.2 fps Vulkan baseline |
+
+The last functional gap is the depth writeback. The two shapes it can take — a 2D-engine copy of the depth image into an `R32F` image the
+writeback program can read, or a `R32F` mirror target written by the fragment shader — both need a console to try, and neither is worth
+building before a run says whether this game reads its depth buffer back at all.

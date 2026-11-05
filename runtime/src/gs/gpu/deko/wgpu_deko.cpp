@@ -91,7 +91,7 @@ struct WGPUDeviceImpl {
     std::uint32_t image_count = 0, sampler_count = 0;
     bool default_sampler = false;  // the sampler slot 0: what a binding that samples a texture uses
     // What the shim has actually done, for the log: a frame rate and a count of the work is the first thing a run should say.
-    std::uint32_t submits = 0, passes = 0, draws = 0, dispatches = 0;
+    std::uint32_t submits = 0, passes = 0, draws = 0, dispatches = 0, skipped = 0;
     void error(std::string message);
 };
 
@@ -819,6 +819,9 @@ void wgpuComputePassEncoderSetBindGroup(WGPUComputePassEncoder p, std::uint32_t,
 }
 
 void wgpuComputePassEncoderDispatchWorkgroups(WGPUComputePassEncoder p, std::uint32_t x, std::uint32_t y, std::uint32_t z) {
+    // A pipeline without a module is a program uam could not compile (hw_writeback_depth reads a depth texture). Counting the dispatches
+    // it costs says whether this game needs that program at all: a run where the count stays at zero does not.
+    if (p && p->pipeline && !p->pipeline->ready) ++p->encoder->device->skipped;
     if (!p || !p->pipeline || !p->pipeline->ready || !x || !y || !z) return;
     ++p->encoder->device->dispatches;
     DkCmdBuf cmd = p->encoder->commands;
@@ -944,8 +947,8 @@ void wgpuQueueSubmit(WGPUQueue queue, std::size_t count, WGPUCommandBuffer const
         static double started = 0.0;
         const double now = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
         if (started == 0.0) started = now;
-        std::fprintf(stderr, "[deko] %u submissions in %.1f s (%.1f a second): %u passes, %u draws, %u dispatches\n", d->submits, now - started,
-                     d->submits / (now - started), d->passes, d->draws, d->dispatches);
+        std::fprintf(stderr, "[deko] %u submissions in %.1f s (%.1f a second): %u passes, %u draws, %u dispatches, %u skipped (no module)\n",
+                     d->submits, now - started, d->submits / (now - started), d->passes, d->draws, d->dispatches, d->skipped);
     }
 }
 
