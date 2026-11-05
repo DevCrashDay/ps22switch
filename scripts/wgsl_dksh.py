@@ -39,16 +39,15 @@ OUT = DEKO_DIR / "dksh_table.cpp"
 
 # entry point -> naga's extension (which picks the GLSL stage) and uam's name for the same stage
 STAGES = {"vert": ("vert", "vert"), "frag": ("frag", "frag"), "comp": ("comp", "comp")}
-# What the renderer draws with, and the memory moves it can do on the GPU, per shader file. hw_writeback is the exception: it reads
-# back through a textureLoad of a depth texture, which naga cannot write as GLSL at all ("not supported in GLSL"). Nothing is lost yet,
-# because a deko3d renderer does not have to keep depth in a depth image to load it: a colour image it reads as R32F does the same job,
-# and that is a different program, not a translation of this one.
+# What the renderer draws with, and the memory moves it can do on the GPU, per shader file. hw_writeback_depth is the exception: it
+# reads back through a textureLoad of a depth texture, which naga cannot write as GLSL at all ("not supported in GLSL"). The colour
+# writeback next to it is a separate program and compiles, which is what matters: only the depth half of the writeback is missing.
 WANTED = {
-    "hw.wgsl": ("hw_vs", "hw_full_vs", "hw_fs", "hw_fs_single", "hw_load_depth", "hw_load_color"),
+    "hw.wgsl": ("hw_vs", "hw_full_vs", "hw_fs", "hw_fs_single", "hw_load_depth", "hw_load_color", "hw_writeback"),
     "blit.wgsl": ("vs", "fs"),
     "stage_draw.wgsl": ("triangle_vs", "triangle_fs"),
 }
-NOT_YET = ("hw_writeback",)
+NOT_YET = ("hw_writeback_depth",)
 
 
 
@@ -87,6 +86,12 @@ def add_bindings(glsl: str, wgsl: str) -> str:
             if not found:
                 sys.exit(f"naga wrote a global this script cannot give a binding to:\n{line}")
             line = line[:layout.start(1)] + f"{layout.group(1)}, binding = {found.group(1)}" + line[layout.end(1):]
+        elif re.match(r"\s*uniform\s+\w*(sampler|image)\w*", line) and "layout(" not in line:
+            # a sampler or image, which naga writes with no layout at all: uam still needs the binding, and it is the same number
+            found = re.search(r"_group_\d+_binding_(\d+)", line)
+            if not found:
+                sys.exit(f"naga wrote a sampler or image this script cannot give a binding to:\n{line}")
+            line = f"layout(binding = {found.group(1)}) " + line.lstrip()
         elif re.search(r"\b(sampler\w*|image\w*)\b", line) and "binding" not in line:
             # a global of a kind this script does not know how to bind: guessing would be worse than stopping
             sys.exit(f"naga wrote a global this script cannot give a binding to:\n{line}")

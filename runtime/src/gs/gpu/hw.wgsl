@@ -201,12 +201,21 @@ fn hw_writeback(@builtin(global_invocation_id) gid: vec3<u32>) {
         keep = rgba_frame(psm, keep) | select(0u, 0x8000u, (keep & 0x80000000u) != 0u);
     }
     write_masked(psm, prm(0u), prm(1u), xy.x, xy.y, rgba_frame(psm, c), keep);
-    if ((prm(9u) & 1u) != 0u) {
-        let zmax = prm(7u);
-        let d = textureLoad(depth_in, vec2<i32>(xy), 0);
-        let z = u32(clamp(round(d * f32(zmax)), 0.0, f32(zmax)));
-        write_masked(prm(4u), prm(3u), prm(1u), xy.x, xy.y, z, 0u);
+}
+
+// The depth buffer written into video memory, as its own program: reading a depth texture is not something GLSL can express, and the
+// deko3d build's programs go through GLSL (scripts/wgsl_dksh.py), so it has no module for this one. Two programs rather than one with a
+// flag keeps the colour writeback — which every renderer needs — compilable everywhere.
+@compute @workgroup_size(8, 8)
+fn hw_writeback_depth(@builtin(global_invocation_id) gid: vec3<u32>) {
+    var xy: vec2<u32>;
+    if (!box_pixel(gid, &xy)) {
+        return;
     }
+    let zmax = prm(7u);
+    let d = textureLoad(depth_in, vec2<i32>(xy), 0);
+    let z = u32(clamp(round(d * f32(zmax)), 0.0, f32(zmax)));
+    write_masked(prm(4u), prm(3u), prm(1u), xy.x, xy.y, z, 0u);
 }
 
 // The depth image is filled by a full-screen triangle that writes the depth (the box is the scissor rectangle)

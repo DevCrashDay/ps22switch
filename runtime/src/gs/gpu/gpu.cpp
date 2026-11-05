@@ -116,7 +116,7 @@ WGPUBindGroupLayout g_hw_layout0 = nullptr, g_hw_layout1 = nullptr, g_hw_layout2
 WGPUBindGroup g_hw_group0 = nullptr, g_hw_group1 = nullptr, g_hw_group2 = nullptr, g_hw_group_none = nullptr;
 WGPUBindGroup g_hw_group_draw = nullptr;  // the render passes' buffers: video memory read-only (binding 5) instead of binding 0
 WGPUPipelineLayout g_hw_load_layout = nullptr, g_hw_back_layout = nullptr, g_hw_render_layout = nullptr;
-WGPUComputePipeline g_hw_load = nullptr, g_hw_back = nullptr;
+WGPUComputePipeline g_hw_load = nullptr, g_hw_back = nullptr, g_hw_back_depth = nullptr;
 WGPURenderPipeline g_hw_load_depth = nullptr;
 // draw pipelines by key: depth mode (bits 0-3: 0 no test, 1 + ZTST, + 4 when depth is written) and blend (bits 4-12: 0 off, 1 + ALPHA's
 // A, B, C, D)
@@ -747,11 +747,21 @@ void hw_write_back() {
     HwImages &h = g_hw_images;
     if (!g_hw || !h.valid || (!h.dirty && !h.zdirty)) return;
     hw_forget(hw_drawn_range());
-    const std::uint32_t param = push_params({h.fbp, h.fbw, h.fpsm, h.zbp, h.zpsm, static_cast<std::uint32_t>(h.dx0) | (static_cast<std::uint32_t>(h.dy0) << 16),
-                                             static_cast<std::uint32_t>(h.dx1) | (static_cast<std::uint32_t>(h.dy1) << 16), z_max(h.zpsm), h.fbmsk, h.zdirty ? 1u : 0u});
-    Command back{kRaster, static_cast<std::uint32_t>(h.dx1 - h.dx0 + 8) / 8, static_cast<std::uint32_t>(h.dy1 - h.dy0 + 8) / 8, param};
+    // Two programs: the colour one (which reads the colour image as a texture) and, when the depth buffer changed too, the one that
+    // reads the depth image - that read is not expressible in GLSL, so the deko3d build has no module for it and skips it.
+    const std::uint32_t box[2] = {static_cast<std::uint32_t>(h.dx0) | (static_cast<std::uint32_t>(h.dy0) << 16),
+                                  static_cast<std::uint32_t>(h.dx1) | (static_cast<std::uint32_t>(h.dy1) << 16)};
+    const std::uint32_t across = static_cast<std::uint32_t>(h.dx1 - h.dx0 + 8) / 8, down = static_cast<std::uint32_t>(h.dy1 - h.dy0 + 8) / 8;
+    const std::uint32_t param = push_params({h.fbp, h.fbw, h.fpsm, h.zbp, h.zpsm, box[0], box[1], z_max(h.zpsm), h.fbmsk, 0u});
+    Command back{kRaster, across, down, param};
     back.hw = 2;
     g_commands.push_back(back);
+    if (h.zdirty) {
+        const std::uint32_t depth_param = push_params({h.fbp, h.fbw, h.fpsm, h.zbp, h.zpsm, box[0], box[1], z_max(h.zpsm), h.fbmsk, 1u});
+        Command depth_back{kRaster, across, down, depth_param};
+        depth_back.hw = 4;  // the depth writeback's own program
+        g_commands.push_back(depth_back);
+    }
     h.dirty = h.zdirty = false;
     h.dx0 = h.dy0 = 0;
     h.dx1 = h.dy1 = -1;
@@ -1488,11 +1498,11 @@ void submit(WGPUTextureView present_view = nullptr) {
         if (c.hw) {
             current = kPipelines;  // the next ordinary command sets its pipeline again
             const std::uint32_t offset = c.param * kParamStride;
-            if (c.hw == 1 || c.hw == 2) {
-                wgpuComputePassEncoderSetPipeline(pass, c.hw == 1 ? g_hw_load : g_hw_back);
+            if (c.hw == 1 || c.hw == 2 || c.hw == 4) {
+                wgpuComputePassEncoderSetPipeline(pass, c.hw == 1 ? g_hw_load : c.hw == 2 ? g_hw_back : g_hw_back_depth);
                 wgpuComputePassEncoderSetBindGroup(pass, 0, g_hw_group0, 1, &offset);
                 wgpuComputePassEncoderSetBindGroup(pass, 1, c.hw == 1 ? g_hw_group1 : g_hw_group_none, 0, nullptr);
-                if (c.hw == 2) wgpuComputePassEncoderSetBindGroup(pass, 2, g_hw_group2, 0, nullptr);
+                if (c.hw != 1) wgpuComputePassEncoderSetBindGroup(pass, 2, g_hw_group2, 0, nullptr);
                 wgpuComputePassEncoderDispatchWorkgroups(pass, c.x, c.y, 1);
                 continue;
             }
@@ -2474,7 +2484,10 @@ bool hw_init() {
     cd.layout = g_hw_back_layout;
     cd.compute.entryPoint = view("hw_writeback");
     g_hw_back = wgpuDeviceCreateComputePipeline(g_device, &cd);
-    if (!g_hw_load || !g_hw_back) return false;
+    // Only the Vulkan renderer has this one: its shader reads a depth texture, which GLSL cannot express (see hw.wgsl, docs/deko3d.md)
+    cd.compute.entryPoint = view("hw_writeback_depth");
+    g_hw_back_depth = wgpuDeviceCreateComputePipeline(g_device, &cd);
+    if (!g_hw_load || !g_hw_back || !g_hw_back_depth) return false;
 
     g_hw_load_depth = hw_render_pipeline("hw_full_vs", "hw_load_depth", false, true, WGPUCompareFunction_Always, nullptr);
     if (!g_hw_load_depth) return false;

@@ -73,6 +73,7 @@ struct WGPUDeviceImpl {
     // Image and sampler descriptors: deko3d binds images by handle, and a handle is an index into these two tables.
     std::shared_ptr<ps2::gs::gpu::deko::Memory> descriptors;
     std::uint32_t image_count = 0, sampler_count = 0;
+    bool default_sampler = false;  // the sampler slot 0: what a binding that samples a texture uses
     void error(std::string message);
 };
 
@@ -93,7 +94,9 @@ struct WGPUTextureImpl {
     std::shared_ptr<ps2::gs::gpu::deko::Image> image;
     WGPUTextureFormat format = WGPUTextureFormat_Undefined;
     std::uint32_t width = 0, height = 0;
-    std::uint32_t image_slot = 0xFFFFFFFFu;  // its descriptor in the device's table, made when it is first bound
+    // Its descriptors in the device's table, made when it is first bound: an image used as a storage image needs a different
+    // descriptor from the same image sampled as a texture, and the colour target is both.
+    std::uint32_t image_slot = 0xFFFFFFFFu, storage_slot = 0xFFFFFFFFu;
     bool borrowed = false;                   // a swap chain back buffer: the swap chain owns it
 };
 
@@ -517,26 +520,33 @@ bool load_program(WGPUDeviceImpl *d, const std::string &entry, DkShader &shader)
     return true;
 }
 
-// The handle of a texture's view in the device's image descriptor table. A storage image (what a compute program writes) has its own
-// entry; sampled ones would need a sampler next to them, and nothing this renderer draws with samples a texture except the program that
-// cannot be compiled at all.
-bool image_handle(WGPUDeviceImpl *d, WGPUTextureImpl *texture, bool storage, DkResHandle &handle) {
+// The handle of a texture's view in the device's descriptor tables: an image descriptor for a storage image (what a compute program
+// writes), an image plus the default sampler for one that is sampled. deko3d binds textures and images by handle, and a handle is an
+// index into those tables.
+bool texture_handle(WGPUDeviceImpl *d, WGPUTextureImpl *texture, bool storage, DkResHandle &handle) {
     if (!texture || !texture->image || !d->descriptors) return false;
-    if (!storage) {
-        log_once("sampled textures are only used by hw_writeback, which has no compiled module (see docs/deko3d.md)");
-        return false;
-    }
-    // One descriptor per image, written the first time the image is bound: an image does not move for its lifetime.
-    if (texture->image_slot == 0xFFFFFFFFu) {
+    auto *images = reinterpret_cast<DkImageDescriptor *>(d->descriptors->cpu);
+    std::uint32_t *slot = storage ? &texture->storage_slot : &texture->image_slot;
+    if (*slot == 0xFFFFFFFFu) {
         if (d->image_count >= 1024) {
             log_once("the image descriptor table is full");
             return false;
         }
-        auto *table = reinterpret_cast<DkImageDescriptor *>(d->descriptors->cpu);
-        texture->image_slot = d->image_count++;
-        dkImageDescriptorInitialize(&table[texture->image_slot], &texture->image->view, true, false);
+        *slot = d->image_count++;
+        dkImageDescriptorInitialize(&images[*slot], &texture->image->view, storage, false);
     }
-    handle = dkMakeImageHandle(texture->image_slot);
+    if (storage) {
+        handle = dkMakeImageHandle(*slot);
+        return true;
+    }
+    if (!d->default_sampler) {
+        // One sampler for every sampling binding: the programs fetch whole texels, so its filtering never matters, only that it exists.
+        auto *samplers = reinterpret_cast<DkSamplerDescriptor *>(d->descriptors->cpu + 1024 * sizeof(DkImageDescriptor));
+        dk::Sampler sampler;
+        dkSamplerDescriptorInitialize(&samplers[0], &sampler);
+        d->default_sampler = true;
+    }
+    handle = dkMakeTextureHandle(*slot, 0);
     return true;
 }
 
@@ -571,10 +581,19 @@ void bind_group(DkCmdBuf cmd, const WGPUBindGroupImpl *group, bool compute, std:
                 dkCmdBufBindUniformBuffers(cmd, stage, entry.binding, &extents, 1);
             }
         } else if (entry.texture && entry.texture->texture) {
+            // The layout says whether this binding is a storage image (a compute program writing it) or a sampled texture.
+            bool storage = false;
+            if (group->layout)
+                for (const WGPUBindGroupLayoutImpl::Entry &l : group->layout->entries)
+                    if (l.binding == entry.binding) storage = l.storage_texture;
             DkResHandle handle = 0;
-            if (!compute) continue;  // only the compute programs bind images, and only as storage images
-            if (!image_handle(entry.texture->texture->device, entry.texture->texture, true, handle)) continue;
-            dkCmdBufBindImages(cmd, DkStage_Compute, entry.binding, &handle, 1);
+            if (!texture_handle(entry.texture->texture->device, entry.texture->texture, storage, handle)) continue;
+            for (DkStage stage : kBufferStages) {
+                if (compute && stage != DkStage_Compute) continue;
+                if (!compute && stage == DkStage_Compute) continue;
+                if (storage) dkCmdBufBindImages(cmd, stage, entry.binding, &handle, 1);
+                else dkCmdBufBindTextures(cmd, stage, entry.binding, &handle, 1);
+            }
         }
     }
 }
