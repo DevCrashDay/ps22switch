@@ -38,6 +38,10 @@
 
 namespace {
 
+// One lock for the whole shim, as the Vulkan one has: gpu.cpp submits the frame from the emulation thread and presents it from the window
+// thread (gpu::present_surface), and both go through the same deko3d queue, swap chain and command memory.
+std::recursive_mutex g_lock;
+
 WGPUStringView text(const char *s) { return WGPUStringView{s, std::strlen(s)}; }
 
 // WebGPU's WGPU_STRLEN (SIZE_MAX) means "the length is strlen's": gpu.cpp's view() passes exactly that for every name and entry point,
@@ -293,6 +297,7 @@ void wgpuInstanceRelease(WGPUInstance instance) { delete instance; }
 void wgpuInstanceProcessEvents(WGPUInstance) {}  // deko3d has no event loop: submissions either wait or they do not
 
 WGPUFuture wgpuInstanceRequestAdapter(WGPUInstance, WGPURequestAdapterOptions const *, WGPURequestAdapterCallbackInfo info) {
+    std::lock_guard<std::recursive_mutex> hold(g_lock);
     auto *adapter = new WGPUAdapterImpl;
     if (info.callback) info.callback(WGPURequestAdapterStatus_Success, adapter, text(""), info.userdata1, info.userdata2);
     return WGPUFuture{1};
@@ -301,6 +306,7 @@ WGPUFuture wgpuInstanceRequestAdapter(WGPUInstance, WGPURequestAdapterOptions co
 void wgpuAdapterRelease(WGPUAdapter adapter) { delete adapter; }
 
 WGPUStatus wgpuAdapterGetInfo(WGPUAdapter, WGPUAdapterInfo *info) {
+    std::lock_guard<std::recursive_mutex> hold(g_lock);
     const auto copy = [](const char *s) {
         const std::size_t n = std::strlen(s);
         char *p = static_cast<char *>(std::malloc(n + 1));
@@ -319,10 +325,12 @@ WGPUStatus wgpuAdapterGetInfo(WGPUAdapter, WGPUAdapterInfo *info) {
 }
 
 void wgpuAdapterInfoFreeMembers(WGPUAdapterInfo info) {
+    std::lock_guard<std::recursive_mutex> hold(g_lock);
     for (WGPUStringView v : {info.vendor, info.architecture, info.device, info.description}) std::free(const_cast<char *>(v.data));
 }
 
 WGPUStatus wgpuAdapterGetLimits(WGPUAdapter, WGPULimits *limits) {
+    std::lock_guard<std::recursive_mutex> hold(g_lock);
     // The console has 3 GiB of memory the program may use in title takeover; a single buffer is never anywhere near this.
     limits->maxStorageBufferBindingSize = 512ull << 20;
     limits->maxBufferSize = 512ull << 20;
@@ -338,11 +346,13 @@ WGPUStatus wgpuAdapterGetLimits(WGPUAdapter, WGPULimits *limits) {
 }
 
 WGPUBool wgpuAdapterHasFeature(WGPUAdapter, WGPUFeatureName feature) {
+    std::lock_guard<std::recursive_mutex> hold(g_lock);
     // Dual-source blending is on the hardware and in hw.wgsl. Timestamp queries: deko3d has no query sets, so gpu.cpp's own timing is off.
     return feature == WGPUFeatureName_DualSourceBlending;
 }
 
 WGPUFuture wgpuAdapterRequestDevice(WGPUAdapter, WGPUDeviceDescriptor const *descriptor, WGPURequestDeviceCallbackInfo info) {
+    std::lock_guard<std::recursive_mutex> hold(g_lock);
     auto *d = new WGPUDeviceImpl;
     if (!d->gpu.open()) {
         delete d;
@@ -374,17 +384,20 @@ WGPUFuture wgpuAdapterRequestDevice(WGPUAdapter, WGPUDeviceDescriptor const *des
 }
 
 void wgpuDeviceRelease(WGPUDevice d) {
+    std::lock_guard<std::recursive_mutex> hold(g_lock);
     if (!d) return;
     d->gpu.wait();
     delete d;
 }
 
 WGPUQueue wgpuDeviceGetQueue(WGPUDevice d) {
+    std::lock_guard<std::recursive_mutex> hold(g_lock);
     trace("get queue");
     return d ? d->queue.get() : nullptr;
 }
 
 WGPUBool wgpuDevicePoll(WGPUDevice d, WGPUBool wait, WGPUSubmissionIndex const *) {
+    std::lock_guard<std::recursive_mutex> hold(g_lock);
     if (d && wait) d->gpu.wait();
     return true;
 }
@@ -394,6 +407,7 @@ WGPUBool wgpuDevicePoll(WGPUDevice d, WGPUBool wait, WGPUSubmissionIndex const *
 // ---------------------------------------------------------------------------------------------------------------------------------
 
 WGPUBuffer wgpuDeviceCreateBuffer(WGPUDevice d, WGPUBufferDescriptor const *descriptor) {
+    std::lock_guard<std::recursive_mutex> hold(g_lock);
     trace("create buffer, %llu bytes", static_cast<unsigned long long>(descriptor->size));
     auto *b = new WGPUBufferImpl;
     b->device = d;
@@ -414,6 +428,7 @@ WGPUBuffer wgpuDeviceCreateBuffer(WGPUDevice d, WGPUBufferDescriptor const *desc
 void wgpuBufferRelease(WGPUBuffer b) { delete b; }
 
 void wgpuQueueWriteBuffer(WGPUQueue queue, WGPUBuffer buffer, std::uint64_t offset, void const *data, std::size_t size) {
+    std::lock_guard<std::recursive_mutex> hold(g_lock);
     if (!queue || !buffer || !data || !size) return;
     if (offset + size > buffer->size) {
         queue->device->error("queue write past the end of a buffer");
@@ -426,6 +441,7 @@ void wgpuQueueWriteBuffer(WGPUQueue queue, WGPUBuffer buffer, std::uint64_t offs
 }
 
 WGPUFuture wgpuBufferMapAsync(WGPUBuffer b, WGPUMapMode, std::size_t, std::size_t, WGPUBufferMapCallbackInfo info) {
+    std::lock_guard<std::recursive_mutex> hold(g_lock);
     if (!b || !b->map_read) {
         if (info.callback) info.callback(WGPUMapAsyncStatus_Error, text("the buffer is not MapRead"), info.userdata1, info.userdata2);
         return WGPUFuture{1};
@@ -438,11 +454,13 @@ WGPUFuture wgpuBufferMapAsync(WGPUBuffer b, WGPUMapMode, std::size_t, std::size_
 }
 
 void const *wgpuBufferGetConstMappedRange(WGPUBuffer b, std::size_t offset, std::size_t) {
+    std::lock_guard<std::recursive_mutex> hold(g_lock);
     if (!b || !b->mapped || !b->memory) return nullptr;
     return b->memory->cpu + offset;
 }
 
 void wgpuBufferUnmap(WGPUBuffer b) {
+    std::lock_guard<std::recursive_mutex> hold(g_lock);
     if (b) b->mapped = false;
 }
 
@@ -451,6 +469,7 @@ void wgpuBufferUnmap(WGPUBuffer b) {
 // ---------------------------------------------------------------------------------------------------------------------------------
 
 WGPUTexture wgpuDeviceCreateTexture(WGPUDevice d, WGPUTextureDescriptor const *descriptor) {
+    std::lock_guard<std::recursive_mutex> hold(g_lock);
     trace("create texture %ux%u, format %d", unsigned(descriptor->size.width), unsigned(descriptor->size.height), int(descriptor->format));
     ps2::gs::gpu::deko::Format format{};
     if (!to_deko_format(descriptor->format, format) || descriptor->dimension != WGPUTextureDimension_2D) {
@@ -474,6 +493,7 @@ WGPUTexture wgpuDeviceCreateTexture(WGPUDevice d, WGPUTextureDescriptor const *d
 void wgpuTextureRelease(WGPUTexture t) { delete t; }  // the images are shared pointers: the last owner frees the memory
 
 WGPUTextureView wgpuTextureCreateView(WGPUTexture t, WGPUTextureViewDescriptor const *) {
+    std::lock_guard<std::recursive_mutex> hold(g_lock);
     trace("create view");
     if (!t) return nullptr;
     auto *v = new WGPUTextureViewImpl;
@@ -490,6 +510,7 @@ void wgpuTextureViewRelease(WGPUTextureView v) { delete v; }
 // ---------------------------------------------------------------------------------------------------------------------------------
 
 namespace {
+    std::lock_guard<std::recursive_mutex> hold(g_lock);
 
 DkCompareOp to_compare(WGPUCompareFunction f) {
     switch (f) {
@@ -715,6 +736,7 @@ void bind_group(DkCmdBuf cmd, const WGPUBindGroupImpl *group, bool compute, std:
 }
 
 WGPUBindGroupLayout wgpuDeviceCreateBindGroupLayout(WGPUDevice, WGPUBindGroupLayoutDescriptor const *descriptor) {
+    std::lock_guard<std::recursive_mutex> hold(g_lock);
     trace("create bind group layout, %zu entries", static_cast<std::size_t>(descriptor->entryCount));
     auto *l = new WGPUBindGroupLayoutImpl;
     for (std::size_t i = 0; i < descriptor->entryCount; ++i) {
@@ -733,6 +755,7 @@ WGPUBindGroupLayout wgpuDeviceCreateBindGroupLayout(WGPUDevice, WGPUBindGroupLay
 void wgpuBindGroupLayoutRelease(WGPUBindGroupLayout l) { delete l; }
 
 WGPUPipelineLayout wgpuDeviceCreatePipelineLayout(WGPUDevice, WGPUPipelineLayoutDescriptor const *descriptor) {
+    std::lock_guard<std::recursive_mutex> hold(g_lock);
     trace("create pipeline layout");
     auto *p = new WGPUPipelineLayoutImpl;
     for (std::size_t i = 0; i < descriptor->bindGroupLayoutCount; ++i) p->groups.push_back(descriptor->bindGroupLayouts[i]);
@@ -742,6 +765,7 @@ WGPUPipelineLayout wgpuDeviceCreatePipelineLayout(WGPUDevice, WGPUPipelineLayout
 void wgpuPipelineLayoutRelease(WGPUPipelineLayout p) { delete p; }
 
 WGPUBindGroup wgpuDeviceCreateBindGroup(WGPUDevice, WGPUBindGroupDescriptor const *descriptor) {
+    std::lock_guard<std::recursive_mutex> hold(g_lock);
     trace("create bind group, %zu entries", static_cast<std::size_t>(descriptor->entryCount));
     auto *g = new WGPUBindGroupImpl;
     g->layout = descriptor->layout;
@@ -765,6 +789,7 @@ WGPUBindGroup wgpuDeviceCreateBindGroup(WGPUDevice, WGPUBindGroupDescriptor cons
 void wgpuBindGroupRelease(WGPUBindGroup g) { delete g; }
 
 WGPUShaderModule wgpuDeviceCreateShaderModule(WGPUDevice, WGPUShaderModuleDescriptor const *) {
+    std::lock_guard<std::recursive_mutex> hold(g_lock);
     trace("create shader module");
     // The module itself is only a handle: a pipeline names the entry point, and that name finds the module uam compiled
     // (dksh_table.cpp). Nothing is compiled or even parsed here.
@@ -774,6 +799,7 @@ WGPUShaderModule wgpuDeviceCreateShaderModule(WGPUDevice, WGPUShaderModuleDescri
 void wgpuShaderModuleRelease(WGPUShaderModule m) { delete m; }
 
 WGPUComputePipeline wgpuDeviceCreateComputePipeline(WGPUDevice d, WGPUComputePipelineDescriptor const *descriptor) {
+    std::lock_guard<std::recursive_mutex> hold(g_lock);
     trace("create compute pipeline, entry point %.*s", int(descriptor->compute.entryPoint.length),
           descriptor->compute.entryPoint.data ? descriptor->compute.entryPoint.data : "");
     WGPUComputePipeline result = nullptr;
@@ -794,6 +820,7 @@ WGPUComputePipeline wgpuDeviceCreateComputePipeline(WGPUDevice d, WGPUComputePip
 void wgpuComputePipelineRelease(WGPUComputePipeline p) { delete p; }
 
 WGPURenderPipeline wgpuDeviceCreateRenderPipeline(WGPUDevice d, WGPURenderPipelineDescriptor const *descriptor) {
+    std::lock_guard<std::recursive_mutex> hold(g_lock);
     trace("create render pipeline, vertex %.*s", int(descriptor->vertex.entryPoint.length),
           descriptor->vertex.entryPoint.data ? descriptor->vertex.entryPoint.data : "");
     WGPURenderPipeline result = nullptr;
@@ -840,6 +867,7 @@ void wgpuRenderPipelineRelease(WGPURenderPipeline p) { delete p; }
 // ---------------------------------------------------------------------------------------------------------------------------------
 
 WGPUCommandEncoder wgpuDeviceCreateCommandEncoder(WGPUDevice d, WGPUCommandEncoderDescriptor const *) {
+    std::lock_guard<std::recursive_mutex> hold(g_lock);
     trace("create command encoder");
     auto *e = new WGPUCommandEncoderImpl;
     e->device = d;
@@ -878,24 +906,28 @@ void wgpuCommandEncoderRelease(WGPUCommandEncoder e) { delete e; }
 
 void wgpuCommandEncoderCopyBufferToBuffer(WGPUCommandEncoder e, WGPUBuffer source, std::uint64_t source_offset, WGPUBuffer destination,
                                           std::uint64_t destination_offset, std::uint64_t size) {
+    std::lock_guard<std::recursive_mutex> hold(g_lock);
     if (!e || !source || !destination || !size) return;
     dkCmdBufCopyBuffer(e->commands, source->memory->gpu + source_offset, destination->memory->gpu + destination_offset,
                        static_cast<std::uint32_t>(size));
 }
 
 void wgpuCommandEncoderResolveQuerySet(WGPUCommandEncoder, WGPUQuerySet, std::uint32_t, std::uint32_t, WGPUBuffer, std::uint64_t) {
+    std::lock_guard<std::recursive_mutex> hold(g_lock);
     log_once("timestamp queries do not exist on deko3d: the renderer's own GPU timing is off");
 }
 
 WGPUQuerySet wgpuDeviceCreateQuerySet(WGPUDevice, WGPUQuerySetDescriptor const *) { return nullptr; }
 
 WGPUComputePassEncoder wgpuCommandEncoderBeginComputePass(WGPUCommandEncoder e, WGPUComputePassDescriptor const *) {
+    std::lock_guard<std::recursive_mutex> hold(g_lock);
     auto *p = new WGPUComputePassEncoderImpl;
     p->encoder = e;
     return p;
 }
 
 void wgpuComputePassEncoderSetPipeline(WGPUComputePassEncoder p, WGPUComputePipeline pipeline) {
+    std::lock_guard<std::recursive_mutex> hold(g_lock);
     p->pipeline = pipeline;
     if (!pipeline || !pipeline->ready) return;
     const DkShader *shaders[] = {&pipeline->shader};
@@ -904,10 +936,12 @@ void wgpuComputePassEncoderSetPipeline(WGPUComputePassEncoder p, WGPUComputePipe
 
 void wgpuComputePassEncoderSetBindGroup(WGPUComputePassEncoder p, std::uint32_t, WGPUBindGroup group, std::size_t count,
                                         std::uint32_t const *offsets) {
+    std::lock_guard<std::recursive_mutex> hold(g_lock);
     bind_group(p->encoder->commands, group, true, count, offsets);
 }
 
 void wgpuComputePassEncoderDispatchWorkgroups(WGPUComputePassEncoder p, std::uint32_t x, std::uint32_t y, std::uint32_t z) {
+    std::lock_guard<std::recursive_mutex> hold(g_lock);
     // A pipeline without a module is a program uam could not compile (hw_writeback_depth reads a depth texture). Counting the dispatches
     // it costs says whether this game needs that program at all: a run where the count stays at zero does not.
     if (p && p->pipeline && !p->pipeline->ready) ++p->encoder->device->skipped;
@@ -923,6 +957,7 @@ void wgpuComputePassEncoderEnd(WGPUComputePassEncoder) {}
 void wgpuComputePassEncoderRelease(WGPUComputePassEncoder p) { delete p; }
 
 WGPURenderPassEncoder wgpuCommandEncoderBeginRenderPass(WGPUCommandEncoder e, WGPURenderPassDescriptor const *descriptor) {
+    std::lock_guard<std::recursive_mutex> hold(g_lock);
     trace("begin render pass");
     auto *p = new WGPURenderPassEncoderImpl;
     p->encoder = e;
@@ -958,6 +993,7 @@ WGPURenderPassEncoder wgpuCommandEncoderBeginRenderPass(WGPUCommandEncoder e, WG
 }
 
 void wgpuRenderPassEncoderSetPipeline(WGPURenderPassEncoder p, WGPURenderPipeline pipeline) {
+    std::lock_guard<std::recursive_mutex> hold(g_lock);
     p->pipeline = pipeline;
     if (!pipeline || !pipeline->ready) return;
     DkCmdBuf cmd = p->encoder->commands;
@@ -973,26 +1009,31 @@ void wgpuRenderPassEncoderSetPipeline(WGPURenderPassEncoder p, WGPURenderPipelin
 
 void wgpuRenderPassEncoderSetBindGroup(WGPURenderPassEncoder p, std::uint32_t, WGPUBindGroup group, std::size_t count,
                                        std::uint32_t const *offsets) {
+    std::lock_guard<std::recursive_mutex> hold(g_lock);
     bind_group(p->encoder->commands, group, false, count, offsets);
 }
 
 void wgpuRenderPassEncoderSetViewport(WGPURenderPassEncoder p, float x, float y, float width, float height, float min_depth, float max_depth) {
+    std::lock_guard<std::recursive_mutex> hold(g_lock);
     const DkViewport viewport{x, y, width, height, min_depth, max_depth};
     dkCmdBufSetViewports(p->encoder->commands, 0, &viewport, 1);
 }
 
 void wgpuRenderPassEncoderSetScissorRect(WGPURenderPassEncoder p, std::uint32_t x, std::uint32_t y, std::uint32_t width, std::uint32_t height) {
+    std::lock_guard<std::recursive_mutex> hold(g_lock);
     const DkScissor scissor{x, y, width, height};
     dkCmdBufSetScissors(p->encoder->commands, 0, &scissor, 1);
 }
 
 void wgpuRenderPassEncoderSetBlendConstant(WGPURenderPassEncoder p, WGPUColor const *color) {
+    std::lock_guard<std::recursive_mutex> hold(g_lock);
     dkCmdBufSetBlendConst(p->encoder->commands, static_cast<float>(color->r), static_cast<float>(color->g), static_cast<float>(color->b),
                           static_cast<float>(color->a));
 }
 
 void wgpuRenderPassEncoderDraw(WGPURenderPassEncoder p, std::uint32_t vertices, std::uint32_t instances, std::uint32_t first_vertex,
                               std::uint32_t first_instance) {
+    std::lock_guard<std::recursive_mutex> hold(g_lock);
     if (!p || !p->pipeline || !p->pipeline->ready || !vertices) return;
     ++p->encoder->device->draws;
     dkCmdBufDraw(p->encoder->commands, p->pipeline->primitive, vertices, instances, first_vertex, first_instance);
@@ -1002,10 +1043,12 @@ void wgpuRenderPassEncoderEnd(WGPURenderPassEncoder) {}
 void wgpuRenderPassEncoderRelease(WGPURenderPassEncoder p) { delete p; }
 
 void wgpuRenderPassSetAreaHint(std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t) {
+    std::lock_guard<std::recursive_mutex> hold(g_lock);
     // deko3d's render targets are whole images and the scissor says what a pass touches: there is no render area to narrow.
 }
 
 WGPUCommandBuffer wgpuCommandEncoderFinish(WGPUCommandEncoder e, WGPUCommandBufferDescriptor const *) {
+    std::lock_guard<std::recursive_mutex> hold(g_lock);
     if (!e) return nullptr;
     auto *c = new WGPUCommandBufferImpl;
     c->memory = e->memory;
@@ -1018,6 +1061,7 @@ WGPUCommandBuffer wgpuCommandEncoderFinish(WGPUCommandEncoder e, WGPUCommandBuff
 void wgpuCommandBufferRelease(WGPUCommandBuffer c) { delete c; }  // its memory is held by the device until the GPU is done with it
 
 void wgpuQueueSubmit(WGPUQueue queue, std::size_t count, WGPUCommandBuffer const *commands) {
+    std::lock_guard<std::recursive_mutex> hold(g_lock);
     trace("submit %zu command buffers", static_cast<std::size_t>(count));
     if (!queue || !count) return;
     WGPUDeviceImpl *d = queue->device;
@@ -1034,6 +1078,7 @@ void wgpuQueueSubmit(WGPUQueue queue, std::size_t count, WGPUCommandBuffer const
     // take them again.
     d->free_slots();
     ++d->submits;
+    if (d->submits == 1) std::fprintf(stderr, "[deko] first submission: the renderer is running through deko3d\n");
     if (d->submits % 60 == 0) {
         static double started = 0.0;
         const double now = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -1044,6 +1089,7 @@ void wgpuQueueSubmit(WGPUQueue queue, std::size_t count, WGPUCommandBuffer const
 }
 
 WGPUFuture wgpuQueueOnSubmittedWorkDone(WGPUQueue queue, WGPUQueueWorkDoneCallbackInfo info) {
+    std::lock_guard<std::recursive_mutex> hold(g_lock);
     if (queue) queue->device->gpu.wait();
     if (info.callback) info.callback(WGPUQueueWorkDoneStatus_Success, text(""), info.userdata1, info.userdata2);
     return WGPUFuture{1};
@@ -1054,12 +1100,14 @@ WGPUFuture wgpuQueueOnSubmittedWorkDone(WGPUQueue queue, WGPUQueueWorkDoneCallba
 // ---------------------------------------------------------------------------------------------------------------------------------
 
 WGPUSurface wgpuCreateViSurface(WGPUInstance, void *window) {
+    std::lock_guard<std::recursive_mutex> hold(g_lock);
     auto *s = new WGPUSurfaceImpl;
     s->window = window;
     return s;
 }
 
 WGPUSurface wgpuInstanceCreateSurface(WGPUInstance, WGPUSurfaceDescriptor const *) {
+    std::lock_guard<std::recursive_mutex> hold(g_lock);
     log_once("only the console's own display is implemented: no other kind of surface");
     return nullptr;
 }
@@ -1067,6 +1115,7 @@ WGPUSurface wgpuInstanceCreateSurface(WGPUInstance, WGPUSurfaceDescriptor const 
 void wgpuSurfaceRelease(WGPUSurface s) { delete s; }
 
 WGPUStatus wgpuSurfaceGetCapabilities(WGPUSurface s, WGPUAdapter, WGPUSurfaceCapabilities *caps) {
+    std::lock_guard<std::recursive_mutex> hold(g_lock);
     if (!s || !caps) return WGPUStatus_Error;
     // The back buffers are RGBA8, presented from three images, and the display locks the picture to the screen's refresh.
     auto *formats = static_cast<WGPUTextureFormat *>(std::malloc(sizeof(WGPUTextureFormat)));
@@ -1086,12 +1135,14 @@ WGPUStatus wgpuSurfaceGetCapabilities(WGPUSurface s, WGPUAdapter, WGPUSurfaceCap
 }
 
 void wgpuSurfaceCapabilitiesFreeMembers(WGPUSurfaceCapabilities caps) {
+    std::lock_guard<std::recursive_mutex> hold(g_lock);
     std::free(const_cast<WGPUTextureFormat *>(caps.formats));
     std::free(const_cast<WGPUPresentMode *>(caps.presentModes));
     std::free(const_cast<WGPUCompositeAlphaMode *>(caps.alphaModes));
 }
 
 void wgpuSurfaceConfigure(WGPUSurface s, WGPUSurfaceConfiguration const *config) {
+    std::lock_guard<std::recursive_mutex> hold(g_lock);
     trace("configure surface %ux%u", config ? unsigned(config->width) : 0u, config ? unsigned(config->height) : 0u);
     if (!s || !config || !config->device) return;
     s->device = config->device;
@@ -1110,6 +1161,7 @@ void wgpuSurfaceConfigure(WGPUSurface s, WGPUSurfaceConfiguration const *config)
 bool wgpuSurfaceHasSwapchain(WGPUSurface s) { return s && s->swapchain.ok(); }
 
 void wgpuSurfaceGetCurrentTexture(WGPUSurface s, WGPUSurfaceTexture *texture) {
+    std::lock_guard<std::recursive_mutex> hold(g_lock);
     texture->texture = nullptr;
     texture->status = WGPUSurfaceGetCurrentTextureStatus_Error;
     if (!s || !s->swapchain.ok()) return;
@@ -1129,6 +1181,7 @@ void wgpuSurfaceGetCurrentTexture(WGPUSurface s, WGPUSurfaceTexture *texture) {
 }
 
 WGPUStatus wgpuSurfacePresent(WGPUSurface s) {
+    std::lock_guard<std::recursive_mutex> hold(g_lock);
     if (!s || !s->swapchain.ok() || !s->acquired) return WGPUStatus_Error;
     s->acquired = false;
     s->swapchain.present();
