@@ -1,0 +1,170 @@
+[switch] arguments from ./launch.txt
+[switch] PS2_CPU_MHZ=1785
+[switch] PS2_GPU_MHZ=921.6
+[switch] PS2_MEM_MHZ=1600
+[switch] PS2_GS_HW=1
+[switch] PS2_VK_PROFILE=1
+[switch] PS2_PRESENT_LOG=1
+[switch] PS2_PARTS=1
+[clock] CPU 1020 -> 1785 MHz (asked for 1785)
+[clock] GPU 307 -> 921 MHz (asked for 921)
+[clock] memory already at 1600 MHz (asked for 1600): left alone
+[keys] sdmc:/switch/ps22switch/Tekken-4/keys.ini: read, 0 problems; mouse stick off
+INFO: SDL_EGL_ChooseConfig: found a slow EGL config
+[audio] when the game runs slower than real time its sound is played slower, with the same pitch (PS2_AUDIO_STRETCH=0 switches that off)
+[pad] Switch Controller (generic) in port 1
+[pad] Switch Controller (generic) in port 2
+[pad] Switch Controller is not used: both ports have a controller
+[pad] Switch Controller is not used: both ports have a controller
+[pad] Switch Controller is not used: both ports have a controller
+[pad] Switch Controller is not used: both ports have a controller
+[pad] Switch Controller is not used: both ports have a controller
+[pad] Switch Controller is not used: both ports have a controller
+[cpu] unknown processor: 0 logical processors
+WARNING: NVK is not a conformant Vulkan implementation, testing use only.
+[gpu] NVIDIA Tegra X1 (GM20B) (NVK GM20B) (Vulkan 1.4.354, driver 109060100) on Vulkan
+[vulkan] memory type 0: heap 0 (2391 MB) device-local host-visible cached
+[vulkan] memory type 1: heap 0 (2391 MB) device-local host-visible coherent
+[vk-profile] timing every dispatch (1.000 ns per tick)
+[gpu] Direct3D 12 shader compiler: FXC (PS2_DX12_COMPILER=fxc|dxc picks)
+[gpu] 9 shaders compiled in 20 ms
+[gpu] hardware rasterizer path on (PS2_GS_HW=1)
+[window] presenting through SDL
+[pad] Switch Controller is not used: both ports have a controller
+[pad] Switch Controller is not used: both ports have a controller
+[pad] Switch Controller is not used: both ports have a controller
+[pad] Switch Controller is not used: both ports have a controller
+[pad] Switch Controller is not used: both ports have a controller
+[pad] Switch Controller is not used: both ports have a controller
+[disc] disc.iso: 6 files, 1317552 sectors, layer 1 at 0
+[mc] card in slot 1: Tekken-4.ps2 (new, unformatted)
+[replay] recording the pad from frame 0 into sdmc:/switch/ps22switch/Tekken-4/states/run_2025-01-16_04-05-37_f000000.inputs
+[parts] sampling the emulation thread every 250 us
+[sif] IOP reboot requested with "rom0:UDNL cdrom:\IRX\IOPRP243.IMG;1"
+[sif] LOADFILE from cdrom:\IRX\IOPRP243.IMG;1 reports 2430
+[loadfile] buffer at 0x20030, 6553 bytes
+[loadfile] buffer at 0x219F0, 44917 bytes
+[loadfile] buffer at 0x2C970, 90805 bytes
+[loadfile] buffer at 0x42C30, 7353 bytes
+[loadfile] buffer at 0x448F0, 25397 bytes
+[iop-io] write 0x1F801404 = 0xBF900000 (pc 0x0008E608)
+[iop-io] write 0x1F80140C = 0xBF900800 (pc 0x0008E60C)
+[iop-io] read 0x1F8010F0 = 0x0 (pc 0x0008E628)
+[iop-io] read 0x1F801570 = 0x0 (pc 0x0008E638)
+[iop-io] write 0x1F801014 = 0x200B31E1 (pc 0x0008E664)
+[iop-io] write 0x1F801414 = 0x200B31E1 (pc 0x0008E668)
+[loadfile] buffer at 0x4AC30, 60885 bytes
+[fileio] open rom0:ROMVER -> 3
+[io] write 0x1000F590 = 0x10000 (pc 0x00291A24)
+[gs] SetGsCrt interlace 1 mode 0x2 field 1
+[dma] gif tag id 0 qwc 9 addr 0x0031E4F0 data 0x0031E4F0
+[dma] gif tag id 0 qwc 9 addr 0x0031E580 data 0x0031E580
+[iop-io] read 0x1F808280 = 0x0 (pc 0x00059C84)
+[vk-profile] per second: 72 submits, GPU busy 84.1 ms, most in flight 7, CPU waited 0.0 ms (0 times) | copy 1.6 ms (20) display 5.7 ms (20) hw_draw 40.9 ms (41) hw_load_color 7.3 ms (41) hw_writeback 15.6 ms (41) load_clut 0.4 ms (48) upload 12.6 ms (116)
+[waits] 27.1 frames/s; emulation thread per frame: waiting for the window thread 0.01 ms, for the sound 1.92 ms; window thread per second: rendering 155 ms, no work 529 ms
+[parts] emulation thread: game code 44% events 0% IOP and sound 29% hardware registers 17% VIF 0% GIF 0% DMA 0% idle 0% waiting for the window 0% waiting for the sound 8%
+[waits] 58.7 frames/s; emulation thread per frame: waiting for the window thread 0.01 ms, for the sound 1.62 ms; window thread per second: rendering 354 ms, no work 634 ms
+[vk-profile] per second: 422 submits, GPU busy 279.9 ms, most in flight 7, CPU waited 0.0 ms (0 times) | copy 4.9 ms (59) display 16.9 ms (59) hw_draw 126.3 ms (168) hw_load_color 18.6 ms (117) hw_writeback 67.6 ms (168) load_clut 3.3 ms (146) upload 42.4 ms (725)
+[waits] 60.6 frames/s; emulation thread per frame: waiting for the window thread 0.01 ms, for the sound 2.46 ms; window thread per second: rendering 384 ms, no work 607 ms
+[parts] emulation thread: game code 46% events 0% IOP and sound 16% hardware registers 20% VIF 2% GIF 0% DMA 0% waiting for the window 0% waiting for the sound 16%
+[waits] 59.9 frames/s; emulation thread per frame: waiting for the window thread 0.01 ms, for the sound 2.79 ms; window thread per second: rendering 556 ms, no work 435 ms
+[vk-profile] per second: 120 submits, GPU busy 491.7 ms, most in flight 6, CPU waited 0.0 ms (0 times) | copy 5.0 ms (59) display 16.8 ms (59) hw_draw 247.8 ms (5293) hw_load_color 18.8 ms (118) hw_writeback 43.5 ms (150) load_clut 19.8 ms (1889) upload 140.0 ms (7523)
+[waits] 59.9 frames/s; emulation thread per frame: waiting for the window thread 0.01 ms, for the sound 3.33 ms; window thread per second: rendering 566 ms, no work 418 ms
+[parts] emulation thread: game code 49% events 0% IOP and sound 6% hardware registers 18% VIF 6% GIF 0% DMA 0% waiting for the window 0% waiting for the sound 20%
+[waits] 60.4 frames/s; emulation thread per frame: waiting for the window thread 0.01 ms, for the sound 3.13 ms; window thread per second: rendering 545 ms, no work 447 ms
+[ipu] bad code in command 0x10010000 (frame 395, bit 43 of 128, next 0000000D 8000000D, picture type 0)
+[ipu] bad code in command 0x10010000 (frame 396, bit 43 of 128, next 0000000D 8000000D, picture type 0)
+[ipu] bad code in command 0x10010000 (frame 397, bit 63 of 128, next 000000D8 000000D8, picture type 0)
+[ipu] bad code in command 0x10010000 (frame 398, bit 63 of 128, next 000000D8 000000D8, picture type 0)
+[ipu] bad code in command 0x10010000 (frame 399, bit 33 of 128, next 00000003 60000003, picture type 0)
+[ipu] bad code in command 0x10010000 (frame 400, bit 33 of 128, next 00000003 60000003, picture type 0)
+[ipu] bad code in command 0x10010000 (frame 401, bit 30 of 128, next 0000006C 0000006C, picture type 0)
+[ipu] bad code in command 0x10010000 (frame 402, bit 30 of 128, next 0000006C 0000006C, picture type 0)
+[vk-profile] per second: 106 submits, GPU busy 457.6 ms, most in flight 6, CPU waited 0.0 ms (0 times) | copy 3.9 ms (52) display 15.0 ms (52) hw_draw 233.2 ms (4352) hw_load_color 17.7 ms (113) hw_writeback 42.4 ms (154) load_clut 19.5 ms (1953) upload 126.0 ms (6582)
+[waits] 50.0 frames/s; emulation thread per frame: waiting for the window thread 0.01 ms, for the sound 1.16 ms; window thread per second: rendering 496 ms, no work 499 ms
+[parts] emulation thread: game code 38% events 0% IOP and sound 17% hardware registers 16% VIF 5% GIF 0% DMA 0% IPU 17% waiting for the window 0% waiting for the sound 6%
+[waits] 46.5 frames/s; emulation thread per frame: waiting for the window thread 0.01 ms, for the sound 0.00 ms; window thread per second: rendering 521 ms, no work 473 ms
+[vk-profile] per second: 91 submits, GPU busy 537.5 ms, most in flight 4, CPU waited 0.0 ms (0 times) | copy 3.6 ms (46) display 13.0 ms (46) hw_draw 302.9 ms (2433) hw_load_color 14.3 ms (91) hw_writeback 42.5 ms (137) load_clut 38.5 ms (2513) upload 122.8 ms (3016)
+[parts] emulation thread: game code 37% events 0% IOP and sound 10% hardware registers 14% VIF 8% GIF 0% DMA 0% IPU 29% waiting for the window 0%
+[waits] 45.6 frames/s; emulation thread per frame: waiting for the window thread 0.01 ms, for the sound 0.00 ms; window thread per second: rendering 514 ms, no work 481 ms
+[waits] 55.1 frames/s; emulation thread per frame: waiting for the window thread 0.01 ms, for the sound 0.91 ms; window thread per second: rendering 543 ms, no work 452 ms
+[vk-profile] per second: 102 submits, GPU busy 487.8 ms, most in flight 4, CPU waited 0.0 ms (0 times) | copy 4.0 ms (51) display 15.2 ms (51) hw_draw 250.8 ms (1915) hw_load_color 16.3 ms (101) hw_writeback 50.6 ms (143) load_clut 28.1 ms (1922) upload 122.8 ms (2445)
+[parts] emulation thread: game code 44% events 0% IOP and sound 17% hardware registers 20% VIF 5% GIF 0% DMA 0% IPU 9% waiting for the sound 5%
+[waits] 59.0 frames/s; emulation thread per frame: waiting for the window thread 0.01 ms, for the sound 0.79 ms; window thread per second: rendering 528 ms, no work 463 ms
+[waits] 59.9 frames/s; emulation thread per frame: waiting for the window thread 0.09 ms, for the sound 2.79 ms; window thread per second: rendering 628 ms, no work 365 ms
+[vk-profile] per second: 107 submits, GPU busy 572.6 ms, most in flight 9, CPU waited 116.8 ms (15 times) | copy 3.7 ms (47) display 13.2 ms (47) hw_draw 293.1 ms (1002) hw_load_color 17.6 ms (114) hw_writeback 47.2 ms (171) load_clut 25.3 ms (1025) upload 172.6 ms (1611)
+[parts] emulation thread: game code 46% events 0% IOP and sound 10% hardware registers 22% VIF 3% GIF 0% DMA 0% waiting for the window 0% waiting for the sound 18%
+[waits] 60.1 frames/s; emulation thread per frame: waiting for the window thread 0.32 ms, for the sound 3.21 ms; window thread per second: rendering 886 ms, no work 113 ms
+[vk-profile] per second: 84 submits, GPU busy 388.3 ms, most in flight 9, CPU waited 299.8 ms (30 times) | copy 2.7 ms (35) display 10.7 ms (35) hw_draw 214.7 ms (587) hw_load_color 13.1 ms (90) hw_writeback 33.4 ms (122) load_clut 17.1 ms (563) upload 96.6 ms (931)
+[waits] 41.7 frames/s; emulation thread per frame: waiting for the window thread 0.44 ms, for the sound 0.00 ms; window thread per second: rendering 319 ms, no work 676 ms
+[parts] emulation thread: game code 87% events 0% IOP and sound 5% hardware registers 4% VIF 0% waiting for the window 2% waiting for the sound 1%
+[waits] 36.8 frames/s; emulation thread per frame: waiting for the window thread 4.14 ms, for the sound 0.00 ms; window thread per second: rendering 648 ms, no work 343 ms
+[vk-profile] per second: 87 submits, GPU busy 312.3 ms, most in flight 9, CPU waited 121.6 ms (7 times) | copy 2.7 ms (35) display 11.0 ms (35) hw_draw 202.2 ms (185) hw_load_color 17.2 ms (122) hw_writeback 23.3 ms (122) load_clut 18.2 ms (187) upload 37.7 ms (838)
+[parts] emulation thread: game code 54% events 0% IOP and sound 4% hardware registers 6% VIF 2% GIF 0% DMA 0% waiting for the window 33%
+[vk-profile] per second: 88 submits, GPU busy 585.2 ms, most in flight 9, CPU waited 467.8 ms (29 times) | copy 2.3 ms (29) display 8.6 ms (29) hw_draw 386.7 ms (390) hw_load_color 35.2 ms (231) hw_writeback 36.1 ms (231) load_clut 43.4 ms (449) upload 72.9 ms (1852)
+[waits] 29.4 frames/s; emulation thread per frame: waiting for the window thread 11.99 ms, for the sound 0.00 ms; window thread per second: rendering 999 ms, no work 0 ms
+[parts] emulation thread: game code 39% events 0% IOP and sound 3% hardware registers 7% VIF 2% GIF 0% DMA 0% waiting for the window 49%
+[waits] 30.2 frames/s; emulation thread per frame: waiting for the window thread 9.84 ms, for the sound 0.00 ms; window thread per second: rendering 999 ms, no work 0 ms
+[vk-profile] per second: 90 submits, GPU busy 582.0 ms, most in flight 9, CPU waited 405.6 ms (30 times) | copy 2.4 ms (30) display 8.6 ms (30) hw_draw 373.9 ms (459) hw_load_color 37.9 ms (226) hw_writeback 41.0 ms (226) load_clut 46.2 ms (495) upload 71.9 ms (1852)
+[parts] emulation thread: game code 53% events 0% IOP and sound 4% hardware registers 8% VIF 3% DMA 0% waiting for the window 31% waiting for the sound 0%
+[waits] 32.1 frames/s; emulation thread per frame: waiting for the window thread 5.81 ms, for the sound 0.00 ms; window thread per second: rendering 988 ms, no work 10 ms
+[vk-profile] per second: 78 submits, GPU busy 593.8 ms, most in flight 9, CPU waited 352.1 ms (38 times) | copy 2.0 ms (24) display 7.4 ms (24) hw_draw 333.7 ms (591) hw_load_color 35.1 ms (207) hw_writeback 67.8 ms (231) load_clut 45.7 ms (569) upload 102.2 ms (2803)
+[parts] emulation thread: game code 47% events 0% IOP and sound 2% hardware registers 5% VIF 7% GIF 0% DMA 0% waiting for the window 39%
+[vk-profile] per second: 91 submits, GPU busy 511.2 ms, most in flight 8, CPU waited 0.0 ms (0 times) | copy 1.9 ms (24) display 6.7 ms (24) hw_draw 287.8 ms (471) hw_load_color 24.0 ms (154) hw_writeback 46.7 ms (179) load_clut 59.8 ms (474) upload 84.2 ms (2296)
+[waits] 23.0 frames/s; emulation thread per frame: waiting for the window thread 12.61 ms, for the sound 0.00 ms; window thread per second: rendering 724 ms, no work 88 ms
+[parts] emulation thread: game code 37% events 0% IOP and sound 2% hardware registers 4% VIF 9% DMA 0% waiting for the window 47%
+[vk-profile] per second: 91 submits, GPU busy 509.5 ms, most in flight 3, CPU waited 0.0 ms (0 times) | copy 1.8 ms (23) display 6.4 ms (23) hw_draw 287.1 ms (472) hw_load_color 24.6 ms (160) hw_writeback 48.7 ms (183) load_clut 59.8 ms (457) upload 81.0 ms (2230)
+[parts] emulation thread: game code 37% IOP and sound 2% hardware registers 4% VIF 9% DMA 0% waiting for the window 47%
+[waits] 22.9 frames/s; emulation thread per frame: waiting for the window thread 12.80 ms, for the sound 0.00 ms; window thread per second: rendering 697 ms, no work 94 ms
+[vk-profile] per second: 91 submits, GPU busy 500.6 ms, most in flight 3, CPU waited 0.0 ms (0 times) | copy 1.8 ms (23) display 6.8 ms (23) hw_draw 281.8 ms (462) hw_load_color 22.9 ms (155) hw_writeback 46.4 ms (178) load_clut 59.5 ms (455) upload 81.4 ms (2214)
+[parts] emulation thread: game code 38% IOP and sound 2% hardware registers 4% VIF 10% DMA 0% waiting for the window 47%
+[waits] 22.5 frames/s; emulation thread per frame: waiting for the window thread 13.43 ms, for the sound 0.00 ms; window thread per second: rendering 707 ms, no work 96 ms
+[vk-profile] per second: 90 submits, GPU busy 495.9 ms, most in flight 3, CPU waited 0.0 ms (0 times) | copy 1.8 ms (22) display 7.2 ms (22) hw_draw 277.2 ms (507) hw_load_color 22.3 ms (145) hw_writeback 42.3 ms (161) load_clut 58.7 ms (507) upload 86.5 ms (2262)
+[parts] emulation thread: game code 40% events 0% IOP and sound 2% hardware registers 3% VIF 11% DMA 0% waiting for the window 45%
+[vk-profile] per second: 96 submits, GPU busy 549.9 ms, most in flight 3, CPU waited 0.0 ms (0 times) | copy 2.0 ms (24) display 7.1 ms (24) hw_draw 305.7 ms (505) hw_load_color 33.4 ms (205) hw_writeback 46.2 ms (205) load_clut 57.1 ms (505) upload 98.3 ms (2375)
+[waits] 23.9 frames/s; emulation thread per frame: waiting for the window thread 11.72 ms, for the sound 0.00 ms; window thread per second: rendering 641 ms, no work 137 ms
+[parts] emulation thread: game code 44% events 0% IOP and sound 1% hardware registers 1% VIF 12% DMA 1% waiting for the window 40%
+[vk-profile] per second: 106 submits, GPU busy 576.6 ms, most in flight 9, CPU waited 94.6 ms (23 times) | copy 2.0 ms (25) display 7.1 ms (25) hw_draw 330.7 ms (505) hw_load_color 37.9 ms (231) hw_writeback 49.7 ms (231) load_clut 56.7 ms (510) upload 92.4 ms (2489)
+[waits] 26.6 frames/s; emulation thread per frame: waiting for the window thread 8.73 ms, for the sound 0.00 ms; window thread per second: rendering 850 ms, no work 54 ms
+[parts] emulation thread: game code 47% events 0% IOP and sound 3% hardware registers 2% VIF 7% GIF 0% DMA 0% waiting for the window 41%
+[vk-profile] per second: 90 submits, GPU busy 592.7 ms, most in flight 9, CPU waited 330.2 ms (53 times) | copy 2.2 ms (26) display 7.5 ms (26) hw_draw 351.2 ms (544) hw_load_color 37.7 ms (232) hw_writeback 49.6 ms (232) load_clut 49.4 ms (544) upload 95.2 ms (2576)
+[parts] emulation thread: game code 45% events 0% IOP and sound 3% hardware registers 1% VIF 3% GIF 0% DMA 0% waiting for the window 47%
+[waits] 26.0 frames/s; emulation thread per frame: waiting for the window thread 10.47 ms, for the sound 0.00 ms; window thread per second: rendering 999 ms, no work 0 ms
+[vk-profile] per second: 84 submits, GPU busy 596.6 ms, most in flight 9, CPU waited 338.1 ms (47 times) | copy 2.2 ms (26) display 7.3 ms (26) hw_draw 353.5 ms (504) hw_load_color 39.9 ms (247) hw_writeback 49.7 ms (247) load_clut 48.0 ms (506) upload 96.2 ms (2515)
+[parts] emulation thread: game code 44% events 0% IOP and sound 3% hardware registers 2% VIF 3% GIF 0% DMA 0% waiting for the window 48%
+[waits] 25.8 frames/s; emulation thread per frame: waiting for the window thread 10.91 ms, for the sound 0.00 ms; window thread per second: rendering 999 ms, no work 0 ms
+[vk-profile] per second: 78 submits, GPU busy 597.7 ms, most in flight 9, CPU waited 340.8 ms (38 times) | copy 2.2 ms (26) display 7.3 ms (26) hw_draw 353.3 ms (493) hw_load_color 40.0 ms (251) hw_writeback 48.8 ms (252) load_clut 49.5 ms (493) upload 96.5 ms (2498)
+[parts] emulation thread: game code 46% events 0% IOP and sound 3% hardware registers 2% VIF 3% GIF 0% DMA 0% waiting for the window 47%
+[waits] 25.5 frames/s; emulation thread per frame: waiting for the window thread 11.45 ms, for the sound 0.00 ms; window thread per second: rendering 999 ms, no work 0 ms
+[vk-profile] per second: 75 submits, GPU busy 600.3 ms, most in flight 9, CPU waited 368.3 ms (39 times) | copy 2.1 ms (25) display 7.2 ms (25) hw_draw 353.4 ms (481) hw_load_color 43.7 ms (274) hw_writeback 48.8 ms (274) load_clut 47.9 ms (481) upload 97.2 ms (2445)
+[parts] emulation thread: game code 43% events 0% IOP and sound 3% hardware registers 1% VIF 2% GIF 0% DMA 0% waiting for the window 50% waiting for the sound 0%
+[waits] 25.3 frames/s; emulation thread per frame: waiting for the window thread 12.21 ms, for the sound 0.00 ms; window thread per second: rendering 1000 ms, no work 0 ms
+[vk-profile] per second: 76 submits, GPU busy 599.7 ms, most in flight 9, CPU waited 350.9 ms (26 times) | copy 2.0 ms (25) display 8.9 ms (25) hw_draw 351.2 ms (503) hw_load_color 44.3 ms (279) hw_writeback 51.8 ms (279) load_clut 48.9 ms (503) upload 92.6 ms (2510)
+[parts] emulation thread: game code 45% events 0% IOP and sound 3% hardware registers 1% VIF 2% DMA 0% waiting for the window 49% waiting for the sound 0%
+[vk-profile] per second: 76 submits, GPU busy 598.8 ms, most in flight 9, CPU waited 350.7 ms (32 times) | copy 2.2 ms (25) display 7.7 ms (25) hw_draw 349.9 ms (491) hw_load_color 45.4 ms (285) hw_writeback 50.2 ms (285) load_clut 49.9 ms (492) upload 93.6 ms (2505)
+[waits] 25.4 frames/s; emulation thread per frame: waiting for the window thread 11.95 ms, for the sound 0.00 ms; window thread per second: rendering 999 ms, no work 0 ms
+[parts] emulation thread: game code 43% events 0% IOP and sound 3% hardware registers 2% VIF 2% GIF 0% DMA 0% waiting for the window 49% waiting for the sound 0%
+[vk-profile] per second: 77 submits, GPU busy 598.9 ms, most in flight 9, CPU waited 376.6 ms (36 times) | copy 2.3 ms (26) display 7.3 ms (26) hw_draw 349.4 ms (515) hw_load_color 42.3 ms (274) hw_writeback 54.1 ms (274) load_clut 47.5 ms (516) upload 96.0 ms (2581)
+[waits] 26.0 frames/s; emulation thread per frame: waiting for the window thread 11.32 ms, for the sound 0.00 ms; window thread per second: rendering 999 ms, no work 0 ms
+[parts] emulation thread: game code 46% events 0% IOP and sound 3% hardware registers 2% VIF 2% GIF 0% DMA 0% waiting for the window 46% waiting for the sound 0%
+[vk-profile] per second: 79 submits, GPU busy 595.2 ms, most in flight 9, CPU waited 337.3 ms (32 times) | copy 2.3 ms (26) display 7.6 ms (26) hw_draw 339.9 ms (476) hw_load_color 41.7 ms (264) hw_writeback 52.6 ms (264) load_clut 46.6 ms (476) upload 104.6 ms (2565)
+[parts] emulation thread: game code 49% events 0% IOP and sound 3% hardware registers 1% VIF 2% GIF 0% DMA 0% waiting for the window 44% waiting for the sound 0%
+[waits] 26.5 frames/s; emulation thread per frame: waiting for the window thread 10.17 ms, for the sound 0.00 ms; window thread per second: rendering 999 ms, no work 0 ms
+[vk-profile] per second: 79 submits, GPU busy 596.2 ms, most in flight 9, CPU waited 336.5 ms (28 times) | copy 2.3 ms (26) display 8.3 ms (26) hw_draw 336.7 ms (476) hw_load_color 43.9 ms (278) hw_writeback 52.5 ms (278) load_clut 50.5 ms (476) upload 101.9 ms (2566)
+[parts] emulation thread: game code 50% events 0% IOP and sound 4% hardware registers 1% VIF 2% GIF 0% DMA 0% waiting for the window 43% waiting for the sound 0%
+[waits] 26.6 frames/s; emulation thread per frame: waiting for the window thread 10.06 ms, for the sound 0.00 ms; window thread per second: rendering 999 ms, no work 0 ms
+[vk-profile] per second: 80 submits, GPU busy 597.8 ms, most in flight 9, CPU waited 345.8 ms (32 times) | copy 2.3 ms (27) display 8.2 ms (27) hw_draw 339.8 ms (507) hw_load_color 43.1 ms (273) hw_writeback 53.3 ms (273) load_clut 47.0 ms (507) upload 104.1 ms (2628)
+[parts] emulation thread: game code 49% events 0% IOP and sound 3% hardware registers 2% VIF 2% GIF 0% DMA 0% waiting for the window 44% waiting for the sound 0%
+[waits] 26.5 frames/s; emulation thread per frame: waiting for the window thread 10.23 ms, for the sound 0.00 ms; window thread per second: rendering 999 ms, no work 0 ms
+[vk-profile] per second: 79 submits, GPU busy 597.8 ms, most in flight 9, CPU waited 342.5 ms (30 times) | copy 2.4 ms (26) display 8.3 ms (26) hw_draw 339.6 ms (516) hw_load_color 43.9 ms (277) hw_writeback 53.1 ms (277) load_clut 50.9 ms (517) upload 99.6 ms (2629)
+[parts] emulation thread: game code 49% events 0% IOP and sound 3% hardware registers 1% VIF 2% GIF 0% DMA 0% waiting for the window 44% waiting for the sound 0%
+[waits] 26.5 frames/s; emulation thread per frame: waiting for the window thread 10.44 ms, for the sound 0.00 ms; window thread per second: rendering 999 ms, no work 0 ms
+[vk-profile] per second: 80 submits, GPU busy 597.8 ms, most in flight 9, CPU waited 370.9 ms (31 times) | copy 2.3 ms (26) display 8.9 ms (26) hw_draw 342.4 ms (579) hw_load_color 41.1 ms (263) hw_writeback 56.0 ms (268) load_clut 49.3 ms (580) upload 97.8 ms (2740)
+[parts] emulation thread: game code 50% events 0% IOP and sound 4% hardware registers 1% VIF 1% GIF 0% DMA 0% waiting for the window 44%
+[waits] 26.7 frames/s; emulation thread per frame: waiting for the window thread 10.51 ms, for the sound 0.00 ms; window thread per second: rendering 999 ms, no work 0 ms
+[vk-profile] per second: 80 submits, GPU busy 604.2 ms, most in flight 9, CPU waited 378.0 ms (27 times) | copy 2.3 ms (27) display 9.1 ms (27) hw_draw 342.5 ms (524) hw_load_color 47.1 ms (295) hw_writeback 54.1 ms (295) load_clut 51.9 ms (524) upload 97.2 ms (2617)
+[parts] emulation thread: game code 48% events 0% IOP and sound 3% hardware registers 2% VIF 2% GIF 0% DMA 0% waiting for the window 44% waiting for the sound 0%
+[waits] 26.2 frames/s; emulation thread per frame: waiting for the window thread 11.17 ms, for the sound 0.00 ms; window thread per second: rendering 999 ms, no work 0 ms
+[vk-profile] per second: 78 submits, GPU busy 599.1 ms, most in flight 9, CPU waited 392.8 ms (35 times) | copy 2.3 ms (26) display 7.9 ms (26) hw_draw 345.8 ms (544) hw_load_color 43.8 ms (280) hw_writeback 51.9 ms (280) load_clut 47.6 ms (545) upload 99.7 ms (2642)
+[parts] emulation thread: game code 47% events 0% IOP and sound 3% hardware registers 2% VIF 2% GIF 0% DMA 0% waiting for the window 45%
+[vk-profile] per second: 79 submits, GPU busy 596.8 ms, most in flight 9, CPU waited 375.5 ms (33 times) | copy 2.3 ms (26) display 8.2 ms (26) hw_draw 348.0 ms (484) hw_load_color 41.1 ms (267) hw_writeback 51.0 ms (267) load_clut 43.9 ms (484) upload 102.3 ms (2568)

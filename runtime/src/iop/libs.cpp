@@ -990,6 +990,9 @@ void install_stdio() {
 void install_modload() {
     register_hle_library("modload", 0x0102);
     def("modload", 13, "SetCheckKelfPathCallback", [](Cpu &c) { c.r[2] = 0; });
+    // #30 takes a module id (from SearchModuleByName) and a flag word (Tekken 5's module 0x22B00 passes 0x40 for two modules); a call that
+    // changes nothing here, since modules are never unloaded behind a game's back.
+    def("modload", 30, "SetModuleFlags", [](Cpu &c) { c.r[2] = 0; });
     def("modload", 16, "GetModuleIdList", [](Cpu &c) {
         std::uint32_t n = 0;
         for (const auto &[id, m] : modules()) {

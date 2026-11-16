@@ -1,0 +1,16 @@
+-- Configuring done (0.1s)
+-- Generating done (0.0s)
+-- Build files have been written to: /tmp/switch-build-tekken-4
+ninja: Entering directory `/tmp/switch-build-tekken-4'
+[0/2] Re-checking globbed directories...
+[1/4] Building CXX object CMakeFiles/ps2runtime.dir/runtime/src/gs/gpu/gpu.o
+[2/4] Linking CXX static library libps2runtime.a
+[3/4] Linking CXX executable ps2run.elf
+[4/4] Building NRO executable target ps2run_nro
+>> F:\ps22switch\build\switch\Tekken-4\Tekken-4.nro (35 MB)
+>> put the disc image next to the .nro as disc.iso yourself: C:\ps2-native-recomp-main\games\Tekken-4\disc.iso
+>> SD card folder: F:\ps22switch\build\switch\Tekken-4\package\switch\ps22switch\Tekken-4
+>> copy the 'switch' folder inside F:\ps22switch\build\switch\Tekken-4\package to the root of the SD card and start Tekken-4.nro from the homebrew menu
+>> start the homebrew menu by holding R while starting a game (title takeover): the album applet gives homebrew less memory
+
+[DONE] Tekken 4 -> Tekken-4.nro

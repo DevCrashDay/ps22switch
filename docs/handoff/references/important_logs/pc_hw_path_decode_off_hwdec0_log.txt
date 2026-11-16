@@ -1,0 +1,127 @@
+[gpu] AMD Radeon RX 6800 XT (Vulkan 1.4.315, driver 8388961) on Vulkan
+[vulkan] memory type 0: heap 0 (16112 MB) device-local
+[vulkan] memory type 1: heap 1 (16338 MB) host-visible coherent
+[vulkan] memory type 2: heap 2 (256 MB) device-local host-visible coherent
+[vulkan] memory type 3: heap 1 (16338 MB) host-visible coherent cached
+[vulkan] memory type 4: heap 0 (16112 MB) device-local
+[vulkan] memory type 5: heap 1 (16338 MB) host-visible coherent
+[vulkan] memory type 6: heap 2 (256 MB) device-local host-visible coherent
+[vulkan] memory type 7: heap 1 (16338 MB) host-visible coherent cached
+[vulkan] memory type 8: heap 0 (16112 MB) device-local
+[vulkan] memory type 9: heap 1 (16338 MB) host-visible coherent
+[vulkan] memory type 10: heap 2 (256 MB) device-local host-visible coherent
+[vulkan] memory type 11: heap 1 (16338 MB) host-visible coherent cached
+[vulkan] memory type 12: heap 0 (16112 MB) device-local
+[vulkan] memory type 13: heap 1 (16338 MB) host-visible coherent
+[vulkan] memory type 14: heap 2 (256 MB) device-local host-visible coherent
+[vulkan] memory type 15: heap 1 (16338 MB) host-visible coherent cached
+[vk-profile] timing every dispatch (10.000 ns per tick)
+[gpu] graphics API: Direct3D 12 (the default on Windows; PS2_GPU_BACKEND=vulkan picks Vulkan)
+[gpu] Direct3D 12 shader compiler: FXC (PS2_DX12_COMPILER=fxc|dxc picks)
+[gpu] 9 shaders compiled in 1 ms
+[gpu] hardware rasterizer path on (PS2_GS_HW=1)
+[disc] C:/ps2-native-recomp-main/games/Tekken-4/disc.iso: 6 files, 1317552 sectors, layer 1 at 0
+[mc] card in slot 1: F:/ps22switch/scratch/hwdec0/card.ps2
+[sif] IOP reboot requested with "rom0:UDNL cdrom:\IRX\IOPRP243.IMG;1"
+[sif] LOADFILE from cdrom:\IRX\IOPRP243.IMG;1 reports 2430
+[loadfile] buffer at 0x20030, 6553 bytes
+[loadfile] buffer at 0x219F0, 44917 bytes
+[loadfile] buffer at 0x2C970, 90805 bytes
+[loadfile] buffer at 0x42C30, 7353 bytes
+[loadfile] buffer at 0x448F0, 25397 bytes
+[iop-io] write 0x1F801404 = 0xBF900000 (pc 0x0008E608)
+[iop-io] write 0x1F80140C = 0xBF900800 (pc 0x0008E60C)
+[iop-io] read 0x1F8010F0 = 0x0 (pc 0x0008E628)
+[iop-io] read 0x1F801570 = 0x0 (pc 0x0008E638)
+[iop-io] write 0x1F801014 = 0x200B31E1 (pc 0x0008E664)
+[iop-io] write 0x1F801414 = 0x200B31E1 (pc 0x0008E668)
+[loadfile] buffer at 0x4AC30, 60885 bytes
+[fileio] open rom0:ROMVER -> 3
+[io] write 0x1000F590 = 0x10000 (pc 0x00291A24)
+[gs] SetGsCrt interlace 1 mode 0x2 field 1
+[dma] gif tag id 0 qwc 9 addr 0x0031E4F0 data 0x0031E4F0
+[dma] gif tag id 0 qwc 9 addr 0x0031E580 data 0x0031E580
+[iop-io] read 0x1F808280 = 0x0 (pc 0x00059C84)
+[vk-profile] per second: 582 submits, GPU busy 410.9 ms, most in flight 7, CPU waited 0.0 ms (0 times) | copy 0.1 ms (2) display 0.1 ms (2) hw_draw 301.4 ms (14389) hw_load_color 5.9 ms (483) hw_writeback 11.3 ms (623) load_clut 19.7 ms (4210) upload 72.5 ms (19968)
+[ipu] bad code in command 0x10010000 (frame 680, bit 43 of 128, next 0000000D 8000000D, picture type 0)
+[ipu] bad code in command 0x10010000 (frame 681, bit 43 of 128, next 0000000D 8000000D, picture type 0)
+[ipu] bad code in command 0x10010000 (frame 682, bit 63 of 128, next 000000D8 000000D8, picture type 0)
+[ipu] bad code in command 0x10010000 (frame 683, bit 63 of 128, next 000000D8 000000D8, picture type 0)
+[ipu] bad code in command 0x10010000 (frame 684, bit 33 of 128, next 00000003 60000003, picture type 0)
+[ipu] bad code in command 0x10010000 (frame 685, bit 33 of 128, next 00000003 60000003, picture type 0)
+[ipu] bad code in command 0x10010000 (frame 686, bit 30 of 128, next 0000006C 0000006C, picture type 0)
+[ipu] bad code in command 0x10010000 (frame 687, bit 30 of 128, next 0000006C 0000006C, picture type 0)
+[vk-profile] per second: 268 submits, GPU busy 585.8 ms, most in flight 4, CPU waited 0.0 ms (0 times) | copy 0.1 ms (2) display 0.1 ms (2) hw_draw 403.8 ms (15478) hw_load_color 6.4 ms (533) hw_writeback 12.3 ms (759) load_clut 56.2 ms (9053) upload 106.9 ms (21529)
+[vk-profile] per second: 252 submits, GPU busy 400.7 ms, most in flight 2, CPU waited 0.0 ms (0 times) | copy 0.1 ms (2) display 0.0 ms (2) hw_draw 285.1 ms (2686) hw_load_color 11.0 ms (610) hw_writeback 13.4 ms (716) load_clut 28.4 ms (2356) upload 62.6 ms (6101)
+[vk-profile] per second: 198 submits, GPU busy 383.7 ms, most in flight 2, CPU waited 0.0 ms (0 times) | copy 0.1 ms (1) display 0.0 ms (1) hw_draw 251.8 ms (1784) hw_load_color 12.1 ms (688) hw_writeback 12.5 ms (732) load_clut 30.3 ms (1736) upload 76.8 ms (8314)
+[vk-profile] per second: 221 submits, GPU busy 417.7 ms, most in flight 2, CPU waited 0.0 ms (0 times) | copy 0.0 ms (0) display 0.0 ms (0) hw_draw 286.4 ms (1664) hw_load_color 10.4 ms (615) hw_writeback 11.7 ms (660) load_clut 28.2 ms (1535) upload 81.0 ms (8680)
+[vk-profile] per second: 209 submits, GPU busy 389.5 ms, most in flight 2, CPU waited 0.0 ms (0 times) | copy 0.1 ms (1) display 0.0 ms (1) hw_draw 270.3 ms (1563) hw_load_color 6.1 ms (417) hw_writeback 9.6 ms (486) load_clut 26.6 ms (1424) upload 76.9 ms (8261)
+[vk-profile] per second: 191 submits, GPU busy 466.3 ms, most in flight 2, CPU waited 0.0 ms (0 times) | copy 0.0 ms (0) display 0.0 ms (0) hw_draw 310.5 ms (2119) hw_load_color 14.5 ms (855) hw_writeback 14.4 ms (857) load_clut 31.5 ms (1960) upload 95.4 ms (10312)
+[vk-profile] per second: 185 submits, GPU busy 479.3 ms, most in flight 2, CPU waited 0.0 ms (0 times) | copy 0.1 ms (1) display 0.0 ms (1) hw_draw 309.9 ms (2355) hw_load_color 18.1 ms (1087) hw_writeback 16.7 ms (1087) load_clut 31.7 ms (2176) upload 102.9 ms (11101)
+[vk-profile] per second: 182 submits, GPU busy 480.1 ms, most in flight 2, CPU waited 0.0 ms (0 times) | copy 0.1 ms (1) display 0.0 ms (1) hw_draw 313.6 ms (2387) hw_load_color 15.8 ms (950) hw_writeback 15.3 ms (950) load_clut 32.9 ms (2217) upload 102.3 ms (11024)
+[vk-profile] per second: 174 submits, GPU busy 459.9 ms, most in flight 2, CPU waited 0.0 ms (0 times) | copy 0.1 ms (1) display 0.0 ms (1) hw_draw 304.5 ms (2215) hw_load_color 13.0 ms (765) hw_writeback 13.7 ms (774) load_clut 31.7 ms (2048) upload 96.9 ms (10423)
+[vk-profile] per second: 171 submits, GPU busy 461.3 ms, most in flight 2, CPU waited 0.0 ms (0 times) | copy 0.1 ms (1) display 0.0 ms (1) hw_draw 307.3 ms (2179) hw_load_color 13.2 ms (768) hw_writeback 13.5 ms (768) load_clut 32.0 ms (2011) upload 95.2 ms (10276)
+[vk-profile] per second: 168 submits, GPU busy 459.9 ms, most in flight 2, CPU waited 0.0 ms (0 times) | copy 0.0 ms (0) display 0.0 ms (0) hw_draw 305.8 ms (2219) hw_load_color 12.9 ms (757) hw_writeback 13.3 ms (757) load_clut 32.9 ms (2059) upload 94.8 ms (10248)
+[vk-profile] per second: 166 submits, GPU busy 456.2 ms, most in flight 2, CPU waited 0.0 ms (0 times) | copy 0.1 ms (1) display 0.0 ms (1) hw_draw 304.5 ms (2180) hw_load_color 12.7 ms (742) hw_writeback 13.1 ms (742) load_clut 32.7 ms (2025) upload 93.1 ms (10063)
+[vk-profile] per second: 164 submits, GPU busy 439.1 ms, most in flight 2, CPU waited 0.0 ms (0 times) | copy 0.0 ms (0) display 0.0 ms (0) hw_draw 293.5 ms (2076) hw_load_color 12.2 ms (708) hw_writeback 12.5 ms (708) load_clut 32.3 ms (1927) upload 88.6 ms (9572)
+[vk-profile] per second: 215 submits, GPU busy 435.4 ms, most in flight 2, CPU waited 0.0 ms (0 times) | copy 0.1 ms (1) display 0.0 ms (1) hw_draw 293.0 ms (2271) hw_load_color 9.1 ms (567) hw_writeback 13.9 ms (833) load_clut 32.5 ms (1911) upload 86.9 ms (9353)
+[vk-profile] per second: 220 submits, GPU busy 441.4 ms, most in flight 2, CPU waited 0.0 ms (0 times) | copy 0.1 ms (1) display 0.0 ms (1) hw_draw 303.9 ms (1932) hw_load_color 7.3 ms (492) hw_writeback 11.9 ms (570) load_clut 30.7 ms (1784) upload 87.4 ms (9421)
+[vk-profile] per second: 188 submits, GPU busy 398.0 ms, most in flight 2, CPU waited 0.0 ms (0 times) | copy 0.0 ms (0) display 0.0 ms (0) hw_draw 254.4 ms (1577) hw_load_color 7.7 ms (561) hw_writeback 14.2 ms (832) load_clut 24.4 ms (1231) upload 97.2 ms (10534)
+[vk-profile] per second: 189 submits, GPU busy 402.4 ms, most in flight 2, CPU waited 0.0 ms (0 times) | copy 0.1 ms (1) display 0.0 ms (1) hw_draw 260.3 ms (1417) hw_load_color 7.7 ms (563) hw_writeback 12.6 ms (657) load_clut 24.8 ms (1239) upload 96.8 ms (10495)
+[vk-profile] per second: 194 submits, GPU busy 395.0 ms, most in flight 2, CPU waited 0.0 ms (0 times) | copy 0.1 ms (1) display 0.0 ms (1) hw_draw 263.0 ms (1241) hw_load_color 7.9 ms (545) hw_writeback 11.9 ms (626) load_clut 23.1 ms (1080) upload 88.9 ms (9570)
+[ee] halted: frame limit reached
+[thread] 1 status 1 prio 1 wait 0/10 pc 0x0022A151 ra 0x00196A58
+[thread]   stack: 0018012C
+[thread] 2 status 4 prio 0 wait 2/2 pc 0x002803E8 ra 0x002876A8
+[thread]   stack:
+[sema] 2 count 0 waiters 1
+[iop] module 1 sio2man at 0x00059B00
+[iop] module 2 padman at 0x0005AB00
+[iop] module 3 mcman at 0x00064900
+[iop] module 4 mcserv at 0x0008A000
+[iop] module 5 Sound_Device_Library at 0x0008D800
+[iop] module 6 zsiopdrv at 0x00092300
+[iop] thread 1 status 16 prio 8 wait 0/0 pc 0x00001010
+[iop] thread 2 status 4 prio 16 wait 4/1 pc 0x00059EC4
+[iop] thread 3 status 16 prio 8 wait 0/0 pc 0x00001010
+[iop] thread 4 status 4 prio 46 wait 8/411188 pc 0x00001020
+[iop] thread 5 status 4 prio 46 wait 8/411412 pc 0x00001020
+[iop] thread 6 status 16 prio 8 wait 0/0 pc 0x00001010
+[iop] thread 7 status 16 prio 8 wait 0/0 pc 0x00001010
+[iop] thread 8 status 4 prio 104 wait 8/579280 pc 0x00001020
+[iop] thread 9 status 16 prio 8 wait 0/0 pc 0x00001010
+[iop] thread 10 status 16 prio 8 wait 0/0 pc 0x00001010
+[iop] thread 11 status 4 prio 29 wait 3/6 pc 0x000952F4
+[iop] thread 12 status 4 prio 83 wait 8/1978248 pc 0x00001020
+[iop] thread 13 status 4 prio 88 wait 1/0 pc 0x00092954
+[iop] thread 14 status 4 prio 89 wait 1/0 pc 0x00098BD4
+[iop] thread 15 status 4 prio 95 wait 1/0 pc 0x0009420C
+[iop] thread 16 status 4 prio 10 wait 2/0 pc 0x000991FC
+[iop] thread 17 status 4 prio 99 wait 1/0 pc 0x00099004
+[iop] thread 18 status 2 prio 20 wait 0/10 pc 0x0005AB94
+[iop] thread 19 status 4 prio 46 wait 4/10 pc 0x0005AB94
+[iop] thread 20 status 4 prio 46 wait 4/11 pc 0x0005AB94
+[iop] thread 21 status 16 prio 46 wait 0/11 pc 0x0005D614
+[iop] thread 22 status 16 prio 46 wait 0/11 pc 0x0005D750
+[iop] thread 23 status 16 prio 46 wait 0/11 pc 0x0005D888
+[iop] thread 24 status 16 prio 46 wait 0/0 pc 0x00000000
+[iop] thread 25 status 16 prio 46 wait 0/0 pc 0x00000000
+[iop] thread 26 status 4 prio 46 wait 4/12 pc 0x0005AB94
+[iop] thread 27 status 4 prio 46 wait 4/12 pc 0x0005AB94
+[iop] thread 28 status 16 prio 46 wait 0/0 pc 0x00000000
+[iop] thread 29 status 16 prio 46 wait 0/0 pc 0x00000000
+[iop] thread 30 status 16 prio 46 wait 0/0 pc 0x00000000
+[iop] thread 31 status 16 prio 46 wait 0/0 pc 0x00000000
+[sif] 0 packets wait for the EE (processed 1)
+[gpu] 8349 submits, dispatches: upload 416586 copy_read 0 copy_write 0 load_clut 88777 display 42 raster 0 resolve 0 snapshot 0 decode 0
+[gs] 40443435 primitives drawn, register writes: 00:17109071 01:206562 02:198598 03:2640428 04:56391276 05:2927796 06:10100027 07:238578 08:10113855 09:233086 0C:44207771 0D:262528 14:23375 15:124069 18:14992 19:12389 1A:22033 22:4103 3B:9548 3D:2845 3F:183193 40:20437 41:12389 42:10119300 43:137802 45:4103 46:22033 47:8214962 48:142407 49:22033 4A:17931 4B:8205 4C:14992 4D:12389 4E:14992 4F:12389 50:516461 51:516461 52:516461 53:516461
+[ipu] commands: 0:396 1:196 4:588 5:4 6:2 9:2 stalls 0 out 2069760 qwords, busy 0 decoding 0 cmd 0x40000020 in 32 bytes bit 100 out 0
+[dma] starts: ch0=2846 ch1=12389 ch2=8206 ch3=196 ch4=392 ch5=0 ch6=0 ch7=0 ch8=2315319 ch9=670952
+[gif] path 1 tags: packed 25772221 reglist 0 image 0
+[gif] path 2 tags: packed 1125737 reglist 86690 image 516461
+[gif] path 3 tags: packed 12308 reglist 4103 image 0
+[vif0] 00:37007 01:2847 04:1 05:2847 10:1 20:2847 4A:2849
+[vif1] 00:43110183 01:37150191 02:404333 03:404333 04:1 05:2 06:1 10:1138148 11:898904 13:2 14:8619896 15:353672 20:2 4A:18 50:536253 51:517291 60:1932657 68:5981449 6C:29231307 6D:154918 6E:5981449
+[spin] 288568 cycles of waiting loops skipped (0.0 % of the time since this run started)
+[ee] stopped after 4200 frames, 20658607786 cycles: frame limit reached
+[mc] card use so far: 1 page reads, 0 page writes, 0 block erases

@@ -1,21 +1,88 @@
-# ps2-native-recomp
+# ps22switch: Recompiling PS2 Games for Nintendo Switch
 
-Turns the disc image of a PS2 game you own into a native program for Windows or Linux. **This project is at an early
-stage** and still changes a lot. God of War II has been played from start to end on Windows; a few more games run as far
-as they have been played.
+Turns the disc image of a PS2 game you own into a native, standalone homebrew executable (`.nro`) for the **Nintendo Switch (Switch 1)**, or into a native program for Windows / Linux.
 
-**Don't expect every game to work on the first try.** Only a few games have been tried so far, and each game uses the
-console a little differently, so many still stop at a black screen, crash, or play with missing sound or wrong pictures.
-When a game doesn't work, please send me a report (see [*Playtesters wanted*](#playtesters-wanted)): every report shows
-me what to fix next, and one fix often helps several games at once.
+Based on [ps2-native-recomp](https://github.com/exoteric33/ps2-native-recomp) and [ps2-web-recomp](https://github.com/snuri00/ps2-web-recomp) by Samir Nuri.
 
-The game's main-CPU code is translated once into C++ (static recompilation) and compiled into a normal program, so there is
-no emulator for the main CPU. The rest of the console (graphics chip, vector units, sound, disc, controller, memory card)
-is reimplemented by a runtime that draws with WebGPU (wgpu-native, on Vulkan or Direct3D 12).
+---
 
-This project builds on [ps2-web-recomp](https://github.com/snuri00/ps2-web-recomp) by Samir Nuri (MIT), which does the
-same on Linux, macOS and in the browser, and whose README explains how the recompiler and the runtime work. The recompiler
-and the runtime started as his. What I added:
+## How It Works on Nintendo Switch
+
+1. **CPU Static Recompilation (Emotion Engine MIPS R5900):**
+   The game's MIPS R5900 machine code is analyzed and statically translated once into portable modern C++20 units via `eerecomp`. These units are cross-compiled directly for the Nintendo Switch ARMv8-A Cortex-A57 64-bit CPU cores using `devkitA64` (`aarch64-none-elf-gcc`). There is **zero CPU emulation overhead** at runtime.
+
+2. **Vector Units (VU0 / VU1):**
+   The VU1 programs the exploring runs on the PC recorded are statically translated to C++ (vector code that GCC turns into ARM NEON). A program the build does not know is interpreted: the Switch has no compiler to translate it while the game runs, so the more of the game the PC runs saw, the faster it plays.
+
+3. **Graphics Synthesizer (GS):**
+   Drawn on the Switch's GPU with Vulkan through Mesa's NVK driver (the same driver build OpenTrickyNX uses). The renderer is
+   the PC's own WebGPU drawing program: `runtime/src/gs/gpu/vk` implements the WebGPU calls it makes on Vulkan, and
+   `scripts/wgsl_spirv.py` turns its shader into SPIR-V with naga (run it after changing `gs.wgsl`). On the PC the same
+   layer draws Tekken 4 pixel for pixel like wgpu-native (`-DPS2_VULKAN=ON -DPS2_VULKAN_INCLUDE=<folder with vulkan/vulkan.h>`).
+   The finished picture is shown through SDL2. `--software` builds with the old software renderer instead (far too slow).
+
+4. **Audio (SPU2):**
+   The PS2 SPU2 synthesizer streams 48,000 Hz stereo audio with dynamic time stretching directly into the Nintendo Switch SDL2 audio driver.
+
+5. **Controls:**
+   Native support for Joy-Cons and Nintendo Switch Pro Controllers through the libnx SDL2 GameController API.
+
+---
+
+## Quick Start for Nintendo Switch
+
+### Prerequisites
+- Windows 10/11 with WSL2 and a distribution named `devkita64` holding devkitPro's devkitA64, libnx and `switch-sdl2`,
+  with `switch-cmake` / `switch-ninja` wrappers in `/usr/local/bin` (`--wsl-distro` picks another name). On Linux,
+  devkitPro installed directly (`$DEVKITPRO`) is used instead.
+- The Mesa NVK SDK for the Switch: `mesa-switch-nvk-sdk.zip` from the `nvk-sdk` release of
+  [OpenTrickyNX](https://github.com/DevCrashDay/OpenTrickyNX/releases/tag/nvk-sdk), unzipped into `tools/nvk-sdk`
+  (or `--nvk-sdk <its portlibs/switch folder>`).
+- What the native build needs on the PC (Git Bash and the translator tools: run `Start.cmd` once, or `scripts/setup.sh --native-only`).
+- Python 3
+
+### Building with One Command
+1. Place your PS2 game ISO (e.g. `Tekken 4 (USA).iso`) in the project directory.
+2. Run `Switch_Build.cmd` or invoke `scripts/switch_port.py`:
+   ```cmd
+   Switch_Build.cmd "Tekken 4 (USA).iso"
+   ```
+   Or via Python:
+   ```cmd
+   python scripts/switch_port.py "Tekken 4 (USA).iso" --title "Tekken 4"
+   ```
+3. The build pipeline automatically:
+   - Runs `scripts/port.sh --native-only` on the PC: extracts the boot program, translates its MIPS R5900 code to C++,
+     runs the game headless to find the code the static pass missed and compiles the VU1 programs those runs recorded.
+     This step matters more than on the PC: the Switch build cannot compile code it meets while the game runs, so code
+     the PC runs never reached stops the game there. `--pnach`, `--widescreen`, `--frames` and `--rounds` are passed on.
+   - Cross-compiles `ps2runtime` and the game's C++ for AArch64 with devkitA64 (`-ffp-contract=off`, so the PS2's
+     floating point results come out the same as on the PC).
+   - Packages the `.nro` with its NACP title and metadata.
+   - Creates a ready-to-use SD card folder under `build/switch/<GameName>/package/`, with the disc image copied in
+     (`--no-disc-copy` leaves that to you) and `launch.txt`, the command line the `.nro` starts the game with.
+   - `--skip-port` rebuilds the `.nro` from what an earlier run left in `generated/<GameName>`.
+
+### Installing to your Switch
+Copy the `switch` folder from `build/switch/<GameName>/package/` to the root of your Switch SD card:
+```
+sdmc:/
+  └── switch/
+      └── ps22switch/
+          └── <GameName>/
+              ├── <GameName>.nro
+              ├── launch.txt       the program, disc image and options, one argument to a line
+              ├── disc/<boot program>
+              ├── disc.iso         the game reads its files from the disc image while it runs
+              ├── patches.txt      when PCSX2 patches were applied
+              └── keys.ini
+```
+Launch the game from the **Homebrew Menu (hbmenu)**, preferably started by holding R while starting a game (title
+takeover gives homebrew all of the memory and processor time; the album applet gives less). The game runs on three of
+the Switch's cores (emulation, vector units, drawing), its log goes to `ps2run.log` and its saves to `<GameName>.ps2`,
+both next to the `.nro`. Without `launch.txt` the `.nro` looks for a boot program and an `.iso` in its folder and in `disc/`.
+
+---
 
 - **Windows:** the recompiler, the runtime and the game build with llvm-mingw and draw through Direct3D 12 or Vulkan.
 - **Faster drawing:** the graphics chip's drawing program does about a fifth less work per frame, with the same pictures
@@ -39,7 +106,7 @@ Tried with real discs (mine are US releases), as far as each was played (no know
 
 | Game | How far | Tested by |
 |---|---|---|
-| God of War II | **played from start to end**, with a game controller; keyboard and mouse work too, and so do quick saves and the game's own save | my friend Petar |
+| God of War II | **played from start to end**, with a game controller; keyboard and mouse work too, and so do quick saves and the game's own save | petarsti |
 | God of War | plays well, not played through yet: from power-on through the menus and the opening film into the first fight on the ship, also in 16:9 | me |
 | Gran Turismo 4 | plays well, not played through yet: from power-on through the film and the menus, and a whole race played | me |
 | Resident Evil 4 | plays well, not played through yet: the menus, the opening, Leon in the forest | me |
@@ -50,7 +117,13 @@ Tried with real discs (mine are US releases), as far as each was played (no know
 | God Hand | plays well, not played through yet: as far as the casino hub, no problems so far | theraineydaze (Reddit) |
 | Tekken 4 | plays well, not played through yet: fights in Story Battle at 60 fps, only a short stutter when a fight starts (Windows 11, a Radeon RX 6800 XT, keyboard and mouse; [#8](https://github.com/exoteric33/ps2-native-recomp/issues/8)) | DevCrashDay |
 | Armored Trooper VOTOMS (Japan) | plays well, not played through yet: the tutorial and the first mission at about 60 fps, and saves work; it slowed down once, the first time a new part loaded (Windows 11, a laptop with Intel graphics, a game controller; [#5](https://github.com/exoteric33/ps2-native-recomp/issues/5)) | omegakatana92 |
-| Ben 10: Alien Force | plays well, not played through yet: works very well, no problems so far | InsomniacSpider-Man |
+| Ben 10: Alien Force | plays well, not played through yet: works very well, no problems so far | Travani |
+
+Known not to work yet (reported by playtesters, on my list to fix):
+
+| Game | What happens | Reported by |
+|---|---|---|
+| Ben 10: Alien Force - Vilgax Attacks | stops at "Checking memory card" right after the start and goes no further | Travani |
 
 54 of the 55 programs of the free [ps2autotests](https://github.com/unknownbrackets/ps2autotests) suite print exactly
 what the console prints (`python scripts/autotests.py`).

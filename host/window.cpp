@@ -1,4 +1,7 @@
+#include "ps2/part.hpp"
 #include "window.hpp"
+#include "thread.hpp"
+#include "switch_clock.hpp"
 
 #include "ps2/system.hpp"
 
@@ -14,6 +17,9 @@
 #ifndef _WIN32
 #include <sys/resource.h>
 #include <unistd.h>
+#endif
+#ifdef __SWITCH__
+#include <switch.h>
 #endif
 #ifdef __linux__
 #include <csignal>
@@ -68,6 +74,13 @@ constexpr PadBinding kPadButtons[] = {
     {SDL_CONTROLLER_BUTTON_DPAD_LEFT, kLeft},   {SDL_CONTROLLER_BUTTON_DPAD_RIGHT, kRight},
 };
 
+// deko3d draws and presents on the console's own window, so SDL keeps input and sound only: with SDL's video subsystem up it would take
+// that window for its renderer, and deko3d could not present into it at all (that is where the Vulkan present path stopped).
+#ifdef PS2_DEKO3D_RENDER
+constexpr bool kSdlVideo = false;
+#else
+constexpr bool kSdlVideo = true;
+#endif
 SDL_Window *g_window = nullptr;
 SDL_Renderer *g_renderer = nullptr;
 SDL_Texture *g_texture = nullptr;
@@ -121,11 +134,13 @@ std::atomic<int> g_beep_request{0};
 bool g_beep_on = true;
 
 void refresh_title() {
+    if (!g_window) return;  // deko3d presents on the console's own window: there is no SDL title to show the speed in
     if (g_notice_text.empty()) SDL_SetWindowTitle(g_window, g_speed_title.c_str());
     else SDL_SetWindowTitle(g_window, (g_notice_text + "   |   " + g_speed_title).c_str());
 }
 
 bool create_renderer() {
+    if (!g_window) return false;
     g_renderer = SDL_CreateRenderer(g_window, -1, SDL_RENDERER_ACCELERATED);
     if (!g_renderer) g_renderer = SDL_CreateRenderer(g_window, -1, SDL_RENDERER_SOFTWARE);
     if (!g_renderer) {
@@ -137,6 +152,30 @@ bool create_renderer() {
 
 bool attach_gpu() {
     if (std::getenv("PS2_SDL_RENDERER")) return false;
+#ifdef __SWITCH__
+#ifdef PS2_DEKO3D_RENDER
+    // The display is deko3d's: the renderer draws the frame into a swap chain image on the console's own window and presents it.
+    ps2::WindowTarget target;
+    target.kind = ps2::WindowTarget::Vi;
+    target.width = 1280;
+    target.height = 720;
+    return ps2::attach_window(target);
+#else
+    // PS2_VK_PRESENT=1: the renderer blits into a swap chain image on the display and the driver presents it, instead of the picture
+    // being read back and uploaded into an SDL texture. Off by default, so the path that has been running on the console stays.
+    if (std::getenv("PS2_VK_PRESENT")) {
+        ps2::WindowTarget target;
+        target.kind = ps2::WindowTarget::Vi;
+        int w = 0, h = 0;
+        SDL_GetWindowSizeInPixels(g_window, &w, &h);
+        target.width = static_cast<std::uint32_t>(w);
+        target.height = static_cast<std::uint32_t>(h);
+        return ps2::attach_window(target);
+    }
+#endif
+#endif
+#ifndef PS2_DEKO3D_RENDER
+    // Every other platform: the window SDL made, whichever video driver it uses
     SDL_SysWMinfo info;
     SDL_VERSION(&info.version);
     if (!SDL_GetWindowWMInfo(g_window, &info)) return false;
@@ -170,6 +209,7 @@ bool attach_gpu() {
     default: return false;
     }
     return ps2::attach_window(target);
+#endif  // !PS2_DEKO3D_RENDER
 }
 
 std::uint8_t axis(SDL_GameController *pad, SDL_GameControllerAxis a) {
@@ -220,8 +260,14 @@ void open_pad(int device) {
     for (int port = 0; port < 2; ++port)
         if (!g_pads[port]) {
             g_pads[port] = SDL_GameControllerOpen(device);
-            if (g_pads[port]) std::fprintf(stderr, "[pad] %s (%s) in port %d\n", or_unknown(SDL_GameControllerName(g_pads[port])), pad_kind(g_pads[port]), port + 1);
-            else std::fprintf(stderr, "[pad] cannot open controller %d: %s\n", device, SDL_GetError());
+            if (g_pads[port]) {
+                SDL_Joystick *stick = SDL_GameControllerGetJoystick(g_pads[port]);
+                std::fprintf(stderr, "[pad] %s (%s) in port %d: %d axes, %d buttons, %d hats\n", or_unknown(SDL_GameControllerName(g_pads[port])),
+                             pad_kind(g_pads[port]), port + 1, stick ? SDL_JoystickNumAxes(stick) : 0, stick ? SDL_JoystickNumButtons(stick) : 0,
+                             stick ? SDL_JoystickNumHats(stick) : 0);
+            } else {
+                std::fprintf(stderr, "[pad] cannot open controller %d: %s\n", device, SDL_GetError());
+            }
             return;
         }
     std::fprintf(stderr, "[pad] %s is not used: both ports have a controller\n", or_unknown(SDL_GameControllerNameForIndex(device)));
@@ -474,7 +520,7 @@ void edit_keys_file() {
 // compositor, opened on another workspace, or simply not noticed stopped the whole game for as long as it stood (the window thread
 // answers the compositor, draws the pictures and takes the emulation's frames; GTA III froze 14 s that way on 2026-10-29,
 // docs/linux.md "The window freeze"). The answer is taken in poll(), on the window thread.
-#if !defined(_WIN32) && !defined(__APPLE__)
+#if !defined(_WIN32) && !defined(__APPLE__) && !defined(__SWITCH__)
 #define PS2_KEY_CARD_ON_A_THREAD 1
 #endif
 
@@ -685,6 +731,7 @@ void poll_port(int port) {
     std::uint16_t pressed = 0;
     std::uint8_t l2 = 0xFF, r2 = 0xFF;
     std::uint8_t lx = 0x80, ly = 0x80, rx = 0x80, ry = 0x80;
+    Uint8 hat = 0;
     if (port == 0) read_keyboard(pressed, lx, ly, rx, ry);
     if (pad) {
         for (const PadBinding &b : kPadButtons)
@@ -701,6 +748,16 @@ void poll_port(int port) {
         if (ly == 0x80) ly = axis(pad, SDL_CONTROLLER_AXIS_LEFTY);
         if (rx == 0x80) rx = axis(pad, SDL_CONTROLLER_AXIS_RIGHTX);
         if (ry == 0x80) ry = axis(pad, SDL_CONTROLLER_AXIS_RIGHTY);
+        // The D-pad reaches SDL as a joystick hat, and a generic controller mapping does not always turn the hat into DPAD_* buttons -
+        // on the Switch it did not, so the four directions never arrived in the log while Cross, Circle and Start did. Read the hat as
+        // well; asking for both costs nothing and covers the pads where the mapping does work.
+        if (SDL_Joystick *stick = SDL_GameControllerGetJoystick(pad)) {
+            hat = SDL_JoystickGetHat(stick, 0);
+            if (hat & SDL_HAT_UP) pressed |= kUp;
+            if (hat & SDL_HAT_DOWN) pressed |= kDown;
+            if (hat & SDL_HAT_LEFT) pressed |= kLeft;
+            if (hat & SDL_HAT_RIGHT) pressed |= kRight;
+        }
     }
     rumble(port);
     static std::uint64_t last[2] = {~0ull, ~0ull};
@@ -714,9 +771,9 @@ void poll_port(int port) {
         std::string names;
         for (int i = 0; i < 16; ++i)
             if (pressed & (1u << i)) names += std::string(" ") + kNames[i];
-        std::fprintf(stderr, "[pad] frame %llu port %d buttons %04X%s, left stick %u %u, right stick %u %u, l2 %u r2 %u\n",
+        std::fprintf(stderr, "[pad] frame %llu port %d buttons %04X%s, left stick %u %u, right stick %u %u, l2 %u r2 %u, hat %u\n",
                      static_cast<unsigned long long>(ps2::frames_run()), port + 1, pressed, names.empty() ? " none" : names.c_str(), lx, ly, rx, ry,
-                     pressed & kL2 ? l2 : 0, pressed & kR2 ? r2 : 0);
+                     pressed & kL2 ? l2 : 0, pressed & kR2 ? r2 : 0, static_cast<unsigned>(hat));
     }
     ps2::set_pad_pressure(8, l2, port);
     ps2::set_pad_pressure(9, r2, port);
@@ -806,7 +863,7 @@ void poll() {
             ps2::flush_memory_card();  // right away: a save made a moment ago must not wait for the emulation to wind down
             ps2::halt("window closed");
         }
-        if (e.type == SDL_KEYDOWN && e.key.keysym.scancode == SDL_SCANCODE_F11 && !e.key.repeat) {
+        if (e.type == SDL_KEYDOWN && e.key.keysym.scancode == SDL_SCANCODE_F11 && !e.key.repeat && g_window) {
             const bool full = SDL_GetWindowFlags(g_window) & SDL_WINDOW_FULLSCREEN;
             SDL_SetWindowFullscreen(g_window, full ? 0 : SDL_WINDOW_FULLSCREEN_DESKTOP);
         }
@@ -855,7 +912,10 @@ void poll() {
         std::fprintf(stderr, "[hitch] reading the controllers and the notice took %.1f ms%s", ps2::hitch::ms_since(after_events), "\n");
 }
 
+std::atomic<double> g_shown_ms{0};  // PS2_PRESENT_LOG: time in show_pixels, added to the wait log's "showing the picture"
+
 void show_pixels(const std::uint32_t *rgba, std::uint32_t w, std::uint32_t h) {
+    const auto shown_from = std::chrono::steady_clock::now();
     if (w != g_tex_w || h != g_tex_h) {
         if (g_texture) SDL_DestroyTexture(g_texture);
         g_texture = SDL_CreateTexture(g_renderer, SDL_PIXELFORMAT_ABGR8888, SDL_TEXTUREACCESS_STREAMING, static_cast<int>(w), static_cast<int>(h));
@@ -867,6 +927,7 @@ void show_pixels(const std::uint32_t *rgba, std::uint32_t w, std::uint32_t h) {
     SDL_RenderClear(g_renderer);
     SDL_RenderCopy(g_renderer, g_texture, nullptr, nullptr);
     SDL_RenderPresent(g_renderer);
+    g_shown_ms.store(g_shown_ms.load() + std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - shown_from).count());
 }
 
 void present() {
@@ -886,6 +947,7 @@ void write_audio_dumps();
 void note_audio();
 
 void pace() {
+    ps2::part::Scope mark(ps2::part::kWaitSound);
     static bool stuck = false;  // the device took no sound for a second; the clock paces the game until it takes some again
     if (g_audio && !(stuck && g_pipe->full())) {
         // The audio device clock paces emulation: wait while more than ~80 ms of sound is waiting. The pipe times the game between
@@ -912,7 +974,9 @@ void pace() {
 }
 
 double process_cpu_seconds() {
-#ifdef _WIN32
+#if defined(__SWITCH__)
+    return 0.0;
+#elif defined(_WIN32)
     FILETIME created, exited, kernel, user;
     GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernel, &user);
     const auto ticks = [](const FILETIME &t) { return static_cast<double>((static_cast<std::uint64_t>(t.dwHighDateTime) << 32) | t.dwLowDateTime); };
@@ -925,7 +989,9 @@ double process_cpu_seconds() {
 }
 
 double resident_mb() {
-#ifdef _WIN32
+#if defined(__SWITCH__)
+    return 0.0;
+#elif defined(_WIN32)
     PROCESS_MEMORY_COUNTERS counters{};
     GetProcessMemoryInfo(GetCurrentProcess(), &counters, sizeof counters);
     return static_cast<double>(counters.WorkingSetSize) / (1024.0 * 1024.0);
@@ -972,19 +1038,30 @@ struct WaitLog {
     using Clock = std::chrono::steady_clock;
     bool on = std::getenv("PS2_PRESENT_LOG") != nullptr;
     Clock::time_point since = Clock::now();
-    double post = 0, sound = 0, seen_working = 0, seen_idle = 0;
+    double post = 0, sound = 0, seen_working = 0, seen_idle = 0, seen_shown = 0, seen_polled = 0;
     std::atomic<double> working{0}, idle{0};  // written by the window thread, read by the emulation thread
+    std::atomic<double> shown{0};             // of the rendering: handing the picture to SDL (texture upload and present)
+    std::atomic<double> polled{0};            // reading the window's events and the controllers (the loop's own overhead)
+    std::atomic<std::uint64_t> polls{0};
     std::uint32_t frames = 0;
+    std::uint64_t seen_polls = 0;
     static double ms(Clock::time_point from) { return std::chrono::duration<double, std::milli>(Clock::now() - from).count(); }
     void emulation_frame() {
+        shown.store(g_shown_ms.load());
         if (++frames < 60) return;
         const double seconds = std::chrono::duration<double>(Clock::now() - since).count();
-        std::fprintf(stderr, "[waits] %.1f frames/s; emulation thread per frame: waiting for the window thread %.2f ms, for the sound %.2f ms; window thread per second: rendering %.0f ms, no work %.0f ms\n",
-                     frames / seconds, post / frames, sound / frames, (working.load() - seen_working) / seconds, (idle.load() - seen_idle) / seconds);
+        std::fprintf(stderr,
+                     "[waits] %.1f frames/s; emulation thread per frame: waiting for the window thread %.2f ms, for the sound %.2f ms; window thread per "
+                     "second: rendering %.0f ms (showing the picture %.0f ms), polling %.0f ms in %.0f calls, no work %.0f ms\n",
+                     frames / seconds, post / frames, sound / frames, (working.load() - seen_working) / seconds, (shown.load() - seen_shown) / seconds,
+                     (polled.load() - seen_polled) / seconds, static_cast<double>(polls.load() - seen_polls) / seconds, (idle.load() - seen_idle) / seconds);
         since = Clock::now();
         post = sound = 0;
         seen_working = working.load();
         seen_idle = idle.load();
+        seen_shown = shown.load();
+        seen_polled = polled.load();
+        seen_polls = polls.load();
         frames = 0;
     }
 };
@@ -1214,7 +1291,7 @@ bool open_window(bool fullscreen) {
     g_beep_on = no_beep.empty() || no_beep == "0";
     g_pad_log = !pad_log.empty() && pad_log != "0";
     if (!script.empty()) SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
-    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_GAMECONTROLLER) != 0) {
+    if (SDL_Init((kSdlVideo ? SDL_INIT_VIDEO : 0u) | SDL_INIT_AUDIO | SDL_INIT_GAMECONTROLLER) != 0) {
         std::fprintf(stderr, "SDL: %s\n", SDL_GetError());
         return false;
     }
@@ -1235,10 +1312,13 @@ bool open_window(bool fullscreen) {
     }
     load_keys();
     const Uint32 flags = SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI | (fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0u);
-    g_window = SDL_CreateWindow("ps2-native-recomp", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, ps2::g_options.widescreen ? 1280 : 960, 720, flags);
-    if (!g_window) {
-        std::fprintf(stderr, "SDL: %s\n", SDL_GetError());
-        return false;
+    if (kSdlVideo) {
+        g_window = SDL_CreateWindow("ps2-native-recomp", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+                                    ps2::g_options.widescreen ? 1280 : 960, 720, flags);
+        if (!g_window) {
+            std::fprintf(stderr, "SDL: %s\n", SDL_GetError());
+            return false;
+        }
     }
     SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "linear");
     SDL_AudioSpec want{}, have{};
@@ -1389,6 +1469,7 @@ void watchdog() {
 #endif
 
 int run_window(const std::function<int()> &emulate) {
+    g_waits.on = std::getenv("PS2_PRESENT_LOG") != nullptr;  // again: on the Switch, launch.txt sets it after the program started
     ps2::init_graphics();
     g_gpu_present = attach_gpu();
     std::fprintf(stderr, "[window] %s\n", g_gpu_present ? "presenting through WebGPU" : "presenting through SDL");
@@ -1427,27 +1508,39 @@ int run_window(const std::function<int()> &emulate) {
     ps2::start_render_thread();
     if (!std::getenv("PS2_NO_VU_THREAD")) {
         ps2::start_vu_thread();
-        std::thread(ps2::run_vu_thread).detach();
+        HostThread(ps2::run_vu_thread).detach();
     }
 #ifdef __linux__
     if (!std::getenv("PS2_NO_WATCHDOG")) std::thread(watchdog).detach();
 #endif
     std::atomic<bool> done{false};
     int result = 0;
-    std::thread emulation([&] {
+    HostThread emulation([&] {
         result = emulate();
         done.store(true);
         ps2::wake_render_thread();
     });
     const std::function<void(const std::uint32_t *, std::uint32_t, std::uint32_t)> copy = show_pixels, none;
+    // Reading the window's events and the two controllers costs about 17 microseconds, and this loop runs several hundred times a second:
+    // it is woken for every few messages the emulation thread posts (16 000 wake-ups a second in a Tekken 4 fight). A key or a pad is
+    // fast enough at a millisecond, so poll() is called at most that often - it was 270 ms of every second otherwise, a quarter of the
+    // thread that is the frame rate's limit.
+    auto last_poll = WaitLog::Clock::now() - std::chrono::milliseconds(2);
     while (!done.load()) {
-        if (ps2::hitch::on()) {  // PS2_HITCH_LOG=<ms>: the window's own event handling
-            const auto p0 = WaitLog::Clock::now();
-            poll();
-            const double p_ms = WaitLog::ms(p0);
-            if (p_ms > ps2::hitch::threshold_ms() / 3) std::fprintf(stderr, "[hitch] window event polling took %.1f ms (around frame %llu)\n", p_ms, static_cast<unsigned long long>(ps2::frames_run()));
-        } else {
-            poll();
+        const auto p0 = WaitLog::Clock::now();
+        if (WaitLog::ms(last_poll) >= 1.0) {
+            last_poll = p0;
+            if (ps2::hitch::on()) {  // PS2_HITCH_LOG=<ms>: the window's own event handling
+                poll();
+                const double p_ms = WaitLog::ms(p0);
+                if (p_ms > ps2::hitch::threshold_ms() / 3) std::fprintf(stderr, "[hitch] window event polling took %.1f ms (around frame %llu)\n", p_ms, static_cast<unsigned long long>(ps2::frames_run()));
+            } else {
+                poll();
+            }
+            if (g_waits.on) {  // [waits]: how much of the window thread's second the loop's own overhead takes
+                g_waits.polled.store(g_waits.polled.load() + std::chrono::duration<double, std::milli>(WaitLog::Clock::now() - p0).count());
+                g_waits.polls.fetch_add(1, std::memory_order_relaxed);
+            }
         }
         window_stage("drawing the pictures of the emulation (render_pending)");
         if (!g_waits.on) {
@@ -1473,5 +1566,8 @@ int run_window(const std::function<int()> &emulate) {
     if (g_card.state.load() == 0) SDL_Quit();  // a key card still open is on a thread inside SDL: the program ends without taking SDL down under it
     if (ps2::g_options.on_exit) ps2::g_options.on_exit();  // the host's log copy hands over the last lines before the process ends
     std::fflush(nullptr);
+#ifdef __SWITCH__
+    switch_clock_restore();  // _Exit skips what exit() would run
+#endif
     std::_Exit(result);
 }

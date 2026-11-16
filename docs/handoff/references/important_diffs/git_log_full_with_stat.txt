@@ -1,0 +1,923 @@
+=== 8e693c9394b08912b30220ebc1f2450361c40fc5 xcrashdayx 2026-10-30 11:34:34 +0100
+Hardware path: PS2_HW_DECODE pre-decodes textures once per submit (off by default, untested)
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+
+ runtime/src/gs/gpu/gpu.cpp            |   90 +-
+ runtime/src/gs/gpu/hw.wgsl            |   10 +
+ runtime/src/gs/gpu/vk/spirv_table.cpp | 1841 +++++++++++++++++----------------
+ 3 files changed, 1024 insertions(+), 917 deletions(-)
+=== aaed0336d08e327c0b2109d7a89ab3280a73b76f xcrashdayx 2026-10-30 11:28:58 +0100
+Hardware path: FIX splits draw runs only when the blend uses it
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+
+ runtime/src/gs/gpu/gpu.cpp | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+=== a1c327df3ec17488b0d50af11a8241add092a699 xcrashdayx 2026-10-30 11:27:35 +0100
+Hardware path: merge render passes with only CLUT loads between them
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+
+ runtime/src/gs/gpu/gpu.cpp | 56 +++++++++++++++++++++++++++++++++++++++++++---
+ 1 file changed, 53 insertions(+), 3 deletions(-)
+=== 5307556c5f9f562f9fd0fcbb1f07780495b68968 xcrashdayx 2026-10-30 11:25:32 +0100
+PS2_PRESENT_LOG: how much of the window thread's time goes into showing the picture
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+
+ host/window.cpp | 14 +++++++++++---
+ 1 file changed, 11 insertions(+), 3 deletions(-)
+=== 569b216b841183bc74b523fcfe2a30497b853a85 xcrashdayx 2026-10-30 11:24:25 +0100
+docs: where Tekken 4's time goes on the Switch and what to try next
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+
+ docs/switch-performance-plan.md | 50 +++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 50 insertions(+)
+=== b6e27c393a2aeb891ebfa35eac365d102defa51b xcrashdayx 2026-10-30 11:23:53 +0100
+Switch: PS2_SWITCH_CORES picks the cores of the three threads, for trying placements
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+
+ runtime/src/system.cpp | 12 ++++++++++--
+ 1 file changed, 10 insertions(+), 2 deletions(-)
+=== 1103fd1c93ebc2f7c8331ecc7fda009ddbdde6d8 xcrashdayx 2026-10-30 11:23:02 +0100
+GPU renderer: uploads before CLUT loads when the order does not matter
+
+When no CLUT load of the queue reads memory a later upload writes, the
+uploads go first and the CLUT loads after, so each kind merges into as few
+dispatches as possible. PS2_PRE_REORDER=0 keeps the queue's order. Same
+pictures on both paths.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+
+ runtime/src/gs/gpu/gpu.cpp | 14 ++++++++++++++
+ 1 file changed, 14 insertions(+)
+=== bd001fd82a9b7f507696acdbb14939cb650088de xcrashdayx 2026-10-30 11:18:00 +0100
+Hardware path: no screen-tile binning on the processor
+
+flush_batch built the compute raster's per-tile lists (spans, tile counts,
+lists), planned texture decodes and snapshots for every batch even on the
+hardware path, which uses none of them. It now stores the shapes and
+setups and draws. Same pictures.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+
+ runtime/src/gs/gpu/gpu.cpp | 24 ++++++++++++++++++++++--
+ 1 file changed, 22 insertions(+), 2 deletions(-)
+=== 9475d4f7eded81fcbcfb281e8b909ddab4e69b41 xcrashdayx 2026-10-30 11:16:23 +0100
+Hardware path: draw with video memory bound read-only, without atomics
+
+The fragment shader's texel reads and the depth fill were atomic loads,
+which skip the GPU's first-level cache (NVK: strong loads). The render
+passes now bind video memory a second time as a plain read-only buffer
+(binding 5, own bind group layout). Same pictures; wgpu-native accepts it.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+
+ runtime/src/gs/gpu/gpu.cpp            |   40 +-
+ runtime/src/gs/gpu/hw.wgsl            |    8 +-
+ runtime/src/gs/gpu/vk/spirv_table.cpp | 1762 +++++++++++++++++----------------
+ 3 files changed, 926 insertions(+), 884 deletions(-)
+=== 28bab2c04184cd33e5534c2c804baeb638324d8b xcrashdayx 2026-10-30 11:13:24 +0100
+Hardware path: keep the images between batches
+
+The colour and depth images now keep the last batch's buffers: video
+memory gets what they drew only when something reads it (a texture they
+cover, a CLUT load, the display, a download, a copy) or they move to other
+buffers, and they reload only when video memory changed under them or a
+batch reaches outside what they hold. On the PC, Tekken 4's fills and
+write-backs drop from about 1400 to about 600 per second. Pictures match
+to within a few pixels on some frames (depth now stays a float between
+batches instead of rounding through video memory).
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+
+ runtime/src/gs/gpu/gpu.cpp | 126 ++++++++++++++++++++++++++++++++++++++++-----
+ 1 file changed, 114 insertions(+), 12 deletions(-)
+=== 8b45d6f779121aa4d48024a23dd8b5f8314eb702 xcrashdayx 2026-10-30 11:10:22 +0100
+Hardware path: the setup's texture fields travel with the vertices
+
+The fragment shader read about 20 words of the setup from the storage
+buffer for every pixel; the vertex shader now reads them once per vertex
+and hands them on as flat interpolants. Same pictures.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+
+ runtime/src/gs/gpu/hw.wgsl            |   39 +-
+ runtime/src/gs/gpu/vk/spirv_table.cpp | 1701 +++++++++++++++++----------------
+ 2 files changed, 938 insertions(+), 802 deletions(-)
+=== d9b9eef23d31212eea394d514781d4c36b0ed550 xcrashdayx 2026-10-30 11:06:09 +0100
+GPU renderer: CLUT loads look up the load that wrote each entry
+
+The parallel load_clut walked back over the earlier loads for every entry,
+which with hundreds of loads in one batch (a Tekken 4 fight) cost 18 ms
+per batch on the Switch. Loads write whole blocks of 16 entries, so the
+processor now works out which load last wrote each of a slot's 32 blocks
+and the shader reads it. Pixel-identical on both paths.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+
+ runtime/src/gs/gpu/gpu.cpp            |    22 +-
+ runtime/src/gs/gpu/gs.wgsl            |    17 +-
+ runtime/src/gs/gpu/vk/spirv_table.cpp | 19048 ++++++++++++++++----------------
+ 3 files changed, 9535 insertions(+), 9552 deletions(-)
+=== ce560bf0e11d7a53a70436aea2eb710b5cef6b7a xcrashdayx 2026-10-30 11:00:30 +0100
+GPU renderer: CLUT loads in parallel; no texture pre-decoding on the hardware path
+
+- load_clut works out every entry of every slot on its own (the latest load
+  up to it that writes the entry, else the slot before the batch), two
+  workgroups per load, instead of one workgroup doing the loads in turn
+  with barriers between (0.6 ms per batch on the Switch). Same results:
+  Tekken 4 pixel-identical on both paths.
+- The hardware path reads textures from video memory itself: the decode
+  passes, which only the compute raster uses, are left out (170 ms of GPU
+  time per second in a Switch fight).
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+
+ runtime/src/gs/gpu/gpu.cpp            |  5924 ++++-----
+ runtime/src/gs/gpu/gs.wgsl            |    86 +-
+ runtime/src/gs/gpu/vk/spirv_table.cpp | 20692 ++++++++++++++++----------------
+ 3 files changed, 13372 insertions(+), 13330 deletions(-)
+=== ece356f4275c07da6c18aa6920332ba684d51fe8 xcrashdayx 2026-10-30 10:53:19 +0100
+Switch: GPU memory reserve and NV transfer memory for NVK
+
+NVK allocates through nvmap outside the newlib heap and wants a larger
+transfer memory than libnx's default. __libnx_initheap now leaves 512 MB
+(128 MB in the album) unmapped for the GPU, and __nx_nv_transfermem_size
+is 16 MB, as NetherSX2's Switch port does.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+
+ host/main.cpp | 30 ++++++++++++++++++++++++++++++
+ 1 file changed, 30 insertions(+)
+=== 4d0bf6c28161eca241882aeaeaca383e977a4fe2 xcrashdayx 2026-10-30 10:51:38 +0100
+Vulkan layer: textures, render pipelines and render passes for the hardware path
+
+2D textures kept in the GENERAL layout (storage, sampled, colour and
+depth attachments), image views, texture bindings, render pipelines with
+dual-source blending and dynamic viewport, scissor and blend constants,
+and render passes through Vulkan 1.3 dynamic rendering. hw.wgsl joins the
+SPIR-V table (naga with dual_source_blending). On the PC the hardware path
+through this layer draws Tekken 4 pixel-identical to wgpu-native's.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+
+ CMakeLists.txt                        |   9 +-
+ runtime/src/gs/gpu/vk/spirv_table.cpp | 804 +++++++++++++++++++++++++++++++++-
+ runtime/src/gs/gpu/vk/wgpu_vk.cpp     | 474 +++++++++++++++++++-
+ scripts/wgsl_spirv.py                 |  56 ++-
+ 4 files changed, 1295 insertions(+), 48 deletions(-)
+=== 6210d1a7676467b9f19d57910c1a44ceae8749fa xcrashdayx 2026-10-30 10:46:45 +0100
+Hardware-rasterizer path for the GS renderer (PS2_GS_HW=1)
+
+A batch is drawn by the GPU's rasterizer into a colour and a depth image
+(2048 square), filled from video memory inside its box before and written
+back after, so video memory stays the truth for uploads, CLUTs, copies,
+the display and textures. hw.wgsl: vertices pulled from the shape records,
+textures read from video memory in the fragment shader (every format,
+CLUTs, bilinear, the wrap modes), the texture functions, fog, the alpha
+test, depth through the depth image, and the PS2 blend as fixed-function
+blending (the source-alpha factor as a dual-source output, FIX as the
+blend constant). gpu.cpp: render passes between the compute passes,
+pipelines cached by depth and blend mode.
+
+Tekken 4 through wgpu-native on the PC draws menus, story screens and
+fights; most frames match the compute renderer, fights differ in shading
+details (floor, effects). Lines, points and the destination alpha test
+are still missing; docs/switch-hw-renderer.md.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+
+ CMakeLists.txt             |   10 +-
+ runtime/src/gs/gpu/gpu.cpp | 5585 +++++++++++++++++++++++---------------------
+ runtime/src/gs/gpu/hw.wgsl |  579 +++++
+ 3 files changed, 3548 insertions(+), 2626 deletions(-)
+=== c191089d96186c7c7cfc3cd32d28dff8dcd96c43 xcrashdayx 2026-10-30 10:35:37 +0100
+docs: design of a hardware-rasterizer GS renderer for the Switch
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+
+ docs/switch-hw-renderer.md | 66 ++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 66 insertions(+)
+=== 8d15359ae2e874a7e8832aa746e1a10507d53af4 xcrashdayx 2026-10-30 10:27:54 +0100
+Switch: set the CPU, GPU and memory clocks from launch.txt
+
+PS2_CPU_MHZ, PS2_GPU_MHZ and PS2_MEM_MHZ (1785, 921.6 and 1600 by default,
+0 keeps the system's) through clkrst or pcv, the nearest rate the console
+offers, re-applied when the system resets it and restored when the game
+ends; sys-clk's or Horizon OC's profile wins unless PS2_CLOCK_FORCE=1. The
+same approach as OpenTrickyNX and flatout2-sw. switch_port.py writes the
+lines into launch.txt.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+
+ CMakeLists.txt         |   3 +
+ host/main.cpp          |   4 ++
+ host/switch_clock.cpp  | 159 +++++++++++++++++++++++++++++++++++++++++++++++++
+ host/switch_clock.hpp  |   8 +++
+ host/window.cpp        |   4 ++
+ scripts/switch_port.py |   2 +
+ 6 files changed, 180 insertions(+)
+=== 526bf3251cfdafd86d107888d8321c23e6b67f5e xcrashdayx 2026-10-30 10:20:57 +0100
+Vulkan renderer: clamp indices in the shader instead of robust buffer access
+
+NVK implements robust buffer access with a branch around every memory
+access (about 480 in the raster program on the Switch). naga now clamps
+every index itself (Restrict, which WebGPU allows), and robust buffer
+access is off unless PS2_VK_ROBUST=1. Tekken 4 stays pixel-identical to
+wgpu-native on PC.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+
+ runtime/src/gs/gpu/vk/spirv_table.cpp | 18048 +++++++++++++++++---------------
+ runtime/src/gs/gpu/vk/wgpu_vk.cpp     |     7 +-
+ scripts/wgsl_spirv.py                 |     5 +-
+ 3 files changed, 9554 insertions(+), 8506 deletions(-)
+=== 95decfe77b8e58ddf4a1c5a5c404dd7edf1f98f1 xcrashdayx 2026-10-30 10:09:32 +0100
+PS2_VK_STATS=1: the driver's statistics and machine code of every compute program
+
+Through VK_KHR_pipeline_executable_properties: registers, spills and the like
+in the log, the machine code in vk_<program>.txt. For the Switch, where
+Mesa's own NAK_DEBUG printing cannot be used.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+
+ runtime/src/gs/gpu/vk/wgpu_vk.cpp | 79 ++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 78 insertions(+), 1 deletion(-)
+=== 154996261425886a6297aa54a73c4b1acca04d55 xcrashdayx 2026-10-30 10:06:10 +0100
+Switch: stdout and descriptors 1 and 2 go to files too
+
+Mesa's shader compiler (NAK_DEBUG=print) writes to stdout directly and the
+program stopped when nothing was behind it. stdout now goes to
+ps2run.stdout.log, and descriptors 1 and 2 point at the two files.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+
+ host/main.cpp | 7 +++++++
+ 1 file changed, 7 insertions(+)
+=== 6dcfc5d1ce75d09e46cf004f3f51d179303626c4 xcrashdayx 2026-10-30 09:55:54 +0100
+PS2_PARTS: start the sampler on a thread with a stack of known size, say so in the log
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+
+ runtime/src/part.cpp | 70 +++++++++++++++++++++++++++++++++++++---------------
+ 1 file changed, 50 insertions(+), 20 deletions(-)
+=== 9709c6455d0cd66c2ed8258f09ef0f770bf3ae87 xcrashdayx 2026-10-30 01:31:13 +0100
+PS2_PARTS: where the emulation thread's time goes, without a profiler
+
+The emulation thread marks which part of the console it is in (events, IOP,
+hardware registers, VIF, GIF, DMA, IPU, idle, waiting for the window or the
+sound); with PS2_PARTS=1 a helper thread samples the mark and logs the shares
+every 2 seconds. For the Switch, where no sampling profiler runs. launch.txt
+NAME=value lines are now set before static initialisation, so switches read
+at start-up work there too.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+
+ CMakeLists.txt               |  1 +
+ host/main.cpp                | 24 ++++++++++++++++++++++++
+ host/window.cpp              |  2 ++
+ runtime/include/ps2/part.hpp | 40 ++++++++++++++++++++++++++++++++++++++++
+ runtime/src/dmac.cpp         |  2 ++
+ runtime/src/gs/gif.cpp       |  3 +++
+ runtime/src/gs/gs.cpp        |  2 ++
+ runtime/src/hw.cpp           |  2 ++
+ runtime/src/ipu/ipu.cpp      |  4 ++++
+ runtime/src/load_stats.hpp   |  5 ++++-
+ runtime/src/part.cpp         | 37 +++++++++++++++++++++++++++++++++++++
+ runtime/src/system.cpp       | 10 ++++++++--
+ runtime/src/vif.cpp          |  2 ++
+ 13 files changed, 131 insertions(+), 3 deletions(-)
+=== 518f6b6d6bb5db5ab7d7985721caae96db1134bc xcrashdayx 2026-10-30 01:22:02 +0100
+Vulkan renderer: GPU-only memory for GPU buffers, tile-size variants
+
+- Memory types are picked with the fewest properties beyond the ones
+  needed, so on the Switch (all memory device local) the GPU's own buffers
+  get a type the CPU does not see; the types are logged at start.
+- SPIR-V for TILE 4, 8 and 16 (PS2_TILE), with and without explicit fma.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+
+ runtime/src/gs/gpu/vk/spirv_table.cpp | 6464 ++++++++++++++++++++++++++++++++-
+ runtime/src/gs/gpu/vk/wgpu_vk.cpp     |   27 +-
+ scripts/wgsl_spirv.py                 |    4 +-
+ 3 files changed, 6360 insertions(+), 135 deletions(-)
+=== f42606b2a48e6c0ee54c8294b21050002ebc9ea3 xcrashdayx 2026-10-30 01:14:36 +0100
+Vulkan renderer: cap queued GPU work, GPU timing, settings in launch.txt
+
+- The CPU now waits once it is 8 submissions ahead of the GPU
+  (PS2_VK_IN_FLIGHT). On the Switch the backlog grew past 230 submissions,
+  the picture fell seconds behind and NVK reported the device lost.
+- PS2_VK_PROFILE=1 times every dispatch with timestamps and logs the GPU time
+  per program every 2 seconds; PS2_VK_ROBUST=0 turns robust buffer access off.
+- launch.txt lines of the form NAME=value set environment variables, so the
+  Switch build takes the same switches as the PC (PS2_PRESENT_LOG is read
+  again when the window starts for that reason).
+- The SPIR-V is now made with naga 29, the version wgpu-native 29 uses.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+
+ host/main.cpp                     |  15 ++++-
+ host/window.cpp                   |   1 +
+ runtime/src/gs/gpu/vk/wgpu_vk.cpp | 128 +++++++++++++++++++++++++++++++++++++-
+ 3 files changed, 142 insertions(+), 2 deletions(-)
+=== 25fb2ba92c9e6313d2284e493fa386aec42c5584 xcrashdayx 2026-10-30 01:01:15 +0100
+Vulkan renderer: share staging blocks between submissions
+
+Each submission took a whole 16 MiB staging block for its queue writes, so
+with several submissions in flight the blocks piled up until the Switch ran
+out of memory. Writes now go one after the other into the current block,
+which is reused once the GPU is past its last reader.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+
+ runtime/src/gs/gpu/vk/wgpu_vk.cpp | 19 +++++++++++++++----
+ 1 file changed, 15 insertions(+), 4 deletions(-)
+=== 584dd8e3fdabbebd2375025a70a80bb105e37727 xcrashdayx 2026-10-30 00:52:34 +0100
+Vulkan renderer for the Switch: the WebGPU renderer on Vulkan (NVK)
+
+The Switch build drew with the reference software rasterizer, which ran
+Tekken 4 at about 1 fps on hardware. The GPU renderer (gpu.cpp + gs.wgsl)
+now runs there too:
+
+- runtime/src/gs/gpu/vk/wgpu_vk.cpp implements the WebGPU C API calls gpu.cpp
+  makes (compute pipelines, buffers, queue writes, copies, maps, queue waits)
+  on Vulkan, keeping WebGPU's ordering rules (staged writes, a barrier after
+  every dispatch, zeroed buffers, timeline-semaphore maps, deferred frees).
+  gpu.cpp is unchanged; surfaces and timestamps are left out, so the picture
+  is read back and shown through SDL2.
+- gs.wgsl becomes SPIR-V with naga (scripts/wgsl_spirv.py writes
+  spirv_table.cpp; CMake stops when it is older than the shader).
+- CMake: PS2_VULKAN (on for the Switch) links NVK from NVK_SDK and swaps
+  SDL2's EGL/glapi for the SDK's, as OpenTrickyNX does; off-Switch it loads
+  the system's Vulkan for testing. Also links synchronization on Windows
+  without wgpu-native (WaitOnAddress).
+- switch_port.py builds with Vulkan by default (tools/nvk-sdk or --nvk-sdk,
+  --software for the old renderer).
+
+Checked on PC (RX 6800 XT): 42 frames of Tekken 4 from power-on through a
+fight are pixel-identical to wgpu-native.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+
+ .gitignore                                    |    1 +
+ CMakeLists.txt                                |   80 +-
+ README.md                                     |    9 +-
+ runtime/src/gs/gpu/vk/include/webgpu/webgpu.h | 6766 +++++++++++++++++++++++++
+ runtime/src/gs/gpu/vk/include/webgpu/wgpu.h   | 1551 ++++++
+ runtime/src/gs/gpu/vk/spirv.hpp               |   22 +
+ runtime/src/gs/gpu/vk/spirv_table.cpp         | 3117 ++++++++++++
+ runtime/src/gs/gpu/vk/wgpu_vk.cpp             | 1119 ++++
+ scripts/switch_port.py                        |   11 +
+ scripts/wgsl_spirv.py                         |  103 +
+ 10 files changed, 12777 insertions(+), 2 deletions(-)
+=== 601f70c34a502b3d7300823b45c8a477e516351f xcrashdayx 2026-10-29 23:44:16 +0100
+Switch port: fix thread stacks, cores, wake-ups, FMA, packaging and launch
+
+- Threads: libnx gives a thread 128 KiB of stack, far too little for the
+  translated code; the emulation and VU threads now get 16 MiB (host/thread.hpp).
+- Cores: Horizon keeps every thread on core 0; emulation, VU and window threads
+  now run on cores 1, 2 and 0 (thread_tune).
+- Queue hand-over: the Switch fell back to 1 ms sleeps; it now waits and wakes
+  with the kernel's address arbiter like the Linux futex path.
+- Floating point: -ffp-contract=off, so GCC does not fuse multiply-add on ARM
+  and change FPU/VU results.
+- Window loop: drop the extra appletMainLoop() check, which ate SDL's quit and
+  left the emulation thread unjoinable; SDL_QUIT already handles it.
+- Launch: the .nro reads launch.txt next to it (program, disc, memory card,
+  patches, widescreen), chdirs to its folder, logs to ps2run.log and shows an
+  on-screen error instead of exiting silently. The Tekken 4 hard-coded paths are gone.
+- switch_port.py: runs port.sh --native-only (exploring runs and VU1 programs,
+  which the Switch cannot compile at run time), then cross-compiles and
+  packages the boot program, disc image, launch.txt and memory card.
+- Switch_Build.cmd: no longer reruns the whole build with python after a failed
+  build, and passes extra options through.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+
+ CMakeLists.txt           |   6 +
+ README.md                |  34 ++--
+ Switch_Build.cmd         |  28 ++-
+ host/main.cpp            | 163 +++++++++--------
+ host/thread.hpp          |  63 +++++++
+ host/window.cpp          |  12 +-
+ runtime/src/gs/queue.cpp |  17 +-
+ runtime/src/system.cpp   |  12 ++
+ scripts/switch_port.py   | 443 +++++++++++++++++++++++++----------------------
+ 9 files changed, 461 insertions(+), 317 deletions(-)
+=== e1b87f6353d44d7dd633a78fb7e057c3f4d38edb xcrashdayx 2026-10-29 23:31:44 +0100
+Merge upstream exoteric33/ps2-native-recomp main (8 commits: Tekken 5 fix, waiting-loop skipping, more)
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+=== f89a7c66c08149e2db1d9c57d71acf8252c1a935 xcrashdayx 2026-10-29 23:05:20 +0100
+Implement Nintendo Switch (Switch 1) recompilation pipeline and runtime port
+
+
+ .gitignore                     |   1 +
+ CMakeLists.txt                 |  40 +++++--
+ README.md                      |  84 +++++++++++---
+ Switch_Build.cmd               |  42 +++++++
+ host/main.cpp                  | 113 ++++++++++++++++++-
+ host/window.cpp                |  20 +++-
+ runtime/include/ps2/vu_ops.hpp |  17 +++
+ runtime/src/ee_live.cpp        |   2 +-
+ runtime/src/live_build.cpp     |   2 +-
+ runtime/src/live_build.hpp     |   2 +-
+ runtime/src/vu_live.cpp        |   2 +-
+ scripts/switch_port.py         | 250 +++++++++++++++++++++++++++++++++++++++++
+ 12 files changed, 538 insertions(+), 37 deletions(-)
+=== 23f6332b7d3e46e4af08f0246948db6dca8688a6 exoteric33 2026-10-29 22:26:53 +0100
+Get Tekken 5 past its black screen, and bound the saved window images (for #6)
+
+Tekken 5 (US, European and Japanese discs) stopped right after start-up with a black screen. It now runs
+its loading mini-game; it still stops after that, waiting for its sound module (work goes on).
+- The ELF loader zeroes every segment before copying any file contents, so a large empty segment that
+  lies over the loader's own code no longer wipes it.
+- Code a game loads into memory its executable never mentions is translated while it runs.
+- IOP: sceSifGetNextRequest / sceSifExecRequest, and server threads that do not use sceSifRpcLoop are
+  woken; SearchModuleByName finds loaded modules; modload #30 is answered.
+- Live translation keeps at most 8 window images per address, 32 and 16 MiB per game, does not save an
+  image again when only data in it changed, and port.sh trims old overlays folders.
+
+
+ recomp/eerecomp_gen.cpp    |  50 +++++++++++-
+ recomp/eerecomp_gen.hpp    |   9 +++
+ runtime/src/ee_live.cpp    | 194 +++++++++++++++++++++++++++++++++++++++++----
+ runtime/src/iop/kernel.cpp |  11 ++-
+ runtime/src/iop/libs.cpp   |   3 +
+ runtime/src/iop/sif.cpp    | 137 ++++++++++++++++++++++++--------
+ runtime/src/system.cpp     |  24 ++++--
+ scripts/port.sh            |   2 +
+ scripts/windows.py         | 125 +++++++++++++++++++++++++++--
+ 9 files changed, 487 insertions(+), 68 deletions(-)
+=== 6ac084a43a5cc5b461db3a25d06a3a1552173450 exoteric 2026-10-29 22:00:20 +0100
+Update README.md
+
+ README.md | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+=== cd1ae28573c6c58b2fe274d3e2d31b81263650bd exoteric33 2026-10-29 21:54:29 +0100
+Give ln and Python a Windows path to a disc image whose name has brackets (for #17)
+
+Git's shell does not turn /d/... into D:/... for native programs when the
+argument holds [ ] ' * or ?, so "Urban Reign [NTSC].iso" reached BusyBox's
+ln and Python as /d/..., which neither can open. pwd -W gives the Windows
+path.
+
+
+ scripts/port.sh | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+=== 30d1d2d67361f8c0abcb0c43dd1871f8400d4b39 exoteric33 2026-10-29 21:21:00 +0100
+Skip waiting loops that provably do nothing, and name the processor in the log
+
+A game that waits for the next picture by reading INTC_STAT in a tight loop now has the clock moved forward by whole turns once the loop is a fixed point (same value, registers and cycles between three reads, no other hardware access); the result is the same cycle for cycle. In Robotech: Battlecry it halves the main thread's work per frame. PS2_NO_SPIN_SKIP=1 switches it off. The log gets a [cpu] line (processor, cores, RAM), so a report tells which machine it came from. --pal / --ntsc win over the rate stored in a state.
+
+
+ host/main.cpp          | 60 +++++++++++++++++++++++++++++++--
+ runtime/src/hw.cpp     | 91 +++++++++++++++++++++++++++++++++++++++++++++++++-
+ runtime/src/hw.hpp     |  7 ++++
+ runtime/src/kernel.cpp |  5 ++-
+ runtime/src/memory.cpp |  7 +++-
+ runtime/src/system.cpp |  6 ++++
+ scripts/speedcheck.py  | 42 ++++++++++++++++++++---
+ 7 files changed, 208 insertions(+), 10 deletions(-)
+=== 14283ccfa91156fe997612fdda0c2e3acd7b3597 exoteric33 2026-10-29 20:46:36 +0100
+README: credit the Vilgax Attacks report to Travani
+
+
+ README.md | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+=== a0979dcca05b238a0808edcb05184dc0985986d3 exoteric33 2026-10-29 20:43:17 +0100
+README: credit Ben 10: Alien Force to Travani
+
+
+ README.md | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+=== 3914353aae54544742e8eb77bdca6fd671fa6747 exoteric33 2026-10-29 20:36:55 +0100
+README: Ben 10: Alien Force - Vilgax Attacks stops at the memory card check
+
+
+ README.md | 6 ++++++
+ 1 file changed, 6 insertions(+)
+=== 3dc39c4c65d5fbab8bbb1e3e5fb47d15e8bea7be exoteric33 2026-10-29 20:16:56 +0100
+Start the vector thread's VIF1 from the loaded state, so a state saved without the vector thread plays on with it
+
+A run without the vector thread never fills the vector thread's own copy of VIF1, so a state it saved restarted VIF1 there with cycle, mask, base and offset at zero; the data landed in the wrong places and the vector program looped forever (seen in Robotech: Battlecry, at start and with F8).
+
+
+ runtime/src/vif.cpp | 6 ++++++
+ 1 file changed, 6 insertions(+)
+=== ba3d4712a9291abe1767c8aa0aa8dc4eeda1db71 exoteric33 2026-10-29 19:32:49 +0100
+Show the key card on a thread of its own on Linux
+
+On Linux the F1/H key card is a separate dialog that can open on another
+workspace. The window thread waited for it, so the whole game stood still
+until the dialog was closed (a 14 s freeze in a GTA III run). The game now
+runs on behind the card. Windows and macOS are unchanged.
+
+
+ host/window.cpp | 167 ++++++++++++++++++++++++++++++++++++++++++++++----------
+ 1 file changed, 137 insertions(+), 30 deletions(-)
+=== 77e39828e7b26a724aa61c54f3ccf3aeba6a32c8 exoteric33 2026-10-29 19:27:05 +0100
+README: say that not every game works on the first try, and ask for reports
+
+
+ README.md | 5 +++++
+ 1 file changed, 5 insertions(+)
+=== a2cabdafab4b352bb0b94f816693aa3a21bde85c exoteric33 2026-10-29 19:13:32 +0100
+README: Ben 10: Alien Force plays well, tested by InsomniacSpider-Man
+
+
+ README.md | 1 +
+ 1 file changed, 1 insertion(+)
+=== e7908f78f87d35449ab714a52f978d6c5ed9ad41 exoteric33 2026-10-29 18:26:51 +0100
+Add PS2_IOP_LOAD and PS2_TTY_FRAME to measure what the sound side costs per frame (for #7)
+
+PS2_IOP_LOAD=1 prints, every 100 frames, the real time per frame spent in the IOP, its interpreter and event jobs, the sound chip, the SIF pump and the disc. PS2_TTY_FRAME=1 puts the frame number in front of every line the IOP modules print. Both are off by default and cost nothing then.
+
+
+ runtime/src/disc.cpp       |  3 +++
+ runtime/src/iop/kernel.cpp |  9 ++++++++-
+ runtime/src/iop/libs.cpp   |  6 +++++-
+ runtime/src/iop/spu2.cpp   |  2 ++
+ runtime/src/load_stats.hpp | 32 ++++++++++++++++++++++++++++++++
+ runtime/src/system.cpp     | 26 ++++++++++++++++++++++++++
+ 6 files changed, 76 insertions(+), 2 deletions(-)
+=== 07d3056797a045c73c634afd8be20063e6ca5147 exoteric33 2026-10-29 17:50:53 +0100
+README: Armored Trooper VOTOMS plays well, tested by omegakatana92 (#5)
+
+
+ README.md | 1 +
+ 1 file changed, 1 insertion(+)
+=== 15a66b462fef55fc442a13e18dea278f9722cf7a exoteric33 2026-10-29 17:18:37 +0100
+README: Tekken 4 plays well, tested by DevCrashDay (#8)
+
+
+ README.md | 1 +
+ 1 file changed, 1 insertion(+)
+=== 04a9d02f4427bf23dc26091216e35abea0670b49 exoteric33 2026-10-29 16:23:06 +0100
+Fix the GTA III start-up hang and the crackle in its opening film
+
+The toSPR DMA channel now copies the chain tag into the scratchpad when tag
+transfer is on, as the console does; GTA III read its draw list 16 bytes off
+and wrote through garbage pointers. Stopping a sound DMA channel now drops the
+blocks still queued, so a music stream no longer plays one block behind.
+Also restores the executable bit of the scripts.
+
+
+ runtime/src/dmac.cpp     |  5 +++++
+ runtime/src/iop/hw.cpp   | 49 +++++++++++++++++++++++++++++++++++++++++++++++-
+ runtime/src/iop/iop.hpp  |  2 ++
+ runtime/src/iop/libs.cpp |  5 +++--
+ runtime/src/iop/sif.cpp  | 11 +++++++++--
+ runtime/src/iop/spu2.cpp | 27 ++++++++++++++++++++++++++
+ runtime/src/iop/spu2.hpp |  1 +
+ runtime/src/ipu/NOTICE   | 44 +++++++++++++++++++++----------------------
+ runtime/src/memory.cpp   | 25 ++++++++++++++++++++++++
+ scripts/build_web.sh     |  0
+ scripts/fetch_sdl2.sh    |  0
+ scripts/fetch_wgpu.sh    |  0
+ scripts/pnach.py         |  0
+ scripts/port.sh          |  0
+ scripts/serve.py         |  0
+ scripts/setup.sh         |  0
+ scripts/wavcheck.py      | 18 ++++++++++++++++++
+ 17 files changed, 160 insertions(+), 27 deletions(-)
+=== 722976514f224e9fb993aa6255bcd43eded5fc07 exoteric33 2026-10-29 14:19:01 +0100
+Answer the IOP's disc stream calls, set ECD at a film's end code, and keep the disc stream in save states
+
+Robotech: Battlecry streams its music from the disc through the IOP's stream calls, which failed, so the game stopped with a
+black screen; and its logo film player waits for the decoder's end flag after the film's end code, which was never set. Both
+are answered now, and the disc stream's position is kept in save states (version 6; versions 4 and 5 still load), so a state
+saved during a streamed film goes on. The game now plays from power-on through the memory card save into the first mission.
+
+God of War II's replays come out the same; Gran Turismo 4's opening film looks the same.
+
+Fixes #1.
+
+
+ runtime/src/iop/cdvd.cpp | 63 ++++++++++++++++++++++++++++++++++++++++++++++++
+ runtime/src/ipu/ipu.cpp  | 43 +++++++++++++++++++++++++++++++--
+ runtime/src/system.cpp   |  7 +++---
+ 3 files changed, 108 insertions(+), 5 deletions(-)
+=== c2a4ed0a9906a86c9519754c3ca2ba336ccaa9e7 exoteric33 2026-10-29 12:29:44 +0100
+Translate a code window quickly first, and again with the normal flags in the background
+
+When the game waits for a code window that was never translated, it is now compiled without optimisation, the biggest files
+first, which halves the wait; the same window is then built again with the normal flags while the game runs and switched in at
+a frame boundary. Replays come out the same, and once the better library is in, frames are as fast as before.
+PS2_EE_LIVE_QUICK=off gives the old behaviour.
+
+Gundam vs. Zeta Gundam, the stop at the start of a mission on a laptop: 2.3 to 2.5 s instead of 4.2 to 5.0 s.
+
+For #2.
+
+
+ recomp/eerecomp_gen.cpp         |   5 +
+ recomp/eerecomp_gen.hpp         |   1 +
+ runtime/include/ps2/ee_live.hpp |   6 ++
+ runtime/src/dispatch.cpp        |  46 ++++++---
+ runtime/src/ee_live.cpp         | 214 +++++++++++++++++++++++++++++++---------
+ runtime/src/live_build.cpp      |  11 ++-
+ runtime/src/live_build.hpp      |   3 +
+ 7 files changed, 228 insertions(+), 58 deletions(-)
+=== b726f6253f07388afcd7026be612018f616aa8dd exoteric33 2026-10-29 12:03:21 +0100
+Add an Update button to the app, and build the games again after it
+
+When a newer version is out, the welcome screen says so and offers Update: the app downloads this repo's newest ZIP from
+GitHub, checks it, swaps its code folders (games, saves, quick saves and build tools stay) and restarts. Then Build my games
+again rebuilds every game one after the other, so the fixes reach them; a game whose disc image is gone is skipped. Nothing is
+uploaded; offline, nothing shows. A folder that is a git clone is never offered an update.
+
+
+ app/app.ps1 | 639 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 619 insertions(+), 20 deletions(-)
+=== a67d5438d26bc574bf01727c13ac98e76bf7f451 exoteric33 2026-10-29 11:03:32 +0100
+Translate code windows in the background once their content settles
+
+A game that loads code into a window while it shows a loading screen no longer stops for its translation when that code is
+used soon after: the window is translated by a worker thread as soon as it stops changing, and the library is switched in at a
+frame boundary. A result is used only if the window still holds exactly the translated bytes, and replays come out the same
+with and without it. PS2_EE_LIVE_BG=0 turns it off.
+
+Gundam vs. Zeta Gundam, from the pilot name screen to the mission start with an empty cache: 8 stops (14.3 s) instead of 10
+(20.9 s). The mission window itself is streamed in right before it is called, so its first translation still stops the game.
+
+For #2.
+
+
+ recomp/eerecomp_gen.cpp         |   6 +
+ runtime/include/ps2/ee_live.hpp |  16 ++
+ runtime/src/dispatch.cpp        |   8 +
+ runtime/src/ee_live.cpp         | 588 ++++++++++++++++++++++++++++++++++------
+ runtime/src/live_build.cpp      |  24 +-
+ runtime/src/live_build.hpp      |   4 +
+ runtime/src/system.cpp          |   2 +
+ 7 files changed, 559 insertions(+), 89 deletions(-)
+=== f374774f8c399b9dcc7de2aebe91a5cfa5d8a20a exoteric33 2026-10-29 09:59:27 +0100
+README: God Hand plays as far as the casino hub; mark the testers from Reddit
+
+
+ README.md | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+=== a820f9bb9f26b5bf081a135cffa22dbce0ff7e4c exoteric33 2026-10-29 09:49:29 +0100
+Draw menus with many small letters in one batch, and shorten the pauses of live translation
+
+Gundam vs. Zeta Gundam keeps its font in the spare top byte of its 24-bit screen buffer. Drawing never changes that byte, but
+the drawing code thought it did and split every menu frame into thousands of batches: the menus ran at 12-17 fps on a laptop,
+58-60 fps now, with the same pictures.
+
+Code that the first build never saw is translated while the game runs, and the game waits meanwhile. A code window is now
+translated as a whole the first time it is needed, and a later miss translates only the missing function: on the way from the
+menu into a mission, 10 pauses (22 s) instead of 26 (69 s), and none on later starts. The first pause at the start of a mission
+is still several seconds.
+
+For #2.
+
+
+ recomp/analysis.cpp        | 31 +++++++++++++++++++++++++------
+ recomp/analysis.hpp        | 12 +++++++++++-
+ recomp/eerecomp_gen.cpp    | 12 ++++++++++--
+ recomp/eerecomp_gen.hpp    |  1 +
+ runtime/src/ee_live.cpp    | 25 +++++++++++++++++++------
+ runtime/src/gs/gpu/gpu.cpp |  5 ++++-
+ 6 files changed, 70 insertions(+), 16 deletions(-)
+=== 475b367641a7a99b4b570975ae804e7fa685cad5 exoteric33 2026-10-29 08:52:16 +0100
+README: The King of Fighters XI works, tested by TsimpleD
+
+
+ README.md | 1 +
+ 1 file changed, 1 insertion(+)
+=== 8199f94c564ea63016ba47f60f24156f67289232 exoteric 2026-10-29 08:17:20 +0100
+Update README.md
+
+ README.md | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+=== 8eb2eef249e324c51533ef74d9156714adffca11 exoteric33 2026-10-29 08:14:35 +0100
+README: one game table with a Tested by column
+
+
+ README.md | 19 +++++++------------
+ 1 file changed, 7 insertions(+), 12 deletions(-)
+=== 994d492deeea67ae6f696fafd0601ba7fa09f614 exoteric33 2026-10-29 08:13:13 +0100
+README: the games play well but are not played through yet
+
+
+ README.md | 12 ++++++------
+ 1 file changed, 6 insertions(+), 6 deletions(-)
+=== d8b430110d2f97fafd09ef38894963342dca1435 exoteric33 2026-10-29 08:12:35 +0100
+README: Macross plays well, tested by omegakatana92
+
+
+ README.md | 6 ++++++
+ 1 file changed, 6 insertions(+)
+=== 0a6dd7c84ed49d8a5688494bf41b3376a0d07d57 exoteric33 2026-10-29 07:57:18 +0100
+README: no known bugs
+
+
+ README.md | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+=== 58d0f30ad48e5b95e4b593647773b04da618bc8d exoteric33 2026-10-29 07:50:06 +0100
+Name the game window and the web page ps2-native-recomp
+
+
+ CMakeLists.txt  | 2 +-
+ host/window.cpp | 6 +++---
+ web/shell.html  | 2 +-
+ 3 files changed, 5 insertions(+), 5 deletions(-)
+=== 1b1adc398afc52b4a313ad3c1f21594895be7d4c exoteric 2026-10-28 21:16:54 +0100
+Update README.md
+
+ README.md | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+=== 0660c5ea6e2c78449601f88f96649d2eff625e7e exoteric33 2026-10-28 21:10:04 +0100
+Import ps2-native-recomp
+
+A static recompiler and runtime that turn a PS2 disc image into a native PC program. Based on ps2-web-recomp by
+Samir Nuri (https://github.com/snuri00/ps2-web-recomp, MIT).
+
+
+ .github/ISSUE_TEMPLATE/playtest.yml   |   73 +
+ .gitignore                            |   68 +
+ CMakeLists.txt                        |  203 +++
+ LICENSE                               |   22 +
+ README.md                             |  121 ++
+ Start.cmd                             |   10 +
+ app/app.ps1                           | 2048 ++++++++++++++++++++++++++
+ app/get-python.ps1                    |   30 +
+ app/ui.cs                             |  450 ++++++
+ cmake/embed.cmake                     |    2 +
+ host/keymap.cpp                       |  364 +++++
+ host/keymap.hpp                       |   59 +
+ host/main.cpp                         |  645 ++++++++
+ host/pad_test.cpp                     |  320 ++++
+ host/profile.cpp                      |  107 ++
+ host/profile.hpp                      |    6 +
+ host/profile_win.cpp                  |  239 +++
+ host/stretch.cpp                      |  393 +++++
+ host/stretch.hpp                      |  164 +++
+ host/web.cpp                          |  494 +++++++
+ host/window.cpp                       | 1370 +++++++++++++++++
+ host/window.hpp                       |    9 +
+ recomp/analysis.cpp                   |  266 ++++
+ recomp/analysis.hpp                   |   28 +
+ recomp/codegen.cpp                    | 1046 +++++++++++++
+ recomp/codegen.hpp                    |   55 +
+ recomp/eerecomp_gen.cpp               |  201 +++
+ recomp/eerecomp_gen.hpp               |   95 ++
+ recomp/elf.cpp                        |  105 ++
+ recomp/elf.hpp                        |   40 +
+ recomp/main.cpp                       |  292 ++++
+ recomp/r5900.cpp                      |  254 ++++
+ recomp/r5900.hpp                      |   86 ++
+ recomp/snr2.cpp                       |  141 ++
+ recomp/snr2.hpp                       |   42 +
+ recomp/vujit_dump.cpp                 |   32 +
+ recomp/vurecomp.cpp                   |   54 +
+ recomp/vurecomp_gen.cpp               |  764 ++++++++++
+ recomp/vurecomp_gen.hpp               |   42 +
+ recomp/xff2.hpp                       |  221 +++
+ runtime/include/ps2/cpu.hpp           |   79 +
+ runtime/include/ps2/disc.hpp          |   32 +
+ runtime/include/ps2/ee_live.hpp       |   28 +
+ runtime/include/ps2/ee_live_abi.hpp   |   85 ++
+ runtime/include/ps2/fpu.hpp           |  328 +++++
+ runtime/include/ps2/generated.hpp     |   93 ++
+ runtime/include/ps2/hitch.hpp         |   66 +
+ runtime/include/ps2/memory.hpp        |  176 +++
+ runtime/include/ps2/mmi.hpp           |  359 +++++
+ runtime/include/ps2/os.hpp            |   55 +
+ runtime/include/ps2/state.hpp         |  178 +++
+ runtime/include/ps2/state_request.hpp |   10 +
+ runtime/include/ps2/system.hpp        |  202 +++
+ runtime/include/ps2/video.hpp         |   11 +
+ runtime/include/ps2/vu.hpp            |  203 +++
+ runtime/include/ps2/vu_live.hpp       |   41 +
+ runtime/include/ps2/vu_ops.hpp        |  949 ++++++++++++
+ runtime/src/cop.cpp                   |  153 ++
+ runtime/src/disc.cpp                  |  187 +++
+ runtime/src/dispatch.cpp              |  240 +++
+ runtime/src/dmac.cpp                  |  536 +++++++
+ runtime/src/dmac.hpp                  |   23 +
+ runtime/src/ee_live.cpp               |  386 +++++
+ runtime/src/gs/gif.cpp                |  335 +++++
+ runtime/src/gs/gif.hpp                |   29 +
+ runtime/src/gs/gpu/blit.wgsl          |  197 +++
+ runtime/src/gs/gpu/gpu.cpp            | 2620 +++++++++++++++++++++++++++++++++
+ runtime/src/gs/gpu/gpu.hpp            |   50 +
+ runtime/src/gs/gpu/gs.wgsl            | 1183 +++++++++++++++
+ runtime/src/gs/gs.cpp                 | 1447 ++++++++++++++++++
+ runtime/src/gs/gs.hpp                 |   95 ++
+ runtime/src/gs/queue.cpp              |  245 +++
+ runtime/src/gs/queue.hpp              |   51 +
+ runtime/src/gs/raster.cpp             |  502 +++++++
+ runtime/src/gs/raster.hpp             |   17 +
+ runtime/src/hw.cpp                    |  313 ++++
+ runtime/src/hw.hpp                    |   64 +
+ runtime/src/iop/cdvd.cpp              |  188 +++
+ runtime/src/iop/cdvdfsv.cpp           |  180 +++
+ runtime/src/iop/cpu.cpp               |  210 +++
+ runtime/src/iop/hw.cpp                |  289 ++++
+ runtime/src/iop/hw.hpp                |   25 +
+ runtime/src/iop/io.cpp                |  188 +++
+ runtime/src/iop/io.hpp                |   22 +
+ runtime/src/iop/iop.hpp               |   78 +
+ runtime/src/iop/kernel.cpp            |  830 +++++++++++
+ runtime/src/iop/kernel.hpp            |  128 ++
+ runtime/src/iop/libs.cpp              | 1296 ++++++++++++++++
+ runtime/src/iop/sif.cpp               |  925 ++++++++++++
+ runtime/src/iop/sif.hpp               |   28 +
+ runtime/src/iop/sio2.cpp              |  627 ++++++++
+ runtime/src/iop/sio2.hpp              |   27 +
+ runtime/src/iop/spu2.cpp              |  814 ++++++++++
+ runtime/src/iop/spu2.hpp              |   23 +
+ runtime/src/ipu/NOTICE                |   26 +
+ runtime/src/ipu/ipu.cpp               |  729 +++++++++
+ runtime/src/ipu/ipu.hpp               |   21 +
+ runtime/src/ipu/tables.hpp            |  145 ++
+ runtime/src/kernel.cpp                |  951 ++++++++++++
+ runtime/src/kernel.hpp                |   30 +
+ runtime/src/live_build.cpp            |  503 +++++++
+ runtime/src/live_build.hpp            |   98 ++
+ runtime/src/memory.cpp                |  188 +++
+ runtime/src/quick_keys.inc            | 1114 ++++++++++++++
+ runtime/src/system.cpp                |  950 ++++++++++++
+ runtime/src/vif.cpp                   |  454 ++++++
+ runtime/src/vif.hpp                   |   23 +
+ runtime/src/vu_jit.cpp                | 2091 ++++++++++++++++++++++++++
+ runtime/src/vu_jit.hpp                |   20 +
+ runtime/src/vu_jit_web.cpp            |  109 ++
+ runtime/src/vu_jit_web.hpp            |   17 +
+ runtime/src/vu_live.cpp               |  355 +++++
+ runtime/src/vu_micro.cpp              | 1208 +++++++++++++++
+ runtime/src/vu_micro.hpp              |   23 +
+ scripts/autotests.py                  |  424 ++++++
+ scripts/bootstrap.ps1                 |   72 +
+ scripts/build_web.sh                  |   35 +
+ scripts/cxx.sh                        |   95 ++
+ scripts/disc.py                       |  162 ++
+ scripts/fetch_dxc.sh                  |   28 +
+ scripts/fetch_sdl2.sh                 |   13 +
+ scripts/fetch_wgpu.sh                 |   15 +
+ scripts/gow2_health.py                |   32 +
+ scripts/gpu_profile.py                |   41 +
+ scripts/gt4_core.py                   |   83 ++
+ scripts/hitches.py                    |  206 +++
+ scripts/mcformat.py                   |  505 +++++++
+ scripts/mkiso.py                      |   89 ++
+ scripts/pack_compiler.ps1             |  146 ++
+ scripts/play.py                       |  194 +++
+ scripts/pnach.py                      |  697 +++++++++
+ scripts/port.sh                       |  233 +++
+ scripts/portable.ps1                  |  360 +++++
+ scripts/ps2tools.py                   |  228 +++
+ scripts/replay.py                     |  222 +++
+ scripts/report.py                     | 1036 +++++++++++++
+ scripts/runtime.sh                    |   61 +
+ scripts/serve.py                      |  200 +++
+ scripts/setup.sh                      |   49 +
+ scripts/soundcheck.py                 |   77 +
+ scripts/speedcheck.py                 |  879 +++++++++++
+ scripts/test_memcard.py               |  419 ++++++
+ scripts/test_vu_codegen.py            |  708 +++++++++
+ scripts/wavcheck.py                   |  303 ++++
+ scripts/webspeed.mjs                  |  243 +++
+ scripts/windows.py                    |  100 ++
+ tests/analysis_tailcall.py            |   41 +
+ tests/codegen_fallthrough.py          |   37 +
+ tests/elf_bss.py                      |   30 +
+ tests/fpu_half_damage.py              |   77 +
+ tests/stretch_test.cpp                |  593 ++++++++
+ web/shell.html                        | 1171 +++++++++++++++
+ 152 files changed, 47366 insertions(+)

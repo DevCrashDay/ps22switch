@@ -8,6 +8,18 @@
 #ifndef __EMSCRIPTEN__
 #include <webgpu/wgpu.h>
 #endif
+#ifdef PS2_VULKAN
+// This shim's own call, not WebGPU: the area the next render pass draws in, so the driver loads and stores only those tiles of the
+// hardware path's 2048x2048 images (defined in vk/wgpu_vk.cpp). wgpu-native, used on the PC for comparison, has no such call and does
+// not need one: there the images are the size of what is drawn.
+extern "C" void wgpuRenderPassSetAreaHint(std::uint32_t x, std::uint32_t y, std::uint32_t width, std::uint32_t height);
+#endif
+#if defined(__SWITCH__) && defined(PS2_VULKAN)
+// This shim's own call (vk/wgpu_vk.cpp): a surface on the display itself, for presenting with Vulkan instead of through SDL.
+extern "C" WGPUSurface wgpuCreateViSurface(WGPUInstance instance, void *window);
+// Whether presenting can work at all: a surface whose swap chain could not be made would leave the screen black.
+extern "C" bool wgpuSurfaceHasSwapchain(WGPUSurface surface);
+#endif
 
 #include <algorithm>
 #include <array>
@@ -25,12 +37,17 @@
 
 extern const char kGsShader[];
 extern const char kBlitShader[];
+extern const char kHwShader[];
 
 namespace ps2::gs {
 void swizzle_tables(std::vector<std::uint32_t> &out);
 }
 
 namespace ps2::gs::gpu {
+
+bool hw_init();
+WGPURenderPipeline hw_pipeline(std::uint32_t key);
+WGPURenderPipeline hw_render_pipeline(const char *vs, const char *fs, bool write_color, bool depth_write, WGPUCompareFunction compare, const WGPUBlendState *blend);
 
 namespace {
 
@@ -65,6 +82,7 @@ std::uint32_t g_scale = 1, g_copy_words = 1u << 20, g_field_words = 1u << 19;
 std::uint32_t field_base(std::uint32_t field) { return g_copy_words + (field & 1u) * g_field_words; }
 
 bool g_timestamps = false;
+bool g_dual_source = false;  // dual-source blending: the hardware path's blend factor comes as a second fragment output
 WGPUQuerySet g_queries = nullptr;
 WGPUBuffer g_query_resolve = nullptr, g_query_read = nullptr;
 bool g_query_pending = false, g_query_ready = false;
@@ -85,7 +103,49 @@ struct Command {
     Pipeline pipeline;
     std::uint32_t x, y;
     std::uint32_t param;
+    std::uint32_t hw = 0;  // the hardware path (g_hw): 1 fill the colour image, 2 write it back, 3 a render pass (param: g_hw_passes index)
 };
+
+// PS2_GS_HW=1: the hardware-rasterizer path (hw.wgsl, docs/switch-hw-renderer.md). A batch is drawn by the GPU's rasterizer into a
+// colour and a depth image of kHwSize pixels square, filled from video memory before it and written back after it, in its box.
+bool g_hw = false;
+constexpr std::uint32_t kHwSize = 2048;
+WGPUTexture g_hw_color = nullptr, g_hw_depth = nullptr;
+WGPUTextureView g_hw_color_view = nullptr, g_hw_depth_view = nullptr;
+WGPUBindGroupLayout g_hw_layout0 = nullptr, g_hw_layout1 = nullptr, g_hw_layout2 = nullptr, g_hw_layout_none = nullptr, g_hw_layout_draw = nullptr;
+WGPUBindGroup g_hw_group0 = nullptr, g_hw_group1 = nullptr, g_hw_group2 = nullptr, g_hw_group_none = nullptr;
+WGPUBindGroup g_hw_group_draw = nullptr;  // the render passes' buffers: video memory read-only (binding 5) instead of binding 0
+WGPUPipelineLayout g_hw_load_layout = nullptr, g_hw_back_layout = nullptr, g_hw_render_layout = nullptr;
+WGPUComputePipeline g_hw_load = nullptr, g_hw_back = nullptr, g_hw_back_depth = nullptr;
+WGPURenderPipeline g_hw_load_depth = nullptr;
+// draw pipelines by key: depth mode (bits 0-3: 0 no test, 1 + ZTST, + 4 when depth is written) and blend (bits 4-12: 0 off, 1 + ALPHA's
+// A, B, C, D)
+std::unordered_map<std::uint32_t, WGPURenderPipeline> g_hw_draw;
+WGPUShaderModule g_hw_module = nullptr;
+struct HwRun {
+    std::uint32_t key, fix, first, count;
+    std::uint32_t draw_param;  // the batch's shapes and setups
+    int x0, y0, x1, y1;        // the batch's box: the scissor of its shapes
+};
+struct HwPass {
+    std::uint32_t load_param, draw_param;
+    bool load_depth;
+    int x0, y0, x1, y1;      // the batch's box: the scissor of its shapes
+    int lx0, ly0, lx1, ly1;  // the box the depth image is loaded in
+    std::vector<HwRun> runs;
+};
+std::vector<HwPass> g_hw_passes;
+
+// What the images hold: the frame and depth buffer of the last batch, valid in the box loaded from video memory or drawn since (R),
+// and drawn but not written back yet in D. Video memory is brought up to date only when something reads it (a texture the image covers,
+// a CLUT load, the display, a download, a copy) or the image moves to other buffers; it is reloaded only when video memory changed
+// under it. Consecutive batches on the same buffers then cost no copies at all.
+struct HwImages {
+    bool valid = false, dirty = false, zdirty = false;
+    std::uint32_t fbp = 0, fbw = 0, fpsm = 0, zbp = 0, zpsm = 0, fbmsk = 0;
+    int rx0 = 0, ry0 = 0, rx1 = -1, ry1 = -1;  // valid
+    int dx0 = 0, dy0 = 0, dx1 = -1, dy1 = -1;  // drawn, not written back
+} g_hw_images;
 
 struct CommandInfo {
     std::size_t index;
@@ -502,7 +562,7 @@ std::vector<Decode> g_decodes;
 void plan_decodes(std::uint32_t prims) {
     Batch &b = g_batch;
     g_decodes.clear();
-    if (!g_decode || prims <= kDecodePrims) return;
+    if (!g_decode || g_hw || prims <= kDecodePrims) return;  // the hardware path reads textures from video memory itself
     const std::uint32_t setups = static_cast<std::uint32_t>(b.setups.size() / kSetupWords);
     static const int kKey[] = {12, 13, 14, 15, 16, 17, 20, 22};
     for (std::uint32_t i = 0; i < setups; ++i) {
@@ -530,6 +590,70 @@ void plan_decodes(std::uint32_t prims) {
         w[24] = g_decoded_used;
         g_decodes.push_back({i, g_decoded_used, words});
         g_decoded_used += words;
+    }
+}
+
+// PS2_HW_DECODE=1: the hardware path decodes a batch's textures once into g_decoded (texels as colours, CLUT applied) and the fragment
+// shader reads them there with one load instead of a swizzle table load, a video memory load and a CLUT load per texel. A decoded
+// texture is kept for the later batches of the submit until video memory under it is written (an upload, a write-back of the images,
+// anything behind flush_all). Only textures the batch covers with at least half as many pixels as they have texels are decoded the first
+// time, so a big texture drawn small is still read in place.
+struct HwDecoded {
+    std::uint32_t key[10];
+    Range range;
+    std::uint32_t offset;
+};
+std::vector<HwDecoded> g_hw_decoded;
+bool g_hw_decode = false;
+
+void hw_forget(const Range &r) {
+    if (g_hw_decoded.empty()) return;
+    std::erase_if(g_hw_decoded, [&](const HwDecoded &d) { return d.range.overlaps(r.lo, r.hi); });
+}
+
+// After the batch's textures are in video memory: decide, write the offsets into the setups in the arena and dispatch the decodes.
+void hw_plan_decodes(const Batch &b, std::uint32_t setup_offset, std::uint32_t prims) {
+    if (!g_hw_decode) return;
+    const std::uint32_t setups = static_cast<std::uint32_t>(b.setups.size() / kSetupWords);
+    static std::vector<std::uint64_t> covered;
+    covered.assign(setups, 0);
+    for (std::uint32_t i = 0; i < prims; ++i) {
+        const std::uint32_t setup = b.prims[static_cast<std::size_t>(i) * kPrimWords];
+        const std::uint32_t lo = b.boxes[i * 2], hi = b.boxes[i * 2 + 1];
+        const std::int64_t w = static_cast<std::int64_t>(hi & 0xFFFFu) - static_cast<std::int64_t>(lo & 0xFFFFu) + 1, h = static_cast<std::int64_t>(hi >> 16) - static_cast<std::int64_t>(lo >> 16) + 1;
+        if (setup < setups && w > 0 && h > 0) covered[setup] += static_cast<std::uint64_t>(w * h);
+    }
+    static const int kKey[] = {12, 13, 14, 15, 16, 17, 18, 19, 20, 22};
+    for (std::uint32_t i = 0; i < setups; ++i) {
+        const std::uint32_t *w = b.setups.data() + static_cast<std::size_t>(i) * kSetupWords;
+        if (!(w[0] & 2u) || !covered[i]) continue;
+        std::uint32_t key[10];
+        for (int k = 0; k < 10; ++k) key[k] = w[kKey[k]];
+        key[9] ^= (w[0] & 32768u) << 16;  // AEM
+        std::uint32_t offset = ~0u;
+        for (const HwDecoded &d : g_hw_decoded)
+            if (std::equal(std::begin(key), std::end(key), d.key)) {
+                offset = d.offset;
+                break;
+            }
+        if (offset == ~0u) {
+            const std::uint32_t tw = w[15] & 0xFFu, th = w[15] >> 8;
+            if (tw > 10 || th > 10) continue;
+            const std::uint32_t mu = (w[7] >> 24) & 3u, mv = (w[7] >> 26) & 3u;
+            const auto inside = [](std::uint32_t mode, std::uint32_t region, std::uint32_t size) { return mode < 2 || ((region & 0x3FFu) < (1u << size) && (region >> 16) < (1u << size)); };
+            if (!inside(mu, w[18], tw) || !inside(mv, w[19], th)) continue;
+            const std::uint32_t words = 1u << (tw + th);
+            if (words > covered[i] * 2 || g_decoded_used + words > kDecodedWords) continue;
+            offset = g_decoded_used;
+            g_decoded_used += words;
+            HwDecoded d;
+            std::copy(std::begin(key), std::end(key), d.key);
+            d.range = region(w[12], w[13], w[14], 0, 0, (1 << tw) - 1, (1 << th) - 1);
+            d.offset = offset;
+            g_hw_decoded.push_back(d);
+            dispatch_linear(kDecode, words, push_params({setup_offset + i * kSetupWords, offset, words}));
+        }
+        g_arena.data()[setup_offset + i * kSetupWords + 24] = offset;
     }
 }
 
@@ -600,6 +724,136 @@ void note_raster(std::uint32_t prims, std::uint32_t tiles, std::uint32_t entries
     g_command_info.push_back({g_commands.size(), {prims, tiles, entries, snapshot, b.prims[1], first[3] | (first[14] << 8) | (first[6] << 16), first[0], textured}});
 }
 
+Range hw_drawn_range() {
+    const HwImages &h = g_hw_images;
+    Range r = region(h.fbp, h.fbw, h.fpsm, h.dx0, h.dy0, h.dx1, h.dy1);
+    if (h.zdirty) {
+        const Range z = region(h.zbp, h.fbw, h.zpsm, h.dx0, h.dy0, h.dx1, h.dy1);
+        r.add(z.lo, z.hi);
+    }
+    return r;
+}
+
+Range hw_valid_range() {
+    const HwImages &h = g_hw_images;
+    Range r = region(h.fbp, h.fbw, h.fpsm, h.rx0, h.ry0, h.rx1, h.ry1);
+    const Range z = region(h.zbp, h.fbw, h.zpsm, h.rx0, h.ry0, h.rx1, h.ry1);
+    r.add(z.lo, z.hi);
+    return r;
+}
+
+// Video memory takes what was drawn into the images and not written back yet
+void hw_write_back() {
+    HwImages &h = g_hw_images;
+    if (!g_hw || !h.valid || (!h.dirty && !h.zdirty)) return;
+    hw_forget(hw_drawn_range());
+    // Two programs: the colour one (which reads the colour image as a texture) and, when the depth buffer changed too, the one that
+    // reads the depth image - that read is not expressible in GLSL, so the deko3d build has no module for it and skips it.
+    const std::uint32_t box[2] = {static_cast<std::uint32_t>(h.dx0) | (static_cast<std::uint32_t>(h.dy0) << 16),
+                                  static_cast<std::uint32_t>(h.dx1) | (static_cast<std::uint32_t>(h.dy1) << 16)};
+    const std::uint32_t across = static_cast<std::uint32_t>(h.dx1 - h.dx0 + 8) / 8, down = static_cast<std::uint32_t>(h.dy1 - h.dy0 + 8) / 8;
+    const std::uint32_t param = push_params({h.fbp, h.fbw, h.fpsm, h.zbp, h.zpsm, box[0], box[1], z_max(h.zpsm), h.fbmsk, 0u});
+    Command back{kRaster, across, down, param};
+    back.hw = 2;
+    g_commands.push_back(back);
+    if (h.zdirty) {
+        const std::uint32_t depth_param = push_params({h.fbp, h.fbw, h.fpsm, h.zbp, h.zpsm, box[0], box[1], z_max(h.zpsm), h.fbmsk, 1u});
+        Command depth_back{kRaster, across, down, depth_param};
+        depth_back.hw = 4;  // the depth writeback's own program
+        g_commands.push_back(depth_back);
+    }
+    h.dirty = h.zdirty = false;
+    h.dx0 = h.dy0 = 0;
+    h.dx1 = h.dy1 = -1;
+}
+
+// Something is about to read (and, with write, change) video memory in r: write back first when the images drew there, forget them when
+// it changes there
+void hw_touch(const Range &r, bool write) {
+    HwImages &h = g_hw_images;
+    if (write) hw_forget(r);
+    if (!g_hw || !h.valid) return;
+    if ((h.dirty || h.zdirty) && hw_drawn_range().overlaps(r.lo, r.hi)) hw_write_back();
+    if (write && hw_valid_range().overlaps(r.lo, r.hi)) h.valid = false;
+}
+
+void hw_sync_all() {
+    hw_write_back();
+    g_hw_images.valid = false;
+}
+
+// The batch on the hardware path: make the images hold its buffers in its box, draw its shapes in runs of the same depth and blend mode.
+void hw_emit(const Batch &b, std::uint32_t prim_offset, std::uint32_t setup_offset, std::uint32_t prims) {
+    const int x0 = std::clamp(b.minx, 0, static_cast<int>(kHwSize) - 1), y0 = std::clamp(b.miny, 0, static_cast<int>(kHwSize) - 1);
+    const int x1 = std::clamp(b.maxx, 0, static_cast<int>(kHwSize) - 1), y1 = std::clamp(b.maxy, 0, static_cast<int>(kHwSize) - 1);
+    if (x0 > x1 || y0 > y1 || !prims) return;
+    HwImages &h = g_hw_images;
+    // textures of this batch drawn into the images: to video memory first, the fragment shader reads them there
+    for (const Range &t : g_batch_reads) hw_touch(t, false);
+    hw_plan_decodes(b, setup_offset, prims);
+    const bool same = h.valid && h.fbp == b.fbp && h.fbw == b.fbw && h.fpsm == b.fpsm && h.zbp == b.zbp && h.zpsm == b.zpsm;
+    if (!same) hw_sync_all();
+    const bool inside = h.valid && x0 >= h.rx0 && y0 >= h.ry0 && x1 <= h.rx1 && y1 <= h.ry1;
+    const std::uint32_t fbmsk = b.setups.size() > 4 ? b.setups[4] : 0u;
+    std::uint32_t load = 0;
+    if (!inside) {
+        // the images take the box again from video memory (with what they drew written back first), colour and depth
+        hw_write_back();
+        int lx0 = x0, ly0 = y0, lx1 = x1, ly1 = y1;
+        if (h.valid) {
+            lx0 = std::min(lx0, h.rx0);
+            ly0 = std::min(ly0, h.ry0);
+            lx1 = std::max(lx1, h.rx1);
+            ly1 = std::max(ly1, h.ry1);
+        }
+        load = push_params({b.fbp, b.fbw, b.fpsm, b.zbp, b.zpsm, static_cast<std::uint32_t>(lx0) | (static_cast<std::uint32_t>(ly0) << 16),
+                            static_cast<std::uint32_t>(lx1) | (static_cast<std::uint32_t>(ly1) << 16), z_max(b.zpsm), fbmsk, 0u});
+        Command fill{kRaster, static_cast<std::uint32_t>(lx1 - lx0 + 8) / 8, static_cast<std::uint32_t>(ly1 - ly0 + 8) / 8, load};
+        fill.hw = 1;
+        g_commands.push_back(fill);
+        h.valid = true;
+        h.fbp = b.fbp;
+        h.fbw = b.fbw;
+        h.fpsm = b.fpsm;
+        h.zbp = b.zbp;
+        h.zpsm = b.zpsm;
+        h.rx0 = lx0;
+        h.ry0 = ly0;
+        h.rx1 = lx1;
+        h.ry1 = ly1;
+    }
+    HwPass pass{load, push_params({prim_offset, setup_offset, kHwSize, kHwSize}), !inside, x0, y0, x1, y1, h.rx0, h.ry0, h.rx1, h.ry1, {}};
+    for (std::uint32_t i = 0; i < prims; ++i) {
+        const std::uint32_t *rec = b.prims.data() + static_cast<std::size_t>(i) * kPrimWords;
+        const std::uint32_t *s = b.setups.data() + static_cast<std::size_t>(rec[0]) * kSetupWords;
+        std::uint32_t key = 0;
+        if (s[0] & 512u) key = 1 + ((s[7] >> 8) & 3u) + ((s[0] & 32u) ? 0u : 4u);
+        if (s[0] & 8u) key |= (1u + ((s[7] >> 12) & 0xFFu)) << 4;
+        // FIX only matters (and only splits runs) when the blend uses it as C
+        const std::uint32_t fix = (s[0] & 8u) && ((s[7] >> 16) & 3u) == 2u ? s[9] : 0u;
+        if (!pass.runs.empty() && pass.runs.back().key == key && pass.runs.back().fix == fix) ++pass.runs.back().count;
+        else pass.runs.push_back({key, fix, i, 1, pass.draw_param, x0, y0, x1, y1});
+    }
+    Command draw{kRaster, 0, 0, static_cast<std::uint32_t>(g_hw_passes.size())};
+    draw.hw = 3;
+    g_hw_passes.push_back(std::move(pass));
+    g_commands.push_back(draw);
+    if (!h.dirty && !h.zdirty) {
+        h.dx0 = x0;
+        h.dy0 = y0;
+        h.dx1 = x1;
+        h.dy1 = y1;
+    } else {
+        h.dx0 = std::min(h.dx0, x0);
+        h.dy0 = std::min(h.dy0, y0);
+        h.dx1 = std::max(h.dx1, x1);
+        h.dy1 = std::max(h.dy1, y1);
+    }
+    h.dirty = true;
+    h.zdirty = h.zdirty || b.zwrite;
+    h.fbmsk = fbmsk;
+}
+
 void flush_batch() {
     Batch &b = g_batch;
     if (b.prims.empty()) {
@@ -607,6 +861,27 @@ void flush_batch() {
         return;
     }
     const std::uint32_t prims = static_cast<std::uint32_t>(b.prims.size() / kPrimWords);
+    if (g_hw) {
+        // the hardware path needs the shapes and setups only: no screen tiles, no texture decoding, no snapshot
+        const std::uint32_t prim_offset = arena_append(b.prims.data(), b.prims.size() * 4);
+        const std::uint32_t setup_offset = arena_append(b.setups.data(), b.setups.size() * 4);
+        if (g_batch_log) {
+            ++g_why_runs[g_why];
+            g_why_prims[g_why] += prims;
+            g_why = kWhyFlush;
+        }
+        hw_emit(b, prim_offset, setup_offset, prims);
+        mark_rendered(pages(b.fbp, b.fbw, b.fpsm, b.minx, b.miny, b.maxx, b.maxy));
+        if (b.zwrite) mark_rendered(pages(b.zbp, b.fbw, b.zpsm, b.minx, b.miny, b.maxx, b.maxy));
+        b.prims.clear();
+        b.setups.clear();
+        b.boxes.clear();
+        g_batch_reads.clear();
+        b.key = ~0ull;
+        b.minx = b.miny = 1 << 30;
+        b.maxx = b.maxy = -1;
+        return;
+    }
     g_touched.clear();
     g_spans.clear();
     g_span_start.resize(prims + 1);
@@ -686,6 +961,68 @@ void batch_ranges() {
     b.z_range = region(b.zbp, b.fbw, b.zpsm, b.minx, b.miny, b.maxx, b.maxy);
 }
 
+// PS2_EMIT_LOG=1: where the window thread's time goes while it turns the game's drawing commands into GPU work. That is CPU time on the
+// thread that also presents the picture, so on the Switch it comes straight off the frame rate. "operations waiting" is how many uploads
+// and CLUT loads one emit_all call had: the cost of emit_pre grows with the square of that number, so it is worth watching.
+struct EmitStats {
+    bool on = std::getenv("PS2_EMIT_LOG") != nullptr;
+    std::chrono::steady_clock::time_point since = std::chrono::steady_clock::now();
+    double pre_ms = 0, flush_ms = 0, submit_ms = 0;
+    std::uint64_t calls = 0, ops = 0, groups = 0, grouping_checks = 0, submits = 0;
+    void report() {
+        if (!on) return;
+        const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - since).count();
+        if (seconds < 2.0) return;
+        std::fprintf(stderr, "[emit] per second: %.0f emit_all calls, %.0f operations waiting, %.0f groups, %.1f overlap tests per group; emit_pre %.1f ms, flush_batch %.1f ms, %.0f submits %.1f ms\n",
+                     calls / seconds, calls ? static_cast<double>(ops) / static_cast<double>(calls) : 0.0, groups / seconds,
+                     groups ? static_cast<double>(grouping_checks) / static_cast<double>(groups) : 0.0, pre_ms / seconds, flush_ms / seconds, submits / seconds,
+                     submit_ms / seconds);
+        since = std::chrono::steady_clock::now();
+        pre_ms = flush_ms = submit_ms = 0;
+        calls = ops = groups = grouping_checks = submits = 0;
+    }
+};
+EmitStats g_emit;
+
+// The memory the CLUT loads of one emit_pre read, as a few disjoint intervals, so that "does this upload write any of it?" is a binary
+// search instead of a walk over every CLUT load. What this replaces was quadratic in the operations a frame queues, and a Tekken 4 fight
+// queues thousands of them: 343 million overlap tests a second, 230 ms of every second on the PC (PS2_EMIT_LOG=1). The order test it
+// answers (is there a CLUT load before an upload that writes what it reads) is the same one, exactly.
+class ClutReads {
+public:
+    void clear() { spans_.clear(); }
+    void add(const Range &r) {
+        if (r.lo >= r.hi) return;
+        std::uint64_t lo = r.lo, hi = r.hi;
+        auto first = std::lower_bound(spans_.begin(), spans_.end(), lo, [](const Span &s, std::uint64_t v) { return s.hi <= v; });
+        auto last = first;
+        while (last != spans_.end() && last->lo <= hi) {
+            lo = std::min(lo, last->lo);
+            hi = std::max(hi, last->hi);
+            ++last;
+        }
+        const auto at = static_cast<std::ptrdiff_t>(first - spans_.begin());
+        const auto count = static_cast<std::ptrdiff_t>(last - first);
+        if (count) {
+            spans_[static_cast<std::size_t>(at)] = Span{lo, hi};
+            spans_.erase(spans_.begin() + at + 1, spans_.begin() + at + count);
+        } else {
+            spans_.insert(spans_.begin() + at, Span{lo, hi});
+        }
+    }
+    bool overlaps(const Range &r) const {
+        if (r.lo >= r.hi) return false;
+        auto it = std::lower_bound(spans_.begin(), spans_.end(), r.lo, [](const Span &s, std::uint64_t v) { return s.hi <= v; });
+        return it != spans_.end() && it->lo < r.hi;
+    }
+
+private:
+    struct Span {
+        std::uint64_t lo, hi;
+    };
+    std::vector<Span> spans_;
+};
+
 bool batch_conflict(const Range &r, bool clut) {
     Batch &b = g_batch;
     if (b.prims.empty()) return false;
@@ -699,6 +1036,36 @@ bool batch_conflict(const Range &r, bool clut) {
 }
 
 void emit_pre() {
+    for (const PreOp &op : g_pre) hw_touch(op.range, !op.clut);
+    // Uploads and CLUT loads usually alternate (a texture, its palette, the next texture...), and every switch between the two kinds is
+    // one more dispatch with a barrier behind it: about 60 microseconds each on the Switch. When no CLUT load reads memory that a later
+    // upload of the queue writes, every upload can go first and every CLUT load after them, in their own order: the same memory is read
+    // and written as before, in two dispatches (fewer when uploads overlap each other). PS2_PRE_REORDER=0 keeps the queue's order.
+    static const bool reorder = os::env("PS2_PRE_REORDER") != "0";
+    if (reorder && g_pre.size() > 2) {
+        // One pass: keep the memory the CLUT loads read so far and ask it about every upload that comes later. Same answer as the pair of
+        // nested loops this replaces, without their cost.
+        static ClutReads clut_reads;
+        clut_reads.clear();
+        bool safe = true;
+        for (const PreOp &op : g_pre) {
+            if (op.clut) clut_reads.add(op.range);
+            else if (clut_reads.overlaps(op.range)) {
+                safe = false;
+                break;
+            }
+        }
+        if (safe) {  // stable: the CLUT loads' order decides which of them wrote a palette, and the uploads' order their offsets
+            static std::vector<PreOp> ordered;
+            ordered.clear();
+            ordered.reserve(g_pre.size());
+            for (const PreOp &op : g_pre)
+                if (!op.clut) ordered.push_back(op);
+            for (const PreOp &op : g_pre)
+                if (op.clut) ordered.push_back(op);
+            g_pre.swap(ordered);
+        }
+    }
     std::size_t i = 0;
     while (i < g_pre.size()) {
         const bool clut = g_pre[i].clut;
@@ -706,10 +1073,14 @@ void emit_pre() {
         while (j < g_pre.size() && g_pre[j].clut == clut) {
             bool overlap = false;
             if (!clut)
-                for (std::size_t k = i; k < j && !overlap; ++k) overlap = uploads_overlap(g_pre[k], g_pre[j]);
+                for (std::size_t k = i; k < j && !overlap; ++k) {
+                    if (g_emit.on) ++g_emit.grouping_checks;
+                    overlap = uploads_overlap(g_pre[k], g_pre[j]);
+                }
             if (overlap) break;
             ++j;
         }
+        if (g_emit.on) ++g_emit.groups;
         const std::uint32_t count = static_cast<std::uint32_t>(j - i);
         std::uint32_t *records = g_arena.grow(count * 12u);
         const std::uint32_t offset = static_cast<std::uint32_t>(records - g_arena.data());
@@ -721,7 +1092,27 @@ void emit_pre() {
                 total += g_pre[k].rec[7];
             }
         }
-        if (clut) g_commands.push_back({kLoadClut, 1, 1, push_params({offset, count})});
+        if (clut) {
+            // which load last wrote each block of 16 entries, up to every load (gs.wgsl load_clut)
+            std::uint32_t *owners = g_arena.grow(count * 32u);
+            const std::uint32_t table = static_cast<std::uint32_t>(owners - g_arena.data());
+            std::uint32_t now[32];
+            std::fill(std::begin(now), std::end(now), 0xFFFFFFFFu);
+            for (std::uint32_t n = 0; n < count; ++n) {
+                const std::uint32_t *r = g_pre[i + n].rec;
+                const std::uint32_t csm = r[4], csa = r[5];
+                const bool eight = r[6] != 0;
+                if (csm) {
+                    for (std::uint32_t k = 0; k < (eight ? 16u : 1u); ++k) now[(csa + k) & 31u] = n;
+                } else if (eight) {
+                    for (std::uint32_t k = 0; k < 16u; ++k) now[k] = n;
+                } else {
+                    now[csa & 15u] = n;
+                }
+                std::memcpy(g_arena.data() + table + n * 32u, now, sizeof now);
+            }
+            g_commands.push_back({kLoadClut, count * 2, 1, push_params({offset, count, table})});  // two workgroups per load
+        }
         else dispatch_linear(kUpload, total, push_params({offset, count, total}));
         i = j;
     }
@@ -729,6 +1120,20 @@ void emit_pre() {
 }
 
 void emit_all() {
+    if (g_emit.on) {
+        const auto t0 = std::chrono::steady_clock::now();
+        const std::size_t pending = g_pre.size();
+        emit_pre();
+        const auto t1 = std::chrono::steady_clock::now();
+        flush_batch();
+        const auto t2 = std::chrono::steady_clock::now();
+        g_emit.pre_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
+        g_emit.flush_ms += std::chrono::duration<double, std::milli>(t2 - t1).count();
+        g_emit.calls += 1;
+        g_emit.ops += pending;
+        g_emit.report();
+        return;
+    }
     emit_pre();
     flush_batch();
 }
@@ -813,6 +1218,8 @@ void flush_image() {
 void flush_all() {
     flush_image();
     emit_all();
+    hw_sync_all();  // what follows (the display, a download, a copy, a save state) reads or changes video memory
+    g_hw_decoded.clear();
 }
 
 void on_error(WGPUDevice const *, WGPUErrorType type, WGPUStringView message, void *, void *) {
@@ -856,10 +1263,50 @@ WGPUBindGroup make_group(WGPUBuffer params, WGPUBuffer data) {
     return wgpuDeviceCreateBindGroup(g_device, &d);
 }
 
+WGPUBindGroup make_hw_draw_group() {
+    WGPUBindGroupEntry e[6] = {};
+    WGPUBuffer buffers[6] = {g_tables, g_params, g_data, g_clut, g_vram, g_decoded};
+    const std::uint32_t bindings[6] = {1, 2, 3, 4, 5, 6};
+    for (int i = 0; i < 6; ++i) {
+        e[i] = WGPU_BIND_GROUP_ENTRY_INIT;
+        e[i].binding = bindings[i];
+        e[i].buffer = buffers[i];
+        e[i].size = bindings[i] == 2 ? kParamStride : WGPU_WHOLE_SIZE;
+    }
+    WGPUBindGroupDescriptor d = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
+    d.layout = g_hw_layout_draw;
+    d.entryCount = 6;
+    d.entries = e;
+    return wgpuDeviceCreateBindGroup(g_device, &d);
+}
+
+WGPUBindGroup make_hw_group() {
+    WGPUBindGroupEntry e[5] = {};
+    WGPUBuffer buffers[5] = {g_vram, g_tables, g_params, g_data, g_clut};
+    for (int i = 0; i < 5; ++i) {
+        e[i] = WGPU_BIND_GROUP_ENTRY_INIT;
+        e[i].binding = static_cast<std::uint32_t>(i);
+        e[i].buffer = buffers[i];
+        e[i].size = i == 2 ? kParamStride : WGPU_WHOLE_SIZE;
+    }
+    WGPUBindGroupDescriptor d = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
+    d.layout = g_hw_layout0;
+    d.entryCount = 5;
+    d.entries = e;
+    return wgpuDeviceCreateBindGroup(g_device, &d);
+}
+
 void rebuild_group() {
     if (g_group) wgpuBindGroupRelease(g_group);
     g_group = make_group(g_params, g_data);
+    if (g_hw) {
+        if (g_hw_group0) wgpuBindGroupRelease(g_hw_group0);
+        g_hw_group0 = make_hw_group();
+        if (g_hw_group_draw) wgpuBindGroupRelease(g_hw_group_draw);
+        g_hw_group_draw = make_hw_draw_group();
+    }
 }
+
 
 void ensure_capacity() {
     bool changed = false;
@@ -940,11 +1387,13 @@ void profile_submit() {
         wgpuBufferUnmap(g_profile_read);
     }
     g_commands.clear();
+    g_hw_passes.clear();
     g_command_info.clear();
     ++g_serial;
     g_param_records.clear();
     g_arena.clear();
     g_decoded_used = 0;
+    g_hw_decoded.clear();
     g_clut_loads = 0;
 }
 
@@ -958,8 +1407,43 @@ void bench_capture() {
     g_bench_info.clear();
 }
 
+// Render passes in a row with nothing but CLUT loads between them become one pass, the CLUT loads moving in front of it: every pass
+// costs a barrier on each side, and on the Switch those add up. Safe because a CLUT load only writes slots no earlier draw reads (the
+// slots are a ring that is not reused within a submit) and reads video memory, which the draws do not write (they draw into the images;
+// a write-back between them breaks the row). A pass that has to fill its depth image first is not merged. PS2_HW_MERGE=0 keeps them apart.
+void hw_merge_passes() {
+    static const bool merge = os::env("PS2_HW_MERGE") != "0";
+    if (!g_hw || !merge) return;
+    std::vector<Command> out;
+    out.reserve(g_commands.size());
+    std::vector<Command> held;
+    std::ptrdiff_t last = -1;  // the last render pass in out, while only CLUT loads followed it
+    for (const Command &c : g_commands) {
+        if (last >= 0 && !c.hw && (c.pipeline == kLoadClut || c.pipeline == kDecode)) {
+            held.push_back(c);
+            continue;
+        }
+        if (last >= 0 && c.hw == 3 && !g_hw_passes[c.param].load_depth) {
+            out.insert(out.begin() + last, held.begin(), held.end());
+            last += static_cast<std::ptrdiff_t>(held.size());
+            held.clear();
+            HwPass &into = g_hw_passes[out[static_cast<std::size_t>(last)].param];
+            const HwPass &from = g_hw_passes[c.param];
+            into.runs.insert(into.runs.end(), from.runs.begin(), from.runs.end());
+            continue;
+        }
+        out.insert(out.end(), held.begin(), held.end());
+        held.clear();
+        out.push_back(c);
+        last = c.hw == 3 ? static_cast<std::ptrdiff_t>(out.size() - 1) : -1;
+    }
+    out.insert(out.end(), held.begin(), held.end());
+    g_commands.swap(out);
+}
+
 // Browsers copy writes above about 1 MiB through a slower path, so large uploads go in pieces.
 void submit(WGPUTextureView present_view = nullptr) {
+    const auto submit_from = g_emit.on ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     if (g_commands.empty() && !present_view) return;
     if (g_bench.capturing) bench_capture();
     if (g_profile_out && !present_view && g_timestamps && frame_count() >= g_profile_from && frame_count() < g_profile_to) {
@@ -998,6 +1482,7 @@ void submit(WGPUTextureView present_view = nullptr) {
     writes.endOfPassWriteIndex = 1;
     WGPUComputePassDescriptor cd = WGPU_COMPUTE_PASS_DESCRIPTOR_INIT;
     if (measure) cd.timestampWrites = &writes;
+    hw_merge_passes();
     WGPUComputePassEncoder pass = wgpuCommandEncoderBeginComputePass(enc, &cd);
     Pipeline current = kPipelines;
     ++g_submits;
@@ -1010,6 +1495,94 @@ void submit(WGPUTextureView present_view = nullptr) {
         return mask;
     }();
     for (const Command &c : g_commands) {
+        if (c.hw) {
+            current = kPipelines;  // the next ordinary command sets its pipeline again
+            const std::uint32_t offset = c.param * kParamStride;
+            if (c.hw == 1 || c.hw == 2 || c.hw == 4) {
+                wgpuComputePassEncoderSetPipeline(pass, c.hw == 1 ? g_hw_load : c.hw == 2 ? g_hw_back : g_hw_back_depth);
+                wgpuComputePassEncoderSetBindGroup(pass, 0, g_hw_group0, 1, &offset);
+                wgpuComputePassEncoderSetBindGroup(pass, 1, c.hw == 1 ? g_hw_group1 : g_hw_group_none, 0, nullptr);
+                if (c.hw != 1) wgpuComputePassEncoderSetBindGroup(pass, 2, g_hw_group2, 0, nullptr);
+                wgpuComputePassEncoderDispatchWorkgroups(pass, c.x, c.y, 1);
+                continue;
+            }
+            // a render pass between two compute passes
+            wgpuComputePassEncoderEnd(pass);
+            wgpuComputePassEncoderRelease(pass);
+            const HwPass &hp = g_hw_passes[c.param];
+            WGPURenderPassColorAttachment color = WGPU_RENDER_PASS_COLOR_ATTACHMENT_INIT;
+            color.view = g_hw_color_view;
+            color.loadOp = WGPULoadOp_Load;
+            color.storeOp = WGPUStoreOp_Store;
+            WGPURenderPassDepthStencilAttachment depth = WGPU_RENDER_PASS_DEPTH_STENCIL_ATTACHMENT_INIT;
+            depth.view = g_hw_depth_view;
+            depth.depthLoadOp = WGPULoadOp_Load;
+            depth.depthStoreOp = WGPUStoreOp_Store;
+            WGPURenderPassDescriptor rd = WGPU_RENDER_PASS_DESCRIPTOR_INIT;
+            rd.colorAttachmentCount = 1;
+            rd.colorAttachments = &color;
+            rd.depthStencilAttachment = &depth;
+#ifdef PS2_VULKAN
+            // Only the part of the 2048x2048 images this pass can change is loaded and stored; see wgpuRenderPassSetAreaHint in
+            // vk/wgpu_vk.cpp. The depth load draws in its own box, so the area is the union of the two.
+            {
+                int ax0 = std::max(0, hp.x0), ay0 = std::max(0, hp.y0);
+                int ax1 = std::min(static_cast<int>(kHwSize) - 1, hp.x1), ay1 = std::min(static_cast<int>(kHwSize) - 1, hp.y1);
+                if (hp.load_depth) {
+                    ax0 = std::max(0, std::min(ax0, hp.lx0));
+                    ay0 = std::max(0, std::min(ay0, hp.ly0));
+                    ax1 = std::min(static_cast<int>(kHwSize) - 1, std::max(ax1, hp.lx1));
+                    ay1 = std::min(static_cast<int>(kHwSize) - 1, std::max(ay1, hp.ly1));
+                }
+                if (ax1 >= ax0 && ay1 >= ay0)
+                    wgpuRenderPassSetAreaHint(static_cast<std::uint32_t>(ax0), static_cast<std::uint32_t>(ay0),
+                                              static_cast<std::uint32_t>(ax1 - ax0 + 1), static_cast<std::uint32_t>(ay1 - ay0 + 1));
+            }
+#endif
+            WGPURenderPassEncoder rp = wgpuCommandEncoderBeginRenderPass(enc, &rd);
+            wgpuRenderPassEncoderSetViewport(rp, 0.0f, 0.0f, static_cast<float>(kHwSize), static_cast<float>(kHwSize), 0.0f, 1.0f);
+            wgpuRenderPassEncoderSetScissorRect(rp, static_cast<std::uint32_t>(hp.x0), static_cast<std::uint32_t>(hp.y0), static_cast<std::uint32_t>(hp.x1 - hp.x0 + 1),
+                                                static_cast<std::uint32_t>(hp.y1 - hp.y0 + 1));
+            if (hp.load_depth) {
+                const std::uint32_t load_offset = hp.load_param * kParamStride;
+                wgpuRenderPassEncoderSetScissorRect(rp, static_cast<std::uint32_t>(hp.lx0), static_cast<std::uint32_t>(hp.ly0), static_cast<std::uint32_t>(hp.lx1 - hp.lx0 + 1),
+                                                    static_cast<std::uint32_t>(hp.ly1 - hp.ly0 + 1));
+                wgpuRenderPassEncoderSetPipeline(rp, g_hw_load_depth);
+                wgpuRenderPassEncoderSetBindGroup(rp, 0, g_hw_group_draw, 1, &load_offset);
+                wgpuRenderPassEncoderDraw(rp, 3, 1, 0, 0);
+                wgpuRenderPassEncoderSetScissorRect(rp, static_cast<std::uint32_t>(hp.x0), static_cast<std::uint32_t>(hp.y0), static_cast<std::uint32_t>(hp.x1 - hp.x0 + 1),
+                                                    static_cast<std::uint32_t>(hp.y1 - hp.y0 + 1));
+            }
+            std::uint32_t bound = ~0u;
+            int scissor[4] = {hp.x0, hp.y0, hp.x1, hp.y1};
+            for (const HwRun &run : hp.runs) {
+                WGPURenderPipeline pipeline = hw_pipeline(run.key);
+                if (!pipeline) continue;
+                if (run.draw_param != bound) {
+                    const std::uint32_t draw_offset = run.draw_param * kParamStride;
+                    wgpuRenderPassEncoderSetBindGroup(rp, 0, g_hw_group_draw, 1, &draw_offset);
+                    bound = run.draw_param;
+                }
+                if (run.x0 != scissor[0] || run.y0 != scissor[1] || run.x1 != scissor[2] || run.y1 != scissor[3]) {
+                    wgpuRenderPassEncoderSetScissorRect(rp, static_cast<std::uint32_t>(run.x0), static_cast<std::uint32_t>(run.y0), static_cast<std::uint32_t>(run.x1 - run.x0 + 1),
+                                                        static_cast<std::uint32_t>(run.y1 - run.y0 + 1));
+                    scissor[0] = run.x0;
+                    scissor[1] = run.y0;
+                    scissor[2] = run.x1;
+                    scissor[3] = run.y1;
+                }
+                wgpuRenderPassEncoderSetPipeline(rp, pipeline);
+                const double fix = static_cast<double>(run.fix) / 128.0;
+                const WGPUColor constant{fix, fix, fix, fix};
+                wgpuRenderPassEncoderSetBlendConstant(rp, &constant);
+                wgpuRenderPassEncoderDraw(rp, run.count * 6, 1, run.first * 6, 0);
+            }
+            wgpuRenderPassEncoderEnd(rp);
+            wgpuRenderPassEncoderRelease(rp);
+            WGPUComputePassDescriptor next = WGPU_COMPUTE_PASS_DESCRIPTOR_INIT;
+            pass = wgpuCommandEncoderBeginComputePass(enc, &next);
+            continue;
+        }
         ++g_dispatches[c.pipeline];
         if (skip & (1u << c.pipeline)) continue;
         if (c.pipeline != current) {
@@ -1066,12 +1639,18 @@ void submit(WGPUTextureView present_view = nullptr) {
     wgpuDevicePoll(g_device, false, nullptr);
 #endif
     g_commands.clear();
+    g_hw_passes.clear();
     g_command_info.clear();
     ++g_serial;
     g_param_records.clear();
     g_arena.clear();
     g_decoded_used = 0;
+    g_hw_decoded.clear();
     g_clut_loads = 0;
+    if (g_emit.on) {  // how much of the drawing thread's time the driver calls themselves take (command recording, submit, queue writes)
+        g_emit.submit_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - submit_from).count();
+        ++g_emit.submits;
+    }
 }
 
 void read_back(WGPUBuffer source, std::uint64_t bytes, void *out, std::uint64_t offset = 0) {
@@ -1572,12 +2151,14 @@ static bool open_backend([[maybe_unused]] std::uint32_t backends, const char *na
     limits.maxBufferSize = supported.maxBufferSize;
     WGPUDeviceDescriptor dd = WGPU_DEVICE_DESCRIPTOR_INIT;
     dd.requiredLimits = &limits;
-    const WGPUFeatureName timestamp_feature = WGPUFeatureName_TimestampQuery;
+    WGPUFeatureName features[2];
+    std::size_t feature_count = 0;
     g_timestamps = wgpuAdapterHasFeature(adapter, WGPUFeatureName_TimestampQuery);
-    if (g_timestamps) {
-        dd.requiredFeatureCount = 1;
-        dd.requiredFeatures = &timestamp_feature;
-    }
+    if (g_timestamps) features[feature_count++] = WGPUFeatureName_TimestampQuery;
+    g_dual_source = wgpuAdapterHasFeature(adapter, WGPUFeatureName_DualSourceBlending);
+    if (g_dual_source) features[feature_count++] = WGPUFeatureName_DualSourceBlending;
+    dd.requiredFeatureCount = feature_count;
+    dd.requiredFeatures = features;
     dd.uncapturedErrorCallbackInfo.callback = on_error;
     bool device_done = false;
     WGPURequestDeviceCallbackInfo dcb = WGPU_REQUEST_DEVICE_CALLBACK_INFO_INIT;
@@ -1694,6 +2275,7 @@ bool init(Mode m) {
     g_cache = make_buffer(static_cast<std::uint64_t>(kCacheWords) * 4, WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst);
     g_decoded = make_buffer(static_cast<std::uint64_t>(kDecodedWords) * 4, WGPUBufferUsage_Storage);
     if (const char *decode = std::getenv("PS2_DECODE")) g_decode = std::atoi(decode) != 0;
+    g_hw_decode = os::env("PS2_HW_DECODE") == "1";
     g_cache_copy.assign(kCacheWords, 0);
     g_readback = make_buffer(static_cast<std::uint64_t>(g_copy_words) * 4, WGPUBufferUsage_MapRead | WGPUBufferUsage_CopyDst);
     if (g_timestamps) {
@@ -1769,9 +2351,219 @@ bool init(Mode m) {
     }
     std::fprintf(stderr, "[gpu] %d shaders compiled in %.0f ms\n", kPipelines, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - compile_start).count());
     wgpuShaderModuleRelease(module);
+    if (const char *hw = std::getenv("PS2_GS_HW"); hw && hw[0] == '1') {
+        g_hw = hw_init();
+        std::fprintf(stderr, "[gpu] hardware rasterizer path %s\n", g_hw ? "on (PS2_GS_HW=1)" : "could not start: the compute path draws");
+    }
     ensure_capacity();
     g_mode = m;
     return true;
+}
+
+// The images, layouts and pipelines of the hardware path
+bool hw_init() {
+    const auto texture = [](WGPUTextureFormat format, WGPUTextureUsage usage) {
+        WGPUTextureDescriptor td = WGPU_TEXTURE_DESCRIPTOR_INIT;
+        td.usage = usage;
+        td.dimension = WGPUTextureDimension_2D;
+        td.size = WGPUExtent3D{kHwSize, kHwSize, 1};
+        td.format = format;
+        td.mipLevelCount = 1;
+        td.sampleCount = 1;
+        return wgpuDeviceCreateTexture(g_device, &td);
+    };
+    g_hw_color = texture(WGPUTextureFormat_RGBA8Unorm, WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_StorageBinding | WGPUTextureUsage_TextureBinding);
+    g_hw_depth = texture(WGPUTextureFormat_Depth32Float, WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_TextureBinding);
+    if (!g_hw_color || !g_hw_depth) return false;
+    g_hw_color_view = wgpuTextureCreateView(g_hw_color, nullptr);
+    g_hw_depth_view = wgpuTextureCreateView(g_hw_depth, nullptr);
+
+    const WGPUShaderStage all = WGPUShaderStage_Vertex | WGPUShaderStage_Fragment | WGPUShaderStage_Compute;
+    WGPUBindGroupLayoutEntry le[5] = {};
+    const WGPUBufferBindingType types[5] = {WGPUBufferBindingType_Storage, WGPUBufferBindingType_ReadOnlyStorage, WGPUBufferBindingType_Uniform,
+                                            WGPUBufferBindingType_ReadOnlyStorage, WGPUBufferBindingType_ReadOnlyStorage};
+    for (int i = 0; i < 5; ++i) {
+        le[i] = WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
+        le[i].binding = static_cast<std::uint32_t>(i);
+        le[i].visibility = i == 0 || i == 4 ? (WGPUShaderStage_Fragment | WGPUShaderStage_Compute) : all;  // writable storage: not in vertex shaders
+        le[i].buffer.type = types[i];
+        le[i].buffer.hasDynamicOffset = i == 2;
+        le[i].buffer.minBindingSize = i == 2 ? kParamStride : 0;
+    }
+    WGPUBindGroupLayoutDescriptor ld = WGPU_BIND_GROUP_LAYOUT_DESCRIPTOR_INIT;
+    ld.entryCount = 5;
+    ld.entries = le;
+    g_hw_layout0 = wgpuDeviceCreateBindGroupLayout(g_device, &ld);
+    // the render passes': bindings 1 to 4 as above, video memory read-only as 5, the decoded textures as 6
+    WGPUBindGroupLayoutEntry dle[6] = {};
+    for (int i = 0; i < 6; ++i) {
+        dle[i] = WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
+        dle[i].binding = static_cast<std::uint32_t>(i + 1);
+        dle[i].visibility = WGPUShaderStage_Vertex | WGPUShaderStage_Fragment;
+        dle[i].buffer.type = i == 1 ? WGPUBufferBindingType_Uniform : WGPUBufferBindingType_ReadOnlyStorage;
+        dle[i].buffer.hasDynamicOffset = i == 1;
+        dle[i].buffer.minBindingSize = i == 1 ? kParamStride : 0;
+    }
+    ld.entryCount = 6;
+    ld.entries = dle;
+    g_hw_layout_draw = wgpuDeviceCreateBindGroupLayout(g_device, &ld);
+
+    WGPUBindGroupLayoutEntry storage = WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
+    storage.binding = 0;
+    storage.visibility = WGPUShaderStage_Compute;
+    storage.storageTexture.access = WGPUStorageTextureAccess_WriteOnly;
+    storage.storageTexture.format = WGPUTextureFormat_RGBA8Unorm;
+    storage.storageTexture.viewDimension = WGPUTextureViewDimension_2D;
+    ld.entryCount = 1;
+    ld.entries = &storage;
+    g_hw_layout1 = wgpuDeviceCreateBindGroupLayout(g_device, &ld);
+
+    WGPUBindGroupLayoutEntry read[2] = {WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT, WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT};
+    read[0].binding = 0;
+    read[0].visibility = WGPUShaderStage_Compute;
+    read[0].texture.sampleType = WGPUTextureSampleType_UnfilterableFloat;
+    read[0].texture.viewDimension = WGPUTextureViewDimension_2D;
+    read[1].binding = 1;
+    read[1].visibility = WGPUShaderStage_Compute;
+    read[1].texture.sampleType = WGPUTextureSampleType_Depth;
+    read[1].texture.viewDimension = WGPUTextureViewDimension_2D;
+    ld.entryCount = 2;
+    ld.entries = read;
+    g_hw_layout2 = wgpuDeviceCreateBindGroupLayout(g_device, &ld);
+    ld.entryCount = 0;
+    ld.entries = nullptr;
+    g_hw_layout_none = wgpuDeviceCreateBindGroupLayout(g_device, &ld);
+
+    WGPUBindGroupEntry ge = WGPU_BIND_GROUP_ENTRY_INIT;
+    WGPUBindGroupDescriptor gd = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
+    ge.binding = 0;
+    ge.textureView = g_hw_color_view;
+    gd.layout = g_hw_layout1;
+    gd.entryCount = 1;
+    gd.entries = &ge;
+    g_hw_group1 = wgpuDeviceCreateBindGroup(g_device, &gd);
+    WGPUBindGroupEntry ge2[2] = {WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT};
+    ge2[0].binding = 0;
+    ge2[0].textureView = g_hw_color_view;
+    ge2[1].binding = 1;
+    ge2[1].textureView = g_hw_depth_view;
+    gd.layout = g_hw_layout2;
+    gd.entryCount = 2;
+    gd.entries = ge2;
+    g_hw_group2 = wgpuDeviceCreateBindGroup(g_device, &gd);
+    gd.layout = g_hw_layout_none;
+    gd.entryCount = 0;
+    gd.entries = nullptr;
+    g_hw_group_none = wgpuDeviceCreateBindGroup(g_device, &gd);
+
+    WGPUPipelineLayoutDescriptor pld = WGPU_PIPELINE_LAYOUT_DESCRIPTOR_INIT;
+    const WGPUBindGroupLayout load_layouts[2] = {g_hw_layout0, g_hw_layout1};
+    pld.bindGroupLayoutCount = 2;
+    pld.bindGroupLayouts = load_layouts;
+    g_hw_load_layout = wgpuDeviceCreatePipelineLayout(g_device, &pld);
+    const WGPUBindGroupLayout back_layouts[3] = {g_hw_layout0, g_hw_layout_none, g_hw_layout2};
+    pld.bindGroupLayoutCount = 3;
+    pld.bindGroupLayouts = back_layouts;
+    g_hw_back_layout = wgpuDeviceCreatePipelineLayout(g_device, &pld);
+    pld.bindGroupLayoutCount = 1;
+    pld.bindGroupLayouts = &g_hw_layout_draw;
+    g_hw_render_layout = wgpuDeviceCreatePipelineLayout(g_device, &pld);
+
+    WGPUShaderSourceWGSL source = WGPU_SHADER_SOURCE_WGSL_INIT;
+    source.code = view(kHwShader);
+    WGPUShaderModuleDescriptor md = WGPU_SHADER_MODULE_DESCRIPTOR_INIT;
+    md.nextInChain = &source.chain;
+    g_hw_module = wgpuDeviceCreateShaderModule(g_device, &md);
+    if (!g_hw_module) return false;
+
+    WGPUComputePipelineDescriptor cd = WGPU_COMPUTE_PIPELINE_DESCRIPTOR_INIT;
+    cd.layout = g_hw_load_layout;
+    cd.compute.module = g_hw_module;
+    cd.compute.entryPoint = view("hw_load_color");
+    g_hw_load = wgpuDeviceCreateComputePipeline(g_device, &cd);
+    cd.layout = g_hw_back_layout;
+    cd.compute.entryPoint = view("hw_writeback");
+    g_hw_back = wgpuDeviceCreateComputePipeline(g_device, &cd);
+    // Only the Vulkan renderer has this one: its shader reads a depth texture, which GLSL cannot express (see hw.wgsl, docs/deko3d.md)
+    cd.compute.entryPoint = view("hw_writeback_depth");
+    g_hw_back_depth = wgpuDeviceCreateComputePipeline(g_device, &cd);
+    if (!g_hw_load || !g_hw_back || !g_hw_back_depth) return false;
+
+    g_hw_load_depth = hw_render_pipeline("hw_full_vs", "hw_load_depth", false, true, WGPUCompareFunction_Always, nullptr);
+    if (!g_hw_load_depth) return false;
+    if (!g_dual_source) std::fprintf(stderr, "[gpu] no dual-source blending on this device: the hardware path blends with a constant factor\n");
+    return hw_pipeline(0) != nullptr;
+}
+
+WGPURenderPipeline hw_render_pipeline(const char *vs, const char *fs, bool write_color, bool depth_write, WGPUCompareFunction compare, const WGPUBlendState *blend) {
+        WGPUDepthStencilState ds = WGPU_DEPTH_STENCIL_STATE_INIT;
+        ds.format = WGPUTextureFormat_Depth32Float;
+        ds.depthWriteEnabled = depth_write ? WGPUOptionalBool_True : WGPUOptionalBool_False;
+        ds.depthCompare = compare;
+        WGPUColorTargetState target = WGPU_COLOR_TARGET_STATE_INIT;
+        target.format = WGPUTextureFormat_RGBA8Unorm;
+        target.writeMask = write_color ? WGPUColorWriteMask_All : WGPUColorWriteMask_None;
+        target.blend = blend;
+        WGPUFragmentState fragment = WGPU_FRAGMENT_STATE_INIT;
+        fragment.module = g_hw_module;
+        fragment.entryPoint = view(fs);
+        fragment.targetCount = 1;
+        fragment.targets = &target;
+        WGPURenderPipelineDescriptor rd = WGPU_RENDER_PIPELINE_DESCRIPTOR_INIT;
+        rd.layout = g_hw_render_layout;
+        rd.vertex.module = g_hw_module;
+        rd.vertex.entryPoint = view(vs);
+        rd.primitive.topology = WGPUPrimitiveTopology_TriangleList;
+        rd.primitive.cullMode = WGPUCullMode_None;
+        rd.depthStencil = &ds;
+        rd.multisample.count = 1;
+        rd.multisample.mask = 0xFFFFFFFFu;
+        rd.fragment = &fragment;
+        return wgpuDeviceCreateRenderPipeline(g_device, &rd);
+}
+
+// The PS2's blend ((A - B) * C >> 7) + D as the GPU's: the colour's coefficient and the frame's are each 0, 1, F, -F or 1 - F, where F
+// is C / 128 (the source alpha as the second output, the destination alpha, or FIX as the blend constant). 1 + F, or both negative,
+// have no fixed-function form; they are drawn with the nearest one.
+WGPUBlendState hw_blend(std::uint32_t alpha) {
+    const std::uint32_t a = alpha & 3u, b = (alpha >> 2) & 3u, c = (alpha >> 4) & 3u, d = (alpha >> 6) & 3u;
+    const WGPUBlendFactor F = c == 0 ? (g_dual_source ? WGPUBlendFactor_Src1Alpha : WGPUBlendFactor_SrcAlpha) : c == 1 ? WGPUBlendFactor_DstAlpha : WGPUBlendFactor_Constant;
+    const WGPUBlendFactor G = c == 0 ? (g_dual_source ? WGPUBlendFactor_OneMinusSrc1Alpha : WGPUBlendFactor_OneMinusSrcAlpha) : c == 1 ? WGPUBlendFactor_OneMinusDstAlpha : WGPUBlendFactor_OneMinusConstant;
+    const auto coefficient = [&](std::uint32_t who, WGPUBlendFactor &factor, int &sign) {
+        const int f = (a == who ? 1 : 0) - (b == who ? 1 : 0), k = d == who ? 1 : 0;
+        sign = 1;
+        if (f == 0) factor = k ? WGPUBlendFactor_One : WGPUBlendFactor_Zero;
+        else if (k == 0) {
+            factor = F;
+            sign = f;
+        } else factor = f < 0 ? G : WGPUBlendFactor_One;  // 1 - F, or 1 + F drawn as 1
+    };
+    WGPUBlendFactor src, dst;
+    int ss, ds;
+    coefficient(0, src, ss);
+    coefficient(1, dst, ds);
+    WGPUBlendState state = WGPU_BLEND_STATE_INIT;
+    state.color.srcFactor = src;
+    state.color.dstFactor = dst;
+    state.color.operation = ss > 0 && ds < 0 ? WGPUBlendOperation_Subtract : ss < 0 && ds > 0 ? WGPUBlendOperation_ReverseSubtract : WGPUBlendOperation_Add;
+    state.alpha.srcFactor = WGPUBlendFactor_One;  // the frame's alpha is the colour's, not blended
+    state.alpha.dstFactor = WGPUBlendFactor_Zero;
+    state.alpha.operation = WGPUBlendOperation_Add;
+    return state;
+}
+
+WGPURenderPipeline hw_pipeline(std::uint32_t key) {
+    if (const auto it = g_hw_draw.find(key); it != g_hw_draw.end()) return it->second;
+    static const WGPUCompareFunction tests[4] = {WGPUCompareFunction_Never, WGPUCompareFunction_Always, WGPUCompareFunction_GreaterEqual, WGPUCompareFunction_Greater};
+    const std::uint32_t depth = key & 15u, blend = key >> 4;
+    const bool test = depth != 0;
+    WGPUBlendState state;
+    if (blend) state = hw_blend(blend - 1);
+    WGPURenderPipeline p = hw_render_pipeline("hw_vs", g_dual_source ? "hw_fs" : "hw_fs_single", true, test && depth >= 5,
+                                              test ? tests[(depth - 1) & 3u] : WGPUCompareFunction_Always, blend ? &state : nullptr);
+    if (!p) std::fprintf(stderr, "[gpu] hardware path: no pipeline for key %X\n", key);
+    g_hw_draw[key] = p;
+    return p;
 }
 
 void draw(const State &st, const Vertex *v, int count) {
@@ -2067,10 +2859,19 @@ void load_clut(std::uint64_t tex0, std::uint64_t texclut) {
 
 void texflush() { ++g_texflushes; }
 
+// PS2_SUBMIT_ONCE=1: the frame's work goes to the chip together with the display blit, as one submission, instead of one submission
+// at the vblank and another one for the display. In the shim every submission starts with a full memory barrier (WebGPU's ordering),
+// which waits for everything submitted before it, so the GPU cannot overlap two submissions anyway: a fight makes 78 of them a
+// second, and about 400 ms of every second of the GPU's time is not inside any dispatch - the drains are the first suspect.
+static bool submit_once() {
+    static const bool on = std::getenv("PS2_SUBMIT_ONCE") != nullptr;
+    return on;
+}
+
 void flush() {
     if (g_mode == Mode::off) return;
     flush_all();
-    submit();
+    if (!submit_once()) submit();
     if (g_batch_log) {
         std::uint32_t runs = 0, prims = 0;
         for (int w = 0; w < kWhys; ++w) runs += g_why_runs[w], prims += g_why_prims[w];
@@ -2256,11 +3057,19 @@ bool attach_surface(const SurfaceTarget &target) {
         wayland.display = target.display;
         wayland.surface = target.surface;
         sd.nextInChain = &wayland.chain;
-    } else {
+    } else if (target.kind != SurfaceTarget::Vi) {
         return false;
     }
 #endif
-    g_surface = wgpuInstanceCreateSurface(g_instance, &sd);
+    if (target.kind == SurfaceTarget::Vi) {  // PS2_VK_PRESENT=1: the Switch's display, from the shim's own call
+#if defined(__SWITCH__) && defined(PS2_VULKAN)
+        g_surface = wgpuCreateViSurface(g_instance, target.surface);
+#else
+        return false;
+#endif
+    } else {
+        g_surface = wgpuInstanceCreateSurface(g_instance, &sd);
+    }
     if (!g_surface) return false;
     WGPUSurfaceCapabilities caps = WGPU_SURFACE_CAPABILITIES_INIT;
     if (wgpuSurfaceGetCapabilities(g_surface, g_adapter, &caps) != WGPUStatus_Success || !caps.formatCount) {
@@ -2299,6 +3108,17 @@ bool attach_surface(const SurfaceTarget &target) {
     g_surface_width = target.width;
     g_surface_height = target.height;
     configure_surface();
+#if defined(__SWITCH__) && defined(PS2_VULKAN)
+    // A surface whose swap chain could not be made presents nothing at all, and the SDL path has already been given up by then: the
+    // first console run of PS2_VK_PRESENT=1 ended in a black screen exactly that way. Give the surface up instead, so the window code
+    // keeps showing the picture through SDL.
+    if (target.kind == SurfaceTarget::Vi && !wgpuSurfaceHasSwapchain(g_surface)) {
+        std::fprintf(stderr, "[gpu] the display's swap chain could not be made: showing the picture through SDL instead\n");
+        wgpuSurfaceRelease(g_surface);
+        g_surface = nullptr;
+        return false;
+    }
+#endif
 
     WGPUShaderSourceWGSL source = WGPU_SHADER_SOURCE_WGSL_INIT;
     source.code = view(kBlitShader);

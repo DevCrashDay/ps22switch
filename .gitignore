@@ -9,6 +9,7 @@
 /generated/
 /tools/
 /build/
+/build-switch/
 
 *.ppm
 *.wav
@@ -66,3 +67,4 @@ __pycache__/
 # Per-PC Claude Code settings and private notes.
 /.claude/settings.local.json
 /CLAUDE.local.md
+/scratch/

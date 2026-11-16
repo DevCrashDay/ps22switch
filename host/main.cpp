@@ -2,6 +2,10 @@
 #include "ps2/system.hpp"
 #include "ps2/ee_live.hpp"
 #include "ps2/vu_live.hpp"
+#include "ps2/deko_stage0.h"
+#include "thread.hpp"
+#include "switch_clock.hpp"
+#include "switch_crash.hpp"
 
 #ifdef PS2_WINDOW
 #include "window.hpp"
@@ -11,6 +15,7 @@
 #endif
 
 #include <algorithm>
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -23,6 +28,9 @@
 #include <atomic>
 #include <chrono>
 #include <thread>
+#if defined(__x86_64__) || defined(__i386__)
+#include <cpuid.h>
+#endif
 #ifdef PS2_WINDOW
 #include <deque>
 #include <mutex>
@@ -43,6 +51,9 @@
 #endif
 #ifdef PS2_WINDOW
 #include <fcntl.h>
+#endif
+#ifdef __SWITCH__
+#include <switch.h>
 #endif
 #endif
 
@@ -152,6 +163,8 @@ public:
         if (_dup2(fds[1], err_fd_) != 0) return false;
         _setmode(err_fd_, _O_BINARY);
         SetStdHandle(STD_ERROR_HANDLE, reinterpret_cast<HANDLE>(_get_osfhandle(err_fd_)));  // code that writes to the handle (wgpu-native) too
+#elif defined(__SWITCH__)
+        return false;
 #else
         if (pipe(fds) != 0) return false;
         saved_ = dup(2);
@@ -185,7 +198,7 @@ public:
         _setmode(err_fd_, _O_BINARY);
         SetStdHandle(STD_ERROR_HANDLE, reinterpret_cast<HANDLE>(_get_osfhandle(err_fd_)));
         _close(write_fd_);
-#else
+#elif !defined(__SWITCH__)
         dup2(saved_, 2);
         close(write_fd_);
 #endif
@@ -193,7 +206,7 @@ public:
 #ifdef _WIN32
         _close(read_fd_);
         _close(saved_);
-#else
+#elif !defined(__SWITCH__)
         close(read_fd_);
         close(saved_);
 #endif
@@ -326,7 +339,7 @@ LONG WINAPI on_crash(EXCEPTION_POINTERS *info) {
 }
 #endif
 
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__SWITCH__)
 // The same for Linux. A run that ended without its closing lines ("[ee] stopped after ..." and the audio summary) used to leave no trace
 // of why: a crash (SIGSEGV), an abort (a failed allocation or an exception nobody caught: SIGABRT) and the terminal closing (SIGHUP) each
 // ended the process at once, and a core dump says nothing in the log. This writes one line and the stack of the thread that got the
@@ -366,6 +379,8 @@ void install_signal_handlers() {
     for (const int sig : {SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT, SIGHUP}) std::signal(sig, on_fatal_signal);
     std::signal(SIGPIPE, SIG_IGN);  // a log pipe whose reader went away makes a write fail instead of ending the run without a word
 }
+#elif defined(__SWITCH__)
+void install_signal_handlers() {}
 #endif
 
 // A name for the calling thread that Windows tools show (Process Explorer, a debugger, a profiler), so the CPU time of the
@@ -381,11 +396,80 @@ void install_signal_handlers() {
 
 }
 
+// One line about the machine for the log, next to the [gpu] lines: a tester's log then says which processor (and how many cores) the speed
+// was seen on. The name comes from CPUID on x86 (any system); the core count and the split into fast and small cores (an "efficiency
+// class" of Windows) from Windows' own list; elsewhere only the number of logical processors is known.
+static void log_machine() {
+    std::string name = "unknown processor";
+#if defined(__x86_64__) || defined(__i386__)
+    unsigned int regs[12] = {};
+    if (__get_cpuid_max(0x80000000u, nullptr) >= 0x80000004u) {
+        for (unsigned int i = 0; i < 3; ++i) __cpuid(0x80000002u + i, regs[i * 4], regs[i * 4 + 1], regs[i * 4 + 2], regs[i * 4 + 3]);
+        name.assign(reinterpret_cast<const char *>(regs), 48);
+        name.resize(std::strlen(name.c_str()));
+        const auto first = name.find_first_not_of(' ');
+        name = first == std::string::npos ? std::string("unknown processor") : name.substr(first);
+    }
+#endif
+    char detail[160] = "";
+    const unsigned int logical = std::thread::hardware_concurrency();
+#ifdef _WIN32
+    DWORD bytes = 0;
+    GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &bytes);
+    std::vector<unsigned char> buffer(bytes);
+    int cores = 0, best = -1, fast = 0;
+    std::vector<int> classes;
+    if (bytes && GetLogicalProcessorInformationEx(RelationProcessorCore, reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(buffer.data()), &bytes)) {
+        for (DWORD at = 0; at < bytes;) {
+            const auto *info = reinterpret_cast<const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *>(buffer.data() + at);
+            if (info->Size == 0) break;
+            ++cores;
+            classes.push_back(info->Processor.EfficiencyClass);
+            best = std::max<int>(best, info->Processor.EfficiencyClass);
+            at += info->Size;
+        }
+        for (const int c : classes) fast += c == best;
+    }
+    MEMORYSTATUSEX memory{};
+    memory.dwLength = sizeof memory;
+    const double gigabytes = GlobalMemoryStatusEx(&memory) ? static_cast<double>(memory.ullTotalPhys) / (1024.0 * 1024.0 * 1024.0) : 0.0;
+    if (cores > 0 && fast < cores) std::snprintf(detail, sizeof detail, "%d cores (%d fast, %d small), %u logical processors", cores, fast, cores - fast, logical);
+    else if (cores > 0) std::snprintf(detail, sizeof detail, "%d cores, %u logical processors", cores, logical);
+    else std::snprintf(detail, sizeof detail, "%u logical processors", logical);
+    if (gigabytes > 0.0) std::snprintf(detail + std::strlen(detail), sizeof detail - std::strlen(detail), ", %.0f GB RAM", gigabytes);
+#else
+    std::snprintf(detail, sizeof detail, "%u logical processors", logical);
+#endif
+    std::fprintf(stderr, "[cpu] %s: %s\n", name.c_str(), detail);
+}
+
 // The window run's threads without a window (PS2_THREADS=1): this thread draws, one runs the vector units, one is the emulation.
 // The emulation waits for the drawing as in a window (post_present lets it run two pictures ahead), nothing is shown.
 // --frames-dir works too: the pictures are read back here, on the drawing side, at the same frames as in a run with one thread, under the
 // same names (a picture that cannot be shown, such as one while the display is off, is skipped).
 static int run_threads_headless(const std::function<int()> &emulate) {
+#ifdef PS2_PROFILE
+    // PS2_PROFILE samples the emulation thread. PS2_PROFILE_RENDER=<file> samples the thread that draws instead (the window thread,
+    // where the drawing commands are recorded and the picture is handed over), which is where a run below full speed can lose its time.
+    // The same PS2_PROFILE_FROM=<frame> says when it starts.
+    struct RenderProfile {
+        std::string path;
+        std::uint64_t from = 0;
+        bool armed = false;
+        RenderProfile() {
+            if (const char *p = std::getenv("PS2_PROFILE_RENDER"); p && *p) path = p;
+            if (const char *f = std::getenv("PS2_PROFILE_FROM")) from = std::strtoull(f, nullptr, 10);
+        }
+        void tick() {
+            if (armed || path.empty() || ps2::frame_count() < from) return;
+            armed = true;
+            start_profile(0);  // 0: arm now, on this thread
+        }
+        void finish() {
+            if (armed) write_profile(path.c_str());
+        }
+    } render_profile;
+#endif
     ps2::init_graphics();
     ps2::g_options.on_vblank = [] { ps2::post_present(); };
     const std::string pictures = ps2::g_options.frames_dir;
@@ -395,11 +479,11 @@ static int run_threads_headless(const std::function<int()> &emulate) {
     ps2::start_render_thread();
     if (!std::getenv("PS2_NO_VU_THREAD")) {
         ps2::start_vu_thread();
-        std::thread(ps2::run_vu_thread).detach();
+        HostThread(ps2::run_vu_thread).detach();
     }
     std::atomic<bool> done{false};
     int result = 0;
-    std::thread emulation([&] {
+    HostThread emulation([&] {
         result = emulate();
         done.store(true);
         ps2::wake_render_thread();
@@ -417,14 +501,166 @@ static int run_threads_headless(const std::function<int()> &emulate) {
             std::fclose(f);
         }
     };
-    while (!done.load())
+    while (!done.load()) {
         if (ps2::render_pending(false, pictures.empty() ? none : save, nullptr, 8.0) == ps2::Rendered::idle) ps2::wait_render_work(4);
+#ifdef PS2_PROFILE
+        render_profile.tick();
+#endif
+    }
+#ifdef PS2_PROFILE
+    render_profile.finish();
+#endif
     emulation.join();
     std::fflush(nullptr);
     std::_Exit(result);
 }
 
+#ifdef __SWITCH__
+// The NAME=value lines of launch.txt set before any static object is made, so switches the runtime reads while starting up (PS2_IOP_LOAD
+// and the like) see them as they would see the shell's on the PC. libnx has the arguments and the SD card ready by then.
+// Memory for the GPU (the Vulkan renderer). NVK takes its memory through nvmap, outside the newlib heap, and needs a larger transfer
+// memory than libnx's default; libnx's own heap setup gives newlib everything that is left, so a large GPU allocation could find
+// nothing. The heap is set up as libnx does it, less a reserve for the GPU. The same as NetherSX2's Switch port (source/main.c).
+extern "C" {
+u32 __nx_nv_transfermem_size = 16 * 1024 * 1024;
+extern char *fake_heap_start;
+extern char *fake_heap_end;
+
+void __libnx_initheap(void) {
+    void *addr = nullptr;
+    std::size_t size = 0;
+    if (envHasHeapOverride()) {
+        addr = envGetHeapOverrideAddr();
+        size = envGetHeapOverrideSize();
+    } else {
+        u64 available = 0, used = 0;
+        svcGetInfo(&available, InfoType_TotalMemorySize, CUR_PROCESS_HANDLE, 0);
+        svcGetInfo(&used, InfoType_UsedMemorySize, CUR_PROCESS_HANDLE, 0);
+        if (available > used + 0x200000) size = (available - used - 0x200000) & ~std::size_t{0x1FFFFF};
+        // leave this much unmapped for the GPU: 512 MB with a game's memory (title takeover), 128 MB in the album
+        const std::size_t reserve = std::size_t{size > (std::size_t{2} << 30) ? 512u : 128u} << 20;
+        if (size > reserve + (std::size_t{256} << 20)) size = (size - reserve) & ~std::size_t{0x1FFFFF};
+        if (size == 0) size = 0x2000000 * 16;
+        if (R_FAILED(svcSetHeapSize(&addr, size))) diagAbortWithResult(MAKERESULT(Module_Libnx, LibnxError_HeapAllocFailed));
+    }
+    fake_heap_start = static_cast<char *>(addr);
+    fake_heap_end = static_cast<char *>(addr) + size;
+}
+}
+
+extern "C" char **__system_argv __attribute__((weak));
+extern "C" int __system_argc __attribute__((weak));
+__attribute__((constructor(101))) void switch_early_environment() {
+    if (!&__system_argc || !&__system_argv || __system_argc < 1 || !__system_argv || !__system_argv[0]) return;
+    std::string path = __system_argv[0];
+    const std::size_t slash = path.find_last_of('/');
+    path = (slash == std::string::npos ? std::string() : path.substr(0, slash + 1)) + "launch.txt";
+    std::FILE *f = std::fopen(path.c_str(), "rb");
+    if (!f) return;
+    char line[512];
+    while (std::fgets(line, sizeof line, f)) {
+        std::string s = line;
+        while (!s.empty() && (s.back() == '\n' || s.back() == '\r' || s.back() == ' ')) s.pop_back();
+        const std::size_t eq = s.find('=');
+        if (eq == std::string::npos || eq == 0) continue;
+        if (!std::all_of(s.begin(), s.begin() + static_cast<std::ptrdiff_t>(eq), [](char c) { return std::isupper(static_cast<unsigned char>(c)) || std::isdigit(static_cast<unsigned char>(c)) || c == '_'; }))
+            continue;
+        setenv(s.substr(0, eq).c_str(), s.substr(eq + 1).c_str(), 1);
+    }
+    std::fclose(f);
+}
+
+// The homebrew menu starts an .nro with no arguments: what a command line gives ps2run elsewhere (the program, --disc, --patches,
+// --widescreen and the rest) comes from launch.txt next to the .nro (or in its RomFS), one argument to a line, with paths relative to
+// the folder of the file. scripts/switch_port.py writes it. Without one, the folder is searched for a program and a disc image.
+std::vector<std::string> switch_arguments() {
+    std::error_code error;
+    const auto read_lines = [](const std::string &path, std::vector<std::string> &lines) {
+        std::FILE *f = std::fopen(path.c_str(), "rb");
+        if (!f) return false;
+        std::string text;
+        char buffer[4096];
+        for (std::size_t n; (n = std::fread(buffer, 1, sizeof buffer, f)) > 0;) text.append(buffer, n);
+        std::fclose(f);
+        std::size_t start = 0;
+        while (start <= text.size()) {
+            std::size_t end = text.find('\n', start);
+            if (end == std::string::npos) end = text.size();
+            std::string line = text.substr(start, end - start);
+            while (!line.empty() && (line.back() == '\r' || line.back() == ' ' || line.back() == '\t')) line.pop_back();
+            const std::size_t first = line.find_first_not_of(" \t");
+            if (first != std::string::npos && line[first] != '#') lines.push_back(line.substr(first));
+            start = end + 1;
+        }
+        return true;
+    };
+    for (const std::string dir : {"./", "romfs:/"}) {
+        std::vector<std::string> lines;
+        if (!read_lines(dir + "launch.txt", lines) || lines.empty()) continue;
+        if (dir != "./") chdir(dir.c_str());  // the paths in it are relative to its folder
+        std::fprintf(stderr, "[switch] arguments from %slaunch.txt\n", dir.c_str());
+        // A line NAME=value sets an environment variable instead (PS2_VK_PROFILE=1 and the other switches the PC takes from the shell)
+        std::vector<std::string> args;
+        for (const std::string &line : lines) {
+            const std::size_t eq = line.find('=');
+            const bool setting = eq != std::string::npos && eq > 0 &&
+                                 std::all_of(line.begin(), line.begin() + static_cast<std::ptrdiff_t>(eq), [](char c) { return std::isupper(static_cast<unsigned char>(c)) || std::isdigit(static_cast<unsigned char>(c)) || c == '_'; });
+            if (setting) {
+                setenv(line.substr(0, eq).c_str(), line.substr(eq + 1).c_str(), 1);
+                std::fprintf(stderr, "[switch] %s\n", line.c_str());
+            } else {
+                args.push_back(line);
+            }
+        }
+        return args;
+    }
+    // No launch.txt: the first PS2 program and the first disc image here or in disc/
+    const auto ends_with = [](std::string name, const char *suffix) {
+        std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        const std::size_t n = std::strlen(suffix);
+        return name.size() > n && name.compare(name.size() - n, n, suffix) == 0;
+    };
+    std::string program, disc;
+    for (const std::string dir : {".", "disc"}) {
+        if (!std::filesystem::is_directory(dir, error)) continue;
+        for (const auto &entry : std::filesystem::directory_iterator(dir, error)) {
+            if (!entry.is_regular_file(error)) continue;
+            const std::string name = entry.path().filename().string();
+            const bool boot_program = name.size() == 11 && name[4] == '_' && name[8] == '.';  // SLUS_203.28, SCES_501.48, ...
+            if (program.empty() && (boot_program || name == "core.elf" || ends_with(name, ".elf"))) program = (std::filesystem::path(dir) / name).string();
+            if (disc.empty() && ends_with(name, ".iso")) disc = (std::filesystem::path(dir) / name).string();
+        }
+    }
+    if (program.empty()) return {};
+    std::vector<std::string> args{program};
+    if (!disc.empty()) args.insert(args.end(), {"--disc", disc});
+    args.insert(args.end(), {"--memcard", "memcard.ps2"});  // the game's saves are kept next to the .nro
+    return args;
+}
+
+// Without a console to print to, a start that cannot go on says why on the screen until + is pressed.
+int switch_error(const char *text) {
+    std::fprintf(stderr, "[switch] %s\n", text);
+    consoleInit(nullptr);
+    padConfigureInput(1, HidNpadStyleSet_NpadStandard);
+    PadState pad;
+    padInitializeDefault(&pad);
+    std::printf("ps2run\n\n%s\n\nThe log is ps2run.log next to the .nro.\n\nPress + to return to the homebrew menu.\n", text);
+    while (appletMainLoop()) {
+        padUpdate(&pad);
+        if (padGetButtonsDown(&pad) & HidNpadButton_Plus) break;
+        consoleUpdate(nullptr);
+    }
+    consoleExit(nullptr);
+    return 1;
+}
+#endif
+
 int main(int argc, char **argv) {
+#ifdef __SWITCH__
+    romfsInit();
+    std::atexit([] { romfsExit(); });
+#endif
 #ifdef _WIN32
     connect_output();
     // argv is in the ANSI code page and loses every character outside it: take the UTF-16 command line and use it as UTF-8
@@ -440,7 +676,39 @@ int main(int argc, char **argv) {
         argv = utf8_argv.data();
     }
 #endif
+#ifdef __SWITCH__
+    // The folder of the .nro (the homebrew menu gives its path as argv[0]) is where launch.txt, the program, the disc image, the
+    // memory card and the log are.
+    if (argc >= 1 && argv[0]) {
+        const std::string self = argv[0];
+        const std::size_t slash = self.find_last_of('/');
+        if (slash != std::string::npos) chdir(self.substr(0, slash + 1).c_str());
+    }
+    if (std::FILE *log = std::freopen("ps2run.log", "w", stderr)) std::setvbuf(log, nullptr, _IOLBF, 0);
+    // stdout too, and on descriptors 1 and 2 as well as the C streams: code that writes there directly (Mesa's shader compiler, in
+    // Rust, with NAK_DEBUG) stopped the program when nothing was behind them
+    if (std::FILE *out = std::freopen("ps2run.stdout.log", "w", stdout)) {
+        std::setvbuf(out, nullptr, _IOLBF, 0);
+        if (fileno(out) != 1) dup2(fileno(out), 1);
+    }
+    if (fileno(stderr) != 2) dup2(fileno(stderr), 2);
+    switch_crash_report();  // host/switch_crash.cpp: from here on, a CPU fault names itself in the log instead of cutting it short
+    std::vector<std::string> switch_args;
+    std::vector<char *> switch_argv;
+    if (argc < 2) {
+        switch_args = switch_arguments();
+        if (switch_args.empty()) return switch_error("No PS2 program found: put launch.txt (scripts/switch_port.py writes one) or the game's ELF next to the .nro.");
+        switch_argv.push_back(argv[0]);
+        for (std::string &a : switch_args) switch_argv.push_back(a.data());
+        switch_argv.push_back(nullptr);
+        argc = static_cast<int>(switch_argv.size()) - 1;
+        argv = switch_argv.data();
+    }
+#endif
     if (argc < 2) return usage();
+#ifdef __SWITCH__
+    switch_clock_start();
+#endif
 #ifdef _WIN32
     SetConsoleCtrlHandler(on_console_event, TRUE);
     SetUnhandledExceptionFilter(on_crash);
@@ -450,6 +718,10 @@ int main(int argc, char **argv) {
     std::atexit([] { ps2::flush_memory_card(); });  // whatever way the program ends through exit()
     std::vector<std::string> args{argv[1]};
     [[maybe_unused]] bool window = false, fullscreen = false;
+#ifdef __SWITCH__
+    window = true;
+    fullscreen = true;
+#endif
     std::string load_path;
     bool no_record = false;
     ps2::g_options.program_path = argv[1];
@@ -509,6 +781,13 @@ int main(int argc, char **argv) {
         else if (a == "--quick-dir" && i + 1 < argc) ps2::g_options.quick_dir = argv[++i];
         else return usage();
     }
+
+#ifdef PS2_DEKO3D
+    // PS2_DEKO3D=1 (or =<frames>): stage 0 of the deko3d renderer (runtime/src/gs/gpu/deko/deko_stage0.cpp) instead of the game.
+    // It has to run before open_window() below, because SDL takes the console's window for its own, and deko3d cannot present into a
+    // window that SDL's EGL surface already owns (that is where the Vulkan present path stopped).
+    if (const std::string deko = ps2::os::env("PS2_DEKO3D"); !deko.empty() && deko != "0") return ps2::deko_stage0();
+#endif
 
 #ifdef PS2_WINDOW
     // PS2_NO_LOG_COPY=1 leaves the log alone (no memory copy, no file): the way back if the pipe is ever in the way
@@ -636,10 +915,16 @@ int main(int argc, char **argv) {
 #endif
     };
 #ifdef PS2_WINDOW
-    if (window) return run_window(emulate);
+    if (window) {
+        log_machine();
+        return run_window(emulate);
+    }
 #endif
     // PS2_THREADS=1: a headless run with the three threads of a window run (emulation, vector units, drawing) so that replays and
     // tests can cover the path a player's window takes (docs/sh2.md).
-    if (ps2::os::env("PS2_THREADS") == "1") return run_threads_headless(emulate);
+    if (ps2::os::env("PS2_THREADS") == "1") {
+        log_machine();
+        return run_threads_headless(emulate);
+    }
     return emulate();
 }

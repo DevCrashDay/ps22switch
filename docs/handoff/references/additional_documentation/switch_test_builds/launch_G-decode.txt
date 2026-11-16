@@ -1,0 +1,14 @@
+# ps2run's command line, one argument to a line (host/main.cpp); paths are relative to this folder
+disc/SLUS_203.28
+--disc
+disc.iso
+--memcard
+Tekken-4.ps2
+# clocks while the game runs, in MHz (0 keeps the system's; sys-clk's profile wins unless PS2_CLOCK_FORCE=1)
+PS2_CPU_MHZ=1785
+PS2_GPU_MHZ=921.6
+PS2_MEM_MHZ=1600
+#PS2_CLOCK_FORCE=1
+PS2_GS_HW=1
+PS2_PRESENT_LOG=1
+PS2_HW_DECODE=1
