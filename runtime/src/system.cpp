@@ -31,7 +31,9 @@
 
 #include <algorithm>
 #if !defined(_WIN32) && !defined(__EMSCRIPTEN__)
+#if !defined(__SWITCH__)  // libnx has no dynamic loader
 #include <dlfcn.h>
+#endif
 #include <pthread.h>
 #endif
 #include <atomic>
@@ -1325,7 +1327,7 @@ void note_live_library(Thread kind, const void *inside) {
     const int n = g_live_count.load(std::memory_order_relaxed);
     if (n >= kMaxLive) return;
     std::uint64_t base = 0;
-#if !defined(_WIN32) && !defined(__EMSCRIPTEN__)
+#if !defined(_WIN32) && !defined(__EMSCRIPTEN__) && !defined(__SWITCH__)
     Dl_info info{};
     if (dladdr(inside, &info) && info.dli_fbase) base = reinterpret_cast<std::uint64_t>(info.dli_fbase);
 #endif

@@ -259,7 +259,8 @@ PS2_VU4 unsigned tops(u32x4 m) {
 #if defined(__SSE2__) && (defined(__x86_64__) || defined(__i386__))
     return static_cast<unsigned>(__builtin_ia32_movmskps((f32x4)m));
 #else
-    return __builtin_reduce_or((m >> 31) << u32x4{0u, 1u, 2u, 3u});
+    // the extra parentheses keep the braces' commas inside one argument where gcc_compat.hpp makes this a macro
+    return __builtin_reduce_or(((m >> 31) << u32x4{0u, 1u, 2u, 3u}));
 #endif
 }
 

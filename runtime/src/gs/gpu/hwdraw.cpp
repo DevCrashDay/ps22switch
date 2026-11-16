@@ -212,6 +212,8 @@ double resident_mb() {
     mach_msg_type_number_t n = MACH_TASK_BASIC_INFO_COUNT;
     if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO, reinterpret_cast<task_info_t>(&info), &n) != KERN_SUCCESS) return 0.0;
     return static_cast<double>(info.resident_size) / (1024.0 * 1024.0);
+#elif defined(__SWITCH__)
+    return 0.0;  // no /proc and no sysconf in libnx
 #else
     long pages = 0, resident = 0;
     if (std::FILE *f = std::fopen("/proc/self/statm", "r")) {
