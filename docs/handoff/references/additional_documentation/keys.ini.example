@@ -1,0 +1,76 @@
+# keys.ini: which key or mouse button works which button of the game's controller.
+#
+# Change a line, save the file, click back into the game window: the new keys are used at once.
+# Delete the file to get the original keys back (it is written again the next time the game starts).
+#
+# A line is   name = key, key, key   (several keys for one button are fine; 'none' means no key).
+# Keys are written the English way: Space, Enter, Esc, Tab, Left Shift, Left Ctrl, Backspace, Up, Down, A, B, 1, 2, ...
+# and mean the place on the keyboard, whatever is printed there: on a German keyboard 'Z' is the key labelled Y.
+# Mouse: Left Mouse, Right Mouse, Middle Mouse, Mouse X1 and Mouse X2 (the two side buttons), Wheel Up, Wheel Down.
+# F1, F2, F5, F8, F9 and F11 belong to the program (key card, picture look, quick save, quick load, problem report, full screen).
+# A line that cannot be read is ignored and written to the log (logs folder); the rest still works.
+
+# D-pad: the menus, and whatever the game does with it
+dpad_up     = W
+dpad_down   = S
+dpad_left   = A
+dpad_right  = D
+
+# left stick (walking): all the way in one direction; two keys make a diagonal
+left_up     = 8
+left_down   = 5
+left_left   = 4
+left_right  = 6
+
+# right stick (God of War II: the evade roll; most games: the camera)
+right_up    = I
+right_down  = K
+right_left  = J
+right_right = L
+
+# the four buttons on the right
+cross       = Down
+circle      = Right
+square      = Left
+triangle    = Up
+
+# the four shoulder buttons
+l1          = Q
+r1          = E
+l2          = t
+r2          = z
+
+# the sticks pressed in
+l3          = X
+r3          = C
+
+# Start and Select
+start       = v
+select      = c
+
+# roll: while it is held, the walk keys push the right stick as well, which is God of War's evade roll
+roll        = Left Ctrl, Mouse X1
+
+# one key that presses L3 and R3 together (God of War's rage)
+rage        = V
+
+# the key card (F1 shows it as well)
+help        = H
+
+# The mouse can also push a stick (off, left or right). Off: the mouse only clicks. On: the pointer is locked in the window
+# and moving the mouse pushes that stick; mouse_speed is how far (1 is a good start). mouse_invert turns a direction
+# round: off, x (left and right), y (up and down) or both. mouse_deadzone (0 to 90 percent) pushes the stick that far
+# as soon as the mouse moves, for games that ignore a stick pushed only a little.
+mouse_stick = off
+mouse_speed = 1
+mouse_invert = off
+mouse_deadzone = 0
+
+# How the picture is enlarged to the window (F2 in the game goes through these and writes the choice here):
+#   sharp_edges   sharp, and the jagged stairs along edges are smoothed (the default)
+#   sharp         a cubic enlargement plus light sharpening: text and the health bar keep their edges
+#   crisp         hard pixels, only their borders blend
+#   crisp_edges   crisp, and the jagged stairs along edges are smoothed
+#   soft          a smooth blend, like an old TV
+#   soft_edges    soft, and the jagged stairs along edges are smoothed
+look = sharp_edges
