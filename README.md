@@ -1,104 +1,92 @@
-# ps22switch: Recompiling PS2 Games for Nintendo Switch
+# ps2-native-recomp
 
-Turns the disc image of a PS2 game you own into a native, standalone homebrew executable (`.nro`) for the **Nintendo Switch (Switch 1)**, or into a native program for Windows / Linux.
+Turns a PS2 game disc you own into a native Windows or Linux program by static recompilation: the code of the PS2's
+main processor is translated to C++ and compiled, and the rest of the console is emulated. 19 games work as far as they
+have been tested, 13 of them out of the box, with zero game-specific code. God of War II has been played from start to
+end. **This project is at an early stage** and still changes a lot.
 
-Based on [ps2-native-recomp](https://github.com/exoteric33/ps2-native-recomp) and [ps2-web-recomp](https://github.com/snuri00/ps2-web-recomp) by Samir Nuri.
+**How it works, from the disc to the picture: [read the explanation](#how-it-works).**
 
----
+Built on [ps2-web-recomp](https://github.com/snuri00/ps2-web-recomp) by Samir Nuri (MIT).
 
-## How It Works on Nintendo Switch
+https://github.com/user-attachments/assets/32487cfd-b222-4e72-9c46-1fe71fafbd08
 
-1. **CPU Static Recompilation (Emotion Engine MIPS R5900):**
-   The game's MIPS R5900 machine code is analyzed and statically translated once into portable modern C++20 units via `eerecomp`. These units are cross-compiled directly for the Nintendo Switch ARMv8-A Cortex-A57 64-bit CPU cores using `devkitA64` (`aarch64-none-elf-gcc`). There is **zero CPU emulation overhead** at runtime.
+**13 games ran out of the box, with zero game-specific code:** God of War, Gran Turismo 4, Tekken 4, The King of Fighters XI, God Hand, Ecco the
+Dolphin: Defender of the Future, The Super Dimension Fortress Macross, Armored Trooper VOTOMS, Ben 10: Alien Force, Samurai
+Western, Thunder Force VI, Raiden III and Heavenly Guardian. *Out of the box* means nobody changed anything for these games: the
+tool recompiled the disc as it is, and the game played (as far as it has been played, see [*What runs*](#what-runs)). Gran Turismo 4 needs one small build step that
+unpacks its program; the runtime has no code for it.
 
-2. **Vector Units (VU0 / VU1):**
-   The VU1 programs the exploring runs on the PC recorded are statically translated to C++ (vector code that GCC turns into ARM NEON). A program the build does not know is interpreted: the Switch has no compiler to translate it while the game runs, so the more of the game the PC runs saw, the faster it plays.
+**The goal is a universal tool:** any PS2 game, recompiled the same way, with no work for each game. When a game doesn't run
+yet, the fix goes into the tool, so it helps every game.
 
-3. **Graphics Synthesizer (GS):**
-   Drawn on the Switch's GPU with Vulkan through Mesa's NVK driver (the same driver build OpenTrickyNX uses). The renderer is
-   the PC's own WebGPU drawing program: `runtime/src/gs/gpu/vk` implements the WebGPU calls it makes on Vulkan, and
-   `scripts/wgsl_spirv.py` turns its shader into SPIR-V with naga (run it after changing `gs.wgsl`). On the PC the same
-   layer draws Tekken 4 pixel for pixel like wgpu-native (`-DPS2_VULKAN=ON -DPS2_VULKAN_INCLUDE=<folder with vulkan/vulkan.h>`).
-   The finished picture is shown through SDL2. `--software` builds with the old software renderer instead (far too slow).
+**Don't expect every game to work on the first try.** Only a few games have been tried so far, and each game uses the
+console a little differently, so many still stop at a black screen, crash, or play with missing sound or wrong pictures.
+When a game doesn't work, please send me a report (see [*Playtesters wanted*](#playtesters-wanted)): every report shows
+me what to fix next, and one fix often helps several games at once.
 
-4. **Audio (SPU2):**
-   The PS2 SPU2 synthesizer streams 48,000 Hz stereo audio with dynamic time stretching directly into the Nintendo Switch SDL2 audio driver.
+## What it does
 
-5. **Controls:**
-   Native support for Joy-Cons and Nintendo Switch Pro Controllers through the libnx SDL2 GameController API.
+- **Turns your disc into a PC game:** in the app, choose the disc image, press *Build*, then *Play*. You get a program of
+  its own with a desktop shortcut. The app downloads its own build tools, so nothing has to be installed.
+- **Windows and Linux**, drawing through Direct3D 12 or Vulkan.
+- **Keyboard and mouse or a game controller**, with a key card (F1) and keys you can change.
+- **Saving:** quick saves (F5 and F8) and the game's own memory card saves.
+- **A clearer picture:** sharper text and HUD, smoother edges, picture styles to switch between (F2), and twice the
+  resolution on a strong graphics card.
+- **Widescreen and other patches** from PCSX2's community, picked in the app.
+- **Smooth sound** when a game runs below full speed: it is stretched instead of chopped.
+- **Nothing left out:** game code the first build did not see is translated while you play and kept for the next start.
 
----
+## How far it is
 
-## Quick Start for Nintendo Switch
+Still early: the project went public on 28 October 2026. God of War II has been played from start to end. 18
+other games play well as far as testers got, among them God of War, Gran Turismo 4, Resident Evil 4, Silent Hill 2,
+Shadow of the Colossus and Tekken 4 (the full list is in [*What runs*](#what-runs)). Most PS2 games have not been tried
+yet, and some still stop at a black screen or crash. 54 of the 55 programs of a free PS2 test suite print exactly what a
+real console prints. **It is not faster than PCSX2 yet:** on the same laptop PCSX2 is faster in every scene I measured (see
+[*Not faster than PCSX2 yet*](#not-faster-than-pcsx2-yet)).
 
-### Prerequisites
-- Windows 10/11 with WSL2 and a distribution named `devkita64` holding devkitPro's devkitA64, libnx and `switch-sdl2`,
-  with `switch-cmake` / `switch-ninja` wrappers in `/usr/local/bin` (`--wsl-distro` picks another name). On Linux,
-  devkitPro installed directly (`$DEVKITPRO`) is used instead.
-- The Mesa NVK SDK for the Switch: `mesa-switch-nvk-sdk.zip` from the `nvk-sdk` release of
-  [OpenTrickyNX](https://github.com/DevCrashDay/OpenTrickyNX/releases/tag/nvk-sdk), unzipped into `tools/nvk-sdk`
-  (or `--nvk-sdk <its portlibs/switch folder>`).
-- What the native build needs on the PC (Git Bash and the translator tools: run `Start.cmd` once, or `scripts/setup.sh --native-only`).
-- Python 3
+## Why recompile instead of emulate
 
-### Building with One Command
-1. Place your PS2 game ISO (e.g. `Tekken 4 (USA).iso`) in the project directory.
-2. Run `Switch_Build.cmd` or invoke `scripts/switch_port.py`:
-   ```cmd
-   Switch_Build.cmd "Tekken 4 (USA).iso"
-   ```
-   Or via Python:
-   ```cmd
-   python scripts/switch_port.py "Tekken 4 (USA).iso" --title "Tekken 4"
-   ```
-3. The build pipeline automatically:
-   - Runs `scripts/port.sh --native-only` on the PC: extracts the boot program, translates its MIPS R5900 code to C++,
-     runs the game headless to find the code the static pass missed and compiles the VU1 programs those runs recorded.
-     This step matters more than on the PC: the Switch build cannot compile code it meets while the game runs, so code
-     the PC runs never reached stops the game there. `--pnach`, `--widescreen`, `--frames` and `--rounds` are passed on.
-   - Cross-compiles `ps2runtime` and the game's C++ for AArch64 with devkitA64 (`-ffp-contract=off`, so the PS2's
-     floating point results come out the same as on the PC).
-   - Packages the `.nro` with its NACP title and metadata.
-   - Creates a ready-to-use SD card folder under `build/switch/<GameName>/package/`, with the disc image copied in
-     (`--no-disc-copy` leaves that to you) and `launch.txt`, the command line the `.nro` starts the game with.
-   - `--skip-port` rebuilds the `.nro` from what an earlier run left in `generated/<GameName>`.
+An emulator works like a whole PS2 inside your PC: while you play, it reads the game's code piece by piece and works out
+what each piece means. This project does the biggest part of that work once, before you play: it translates the code of
+the PS2's main processor into C++ and compiles it into a normal program. That gives you:
 
-### Installing to your Switch
-Copy the `switch` folder from `build/switch/<GameName>/package/` to the root of your Switch SD card:
-```
-sdmc:/
-  └── switch/
-      └── ps22switch/
-          └── <GameName>/
-              ├── <GameName>.nro
-              ├── launch.txt       the program, disc image and options, one argument to a line
-              ├── disc/<boot program>
-              ├── disc.iso         the game reads its files from the disc image while it runs
-              ├── patches.txt      when PCSX2 patches were applied
-              └── keys.ini
-```
-Launch the game from the **Homebrew Menu (hbmenu)**, preferably started by holding R while starting a game (title
-takeover gives homebrew all of the memory and processor time; the album applet gives less). The game runs on three of
-the Switch's cores (emulation, vector units, drawing), its log goes to `ps2run.log` and its saves to `<GameName>.ps2`,
-both next to the `.nro`. Without `launch.txt` the `.nro` looks for a boot program and an `.iso` in its folder and in `disc/`.
+- **A real PC program for each game**, with its own shortcut, instead of an emulator with a game loaded into it.
+- **No translating while you play:** the main processor's code is already translated, so the PC does not have to work
+  it out piece by piece. That part is fast, but it is only a small part of the work (see below).
+- **A game whose code can be changed:** fixes and improvements can go right into the game itself, not only around it.
+  That is what opens the door to the ideas below.
 
----
+### Not faster than PCSX2 yet
 
-- **Windows:** the recompiler, the runtime and the game build with llvm-mingw and draw through Direct3D 12 or Vulkan.
-- **Faster drawing:** the graphics chip's drawing program does about a fifth less work per frame, with the same pictures
-  pixel for pixel. On Windows it is compiled with Microsoft's newer shader compiler and drawn through Direct3D 12 by
-  default, and the processor side (game, vector units, window) no longer holds the game back.
-- **A clearer picture:** a new scaling step with light sharpening keeps text and the HUD crisp, slanted edges are
-  smoothed, shadows are solid instead of dotted, and faces move as they should (Silent Hill 2).
-- **An app for players:** choose a disc image, press *Build*, press *Play*. It downloads its own build tools, so nothing
-  has to be installed.
-- **Code translated while you play:** game code and graphics programs the first build did not see are translated in the
-  background while the game runs, and kept for the next start.
-- **More games:** God of War, Gran Turismo 4 (US), Silent Hill 2, Resident Evil 4 and Shadow of the Colossus run too,
-  with fixes in the runtime where they needed them.
-- **Playing:** keyboard and mouse controls with a key card, quick saves, sound that is stretched instead of chopped when
-  the game runs below full speed, picture styles to switch between, and PCSX2's community patches (widescreen and more)
-  to pick in the app.
+I measured both on the same laptop (Intel Core 5 120U with its built-in Intel graphics, Windows 11, November 2026), in
+the same scenes, at the PS2's own resolution. **PCSX2 was faster in every scene.** But the goal still is to beat PCSX2
+performance-wise.
+
+PCSX2 also runs far more games today and has many years of work behind it. If your game doesn't run here yet, or runs too
+slowly, PCSX2 is the better choice for now.
+
+Under the hood, the rest of the console (graphics chip, vector units, sound, disc, controller, memory card) is rebuilt
+in a runtime that draws with WebGPU (wgpu-native, on Vulkan or Direct3D 12). [How that works](#the-graphics-chip).
+
+## Ideas for later
+
+Not promises, just where this can go:
+
+- **An in-game menu** for resolution, picture look and 16:9.
+- **A folder you can move:** the game program and your disc image together, to take to another PC.
+- **60 fps** for games that run at 30, where the game allows it, and **mods** that change the game's code directly.
+- **Faster than PCSX2**, so more games reach full speed on built-in laptop graphics (today it is slower, see above).
+- **The Steam Deck and other handhelds:** Linux already works; it needs testing there.
+- **More games:** every report shows me what to fix next.
+
+## Offline runtime inspection
+
+Developers can request exact screenshot frames and opt-in EE RAM window captures for repeatable offline recompilation
+work. See [`docs/aot-window-capture.md`](docs/aot-window-capture.md). Capturing RAM does not itself prove that a
+translated cache is complete or correct; the offline build and cache validation must establish that.
 
 ## What runs
 
@@ -112,12 +100,19 @@ Tried with real discs (mine are US releases), as far as each was played (no know
 | Resident Evil 4 | plays well, not played through yet: the menus, the opening, Leon in the forest | me |
 | Silent Hill 2 | plays well, not played through yet: the opening at the rest stop and about 20 minutes of play from there but works fine| me |
 | Shadow of the Colossus | plays well, not played through yet: played like 30 minutes that went very well | me |
+| Grand Theft Auto III | plays well, not played through yet: from power-on through the first mission, and the game's own save and load work, also in 16:9 | Chewing_Character, me |
 | The Super Dimension Fortress Macross | plays well, not played through yet: menus and gameplay at about 60 fps (Windows 11, a laptop with Intel graphics, a game controller; [#3](https://github.com/exoteric33/ps2-native-recomp/issues/3)) | omegakatana92 |
 | The King of Fighters XI | plays well, not played through yet: works perfectly | TsimpleD (Reddit) |
 | God Hand | plays well, not played through yet: as far as the casino hub, no problems so far | theraineydaze (Reddit) |
 | Tekken 4 | plays well, not played through yet: fights in Story Battle at 60 fps, only a short stutter when a fight starts (Windows 11, a Radeon RX 6800 XT, keyboard and mouse; [#8](https://github.com/exoteric33/ps2-native-recomp/issues/8)) | DevCrashDay |
+| Tekken 5 | plays well, not played through yet: first a black screen, reported and tested by DevCrashDay and UserGit-2021 ([#6](https://github.com/exoteric33/ps2-native-recomp/issues/6)); after the fix I played a fight on Linux | DevCrashDay, UserGit-2021, me |
 | Armored Trooper VOTOMS (Japan) | plays well, not played through yet: the tutorial and the first mission at about 60 fps, and saves work; it slowed down once, the first time a new part loaded (Windows 11, a laptop with Intel graphics, a game controller; [#5](https://github.com/exoteric33/ps2-native-recomp/issues/5)) | omegakatana92 |
 | Ben 10: Alien Force | plays well, not played through yet: works very well, no problems so far | Travani |
+| Samurai Western (Europe) | plays well, not played through yet: from the opening film into the game at 49 to 60 fps, with short slowdowns while new parts appear; the US disc gets there too but slows down more (Windows 11, a laptop with Intel graphics, a game controller; [#19](https://github.com/exoteric33/ps2-native-recomp/issues/19)) | omegakatana92 |
+| Thunder Force VI (Japan) | plays well, not played through yet: to the second boss, smooth (Windows 11, a laptop with AMD graphics, a game controller; [#21](https://github.com/exoteric33/ps2-native-recomp/issues/21)) | Pacioso |
+| Raiden III | plays well, not played through yet: to the second stage, smooth (Windows 11, a laptop with AMD graphics, a game controller; [#25](https://github.com/exoteric33/ps2-native-recomp/issues/25)) | Pacioso |
+| Heavenly Guardian (USA) | plays well, not played through yet: to the first boss, smooth (Windows 11, a laptop with AMD graphics, a game controller; [#28](https://github.com/exoteric33/ps2-native-recomp/issues/28)) | Pacioso |
+| Ecco the Dolphin: Defender of the Future (USA) | plays well, not played through yet: the first level, smooth (Windows 11, a laptop with AMD graphics, a game controller; [#30](https://github.com/exoteric33/ps2-native-recomp/issues/30)) | Pacioso |
 
 Known not to work yet (reported by playtesters, on my list to fix):
 
@@ -168,7 +163,7 @@ You need git, clang, CMake, Ninja, Python 3, the SDL2 development files and a Vu
 `bash scripts/setup.sh --native-only` and `bash scripts/port.sh mygame "My Game.iso" --native-only`, and run the line it
 prints. Checked on CachyOS with an NVIDIA graphics card.
 
-On macOS the original project builds and runs (on Metal); my changes have not been tried on a Mac yet.
+**macOS:** [n0madic](https://github.com/n0madic) is the macOS maintainer: builds and tests it on an Apple Silicon Mac and looks after Mac issues and pull requests. GitHub also builds every change on macOS.
 
 ## Playing
 
@@ -191,7 +186,194 @@ programs are translations of the game's own code and belong to the game's owners
 not share them. Please do not ask for disc images here. There is no decryption or copy-protection code in this repo
 (PS2 discs need none).
 
+## How it works
+
+This explains the idea and what happens to a game, without going through the code. The basic design comes from the original
+project, [ps2-web-recomp](https://github.com/snuri00/ps2-web-recomp): a translator plus a runtime, and the graphics chip as
+programs on the graphics card. Windows, translating during play and most of the compatibility work came later.
+
+### The idea
+
+A PS2 game is machine code for the console's processors. Here the code of the main processor is translated to C++ once,
+before you play, and an ordinary compiler turns it into an ordinary program.
+
+Only the main processor works that way. The game still expects a whole PS2 around it, so the program also carries a
+*runtime*: C++ code that behaves like the rest of the console. The translated game writes to the graphics chip, starts
+transfers and calls the system as it would on a PS2, and the runtime answers.
+
+```mermaid
+flowchart LR
+    subgraph once["Once per game: the build"]
+        disc["Your disc image"] --> tr["Translator: game code to C++"]
+        tr --> cc["C++ compiler"]
+        cc --> game["A program of its own"]
+        game -.->|"test runs find missed code"| tr
+    end
+    subgraph play["While you play"]
+        ee["Main processor: the translated game"] -->|"3D data"| vu["Vector units"]
+        vu -->|"shapes"| gs["Graphics chip: programs on your graphics card"]
+        ee <-->|"requests"| iop["Second processor: sound, disc, pads, memory card"]
+    end
+    game --> play
+```
+
+| Part of the PS2 | Its job | Here |
+|---|---|---|
+| Emotion Engine (EE), the main processor | runs the game | translated to C++ ahead of time |
+| Vector units (VU0, VU1) | small processors for 3D maths, running short programs | programs translated ahead of time where they are known, otherwise interpreted (read and run one instruction at a time) |
+| Graphics Synthesizer (GS) | draws shapes into its own 4 MiB of memory | compute programs on your graphics card |
+| IOP, the second processor | runs driver programs from the game's disc | interpreted |
+| SPU2 and IPU | the sound chip and the film decoder | rebuilt in C++ |
+| Kernel (the BIOS system services) | threads, interrupts, starting programs | rebuilt in C++; no BIOS image is used |
+| Disc, memory card, pads | | the disc image is read directly, the card is a file, the pads are your keyboard, mouse or controller |
+
+### Building a game
+
+1. **Find the program.** A small text file on the disc names the game's main program, and the build extracts it. Patches
+   such as widescreen are applied to it now, because a change to the code has to be in the translation. Gran Turismo 4 needs
+   one step written just for it: its program is packed on the disc and is unpacked first.
+2. **Find the code.** A program file mixes code and data. The translator starts where the program starts and follows every
+   jump and call. Then it looks for what that cannot reach: addresses the code builds, jump tables, and places that look like
+   the start of a function. A guess only counts if what is there decodes as code up to a return.
+3. **Test runs.** Some code is only reached through addresses the game computes while running. So the build runs the game
+   without a window for up to 3,600 frames (a minute of game time), pressing Start and Cross on a timer. When the game jumps
+   somewhere with no translation, the run stops and notes the address, and the build translates again. This repeats up to 8
+   times, until a run finds nothing new. The same runs record the programs the game sends to its vector units.
+4. **Compile.** The generated C++ and the runtime become one program. This is the part that takes several minutes.
+
+### How game code becomes C++
+
+The game's memory is cut into blocks of 16 KiB, and each block with code becomes one C++ function that can be entered at any
+place the game may jump to.
+
+- **Registers** are a structure in memory, 128 bits each. An instruction such as an addition becomes one line of C++ on that
+  structure, and the compiler optimises the rest.
+- **Memory.** The PS2's 32 MiB of RAM is one array, so a normal load or store is a plain array access. Any other address
+  (a chip's registers, say) takes a slower route that works out what it means.
+- **Delay slots.** On this processor the instruction after a branch still runs before the branch happens. The translator
+  moves it into the code of the branch.
+- **Calls.** A function call in the game is a C++ function call. Afterwards the caller checks that the game came back where
+  it expected. If it did not (a thread switch, say), the C++ calls unwind to a central loop that goes on at the right address.
+- **Floating point.** The PS2's rules differ from the PC's: no infinity, different rounding. The runtime does that maths with
+  integer arithmetic, so the bits come out the same.
+- **Time.** Every instruction counts as one cycle. At the end of a loop the code checks whether its slice of time is used up,
+  and if so the runtime does whatever is due.
+
+### Code the build did not see
+
+Games load more code from the disc while they run, sometimes different code into the same memory. No build can have seen
+all of it. When the game jumps to code that has no translation, it waits while this happens:
+
+1. The program copies that code out of memory and translates it, with the same translator as the build.
+2. A real C++ compiler turns the result into a small library. (So a C++ compiler must be on the PC; the app brings its own.)
+3. The library is loaded into the running program, and the game goes on.
+
+That wait is the pause you may see the first time you reach a new place. A larger piece of code is built quickly first,
+and a better version is built in the background and takes over. Because memory can change, each translated piece keeps a few
+of the original instructions and is only used while those still match what is in memory. Everything is kept on disk, so the
+same place does not pause again.
+
+### The kernel and the second processor
+
+There is no BIOS. The system services a game calls (threads, semaphores, interrupt handlers, alarms) are rebuilt in C++. A
+game thread is a saved set of registers, and one runs at a time, as on the console.
+
+The game does not talk to the sound chip, pads, memory cards or disc itself. It loads driver programs onto the second
+processor, the IOP, and sends them requests. Those drivers come from the game's disc and really run, on an interpreter,
+talking to rebuilt hardware. What they expect from the IOP's own system (threads, timers, files) is rebuilt in C++, and a few
+services such as disc reads and module loading are answered directly.
+
+### The vector units
+
+These two small processors do the 3D maths. VU1 takes the game's 3D data, transforms it and sends finished shapes to the
+graphics chip. Games upload the programs for them while running.
+
+The test runs record every program a game uploads, and each one is translated to C++ that uses the PC's SIMD instructions
+(one instruction working on several numbers). The console's exact rules for rounding and flags stay in, and how long an
+instruction has to wait for an earlier result is worked out at translation time, so nothing has to simulate that while the
+game runs. While playing, a program is recognised by a fingerprint of its code. If it is known, the compiled version runs.
+If not, the interpreter runs it, and an unknown VU1 program is compiled in the background and switched in.
+
+### The graphics chip
+
+This is where most of the time goes. The GS keeps pictures and textures in the same 4 MiB of memory, in a scrambled layout of
+its own (pixels are not stored row by row), and games rely on that: they draw into memory and then read the same memory as a
+texture. So here that memory is one big buffer on your graphics card, in the console's own layout, and all drawing is done by
+compute programs, general programs that run on the graphics card:
+
+1. Shapes are collected into batches.
+2. The screen is cut into tiles of 8 by 8 pixels, and each tile gets a list of the shapes that touch it, in drawing order.
+3. One thread per pixel walks its tile's list in order and does what the chip does for each shape that covers it: texture
+   lookup, alpha test, depth test, blending, writing the result.
+
+Each pixel is handled by one thread, so the order stays right without any locking. When a batch reads memory it also writes
+(glow and blur effects do this), it reads a copy made first.
+
+The picture you see is read from that memory by another compute program, which works like the console's display circuit, and
+is then scaled to your window. The picture styles (F2) only touch that last step. At twice the resolution each PS2 pixel is
+stored as 4 samples, at three times as 9. There is also a version of the same drawing in plain C++, used for checking and when
+no graphics API can be opened.
+
+The gain is exactness: the program controls every bit of memory and every step of the arithmetic. The cost is that every pixel
+goes through a general-purpose program, with the scrambled address worked out before each read and write. That is the main
+reason it is [slower than PCSX2](#not-faster-than-pcsx2-yet) today.
+
+### Keeping everything in time
+
+On a real PS2 all of this runs side by side. Here everything follows one clock, the main processor's 294.912 MHz, and a list
+of what is due next: the next TV picture, a timer, the end of a disc read. The game runs until the next event is due, then the
+runtime handles it. The IOP runs at 1/8 of that clock and catches up whenever it needs to, and the sound chip makes 48,000
+samples per second of game time.
+
+Your PC runs three main threads, joined by queues:
+
+- **The emulation thread:** the game, the kernel, the IOP and the sound chip.
+- **The vector-unit thread:** VU1 and its data.
+- **The window thread:** the graphics chip's work, the window, keyboard, mouse and controllers.
+
+The game may run up to two pictures ahead of the drawing. The sound device sets the pace: the game waits when more than about
+80 ms of sound is queued. Input is taken once per frame, so the same input gives the same game, however fast your PC is.
+
+### Sound and films
+
+The sound chip has two cores of 24 voices each. A voice decodes compressed samples and applies its volume curve and pitch, and
+the cores mix the voices and add reverb. If the game runs slower than real time, the sound would be chopped, so it is played
+slower at the same pitch instead, down to a fifth of its speed. At full speed it passes through untouched. Films use the
+console's MPEG-2 decoder, which is rebuilt too: the game sends it the stream and gets pictures back.
+
+### Saves and checks
+
+A quick save is the whole machine in one file: memory, registers, all the chips. The game's own saves go to a memory card file,
+which is written through a temporary file, so it is always a whole card.
+
+Every window run records the pad and, every 15 frames, a fingerprint of the machine. Playing that recording again without a
+window shows whether the game goes exactly the same way, and where it first differs. That, and comparing the whole machine and
+the pictures before and after a change, is how a fix is checked against games that already work. The free
+[ps2autotests](https://github.com/unknownbrackets/ps2autotests) programs give a second check: 54 of 55 print exactly what a real
+console prints. GitHub builds every change on Linux and macOS; Windows I build and test on my own PCs.
+
+### What it stands on
+
+Drawing goes through [wgpu-native](https://github.com/gfx-rs/wgpu-native) (WebGPU), which uses Direct3D 12 or Vulkan, and Metal
+on a Mac. SDL2 gives the window, the input and the sound device. On Windows it is built with llvm-mingw (clang) instead of Visual
+Studio, because the code uses clang's vector features and llvm-mingw is a plain zip that the app can download by itself. The app
+runs the same build steps as the command line.
+
+### What it does not do
+
+- **Speed.** It is slower than PCSX2 in every scene I measured, mostly because of the graphics chip's programs.
+- **Exact timing.** One cycle per instruction, with no caches and no memory delays. Transfers, vector programs and drawing take no
+  game time at all. A game that races two processors against each other or measures such things can go wrong.
+- **Exact pictures.** The drawing follows the chip's rules as far as they are known and tested, but wrong pictures happen.
+- **Faults.** There is no memory protection or fault handling like on the console. A game that depends on it does not work.
+- **Patches written into memory while the game runs** have no effect on translated code.
+- **Some hardware.** There is nothing yet for the network adapter, USB devices, a multitap, light guns or the camera.
+- **Most games** have not been tried. A game is only known to work if somebody played it (see [*What runs*](#what-runs)).
+
 ## Credits and license
+
+The recompiler and the runtime started as [ps2-web-recomp](https://github.com/snuri00/ps2-web-recomp) by Samir Nuri,
+which also runs on macOS and in the browser; its README explains how the recompiler and the runtime work.
 
 MIT, see [LICENSE](LICENSE): the original copyright is Samir Nuri's, and my changes are under the same license. The VLC
 tables of the MPEG decoder are adapted from [Play!](https://github.com/jpd002/Play-) (BSD 2-clause, notice in
@@ -203,3 +385,36 @@ own discs.
 
 PlayStation and PS2 are trademarks of Sony Interactive Entertainment. All game names are trademarks of their owners. This
 project is not affiliated with or endorsed by Sony or any game publisher.
+
+### Native window title
+
+Launchers can set `PS2_WINDOW_TITLE` to a game's display name. For example:
+
+```sh
+PS2_WINDOW_TITLE="My Game" ./ps2run game.elf --window
+```
+
+The name stays first in the window title, followed by any temporary key/save notice and the runtime's speed statistics.
+Leaving the variable unset or empty keeps the default title. The RAM statistic is the process's current resident memory;
+on macOS it is read through Mach rather than Linux's `/proc`.
+
+### GPU readback diagnostics
+
+Set `PS2_READBACK_LOG=1` before launching to report CPU-visible waits for GPU memory:
+
+```sh
+PS2_READBACK_LOG=1 ./ps2run game.elf --window
+```
+
+Synchronous `[readback]` lines show the emulation frame, byte count, `encode/submit`
+(command encoding/submission and callback preparation), `map-wait` (mapping request
+and wait for its callback), and `copy` (mapped-range access, CPU copy and unmap),
+all in milliseconds. Asynchronous lines show the frame, transfer serial, byte
+count and the time spent waiting when the transfer is finished; they do not
+measure the transfer's full lifetime or its final CPU copy.
+
+These are wall-clock intervals, including driver and GPU queue waits, not GPU
+timestamp measurements. The frame identifies when the log is emitted, which may
+be ahead of the rendering thread. Only reads with a measured wait/encoding
+interval of at least 10 ms are reported: the first 20, then every 100th slow read
+across both paths. With the variable unset, no readback timers or lines are added.

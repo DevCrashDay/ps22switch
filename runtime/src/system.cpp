@@ -1,4 +1,3 @@
-#include "ps2/part.hpp"
 #include "dmac.hpp"
 #include "gs/gif.hpp"
 #include "vif.hpp"
@@ -55,6 +54,11 @@ namespace ps2 {
 
 Cpu g_cpu;
 Options g_options;
+
+bool frame_capture_requested(std::uint64_t frame) {
+    if (g_options.frame_every && frame % g_options.frame_every == 0) return true;
+    return std::binary_search(g_options.frame_capture_frames.begin(), g_options.frame_capture_frames.end(), frame);
+}
 
 // What the game's controller port gets: the pad state of one port as the host tells it. The host (window thread) writes g_pad_in at any
 // time; the emulation takes it over once per frame (latch_pads), so a run is the same however the host's timing falls. The recording
@@ -289,6 +293,91 @@ void report_load() {
 
 void vblank() {
     ++g_frames;
+    // Offline EE cache preparation: capture only explicitly requested frames.
+    // Disabled for normal runs; the filenames retain the frame and address so
+    // a headless preparer can associate each image with the scripted input.
+    static const auto aot_capture = [] {
+        struct Config {
+            std::string dir;
+            std::vector<std::uint64_t> frames;
+            std::vector<std::uint32_t> bases;
+        } config;
+        config.dir = os::env("PS2_CAPTURE_AOT_DIR");
+        const std::string list = os::env("PS2_CAPTURE_AOT_FRAMES");
+        const std::string base_list = os::env("PS2_CAPTURE_AOT_BASES");
+        if (config.dir.empty() || list.empty() || base_list.empty()) return config;
+        const auto parse_list = [](const std::string &text, bool addresses, auto &output) {
+            std::size_t at = 0;
+            while (at < text.size()) {
+                const std::size_t next = text.find(',', at);
+                const std::string token = text.substr(at, next == std::string::npos ? next : next - at);
+                const char *digits = token.c_str();
+                int radix = 10;
+                if (addresses && token.size() > 2 && token[0] == '0' &&
+                    (token[1] == 'x' || token[1] == 'X')) {
+                    digits += 2;
+                    radix = 16;
+                }
+                char *end = nullptr;
+                const auto value = std::strtoull(digits, &end, radix);
+                if (end == digits || *end) { output.clear(); return false; }
+                output.push_back(value);
+                if (next == std::string::npos) break;
+                at = next + 1;
+            }
+            return !output.empty();
+        };
+        if (!parse_list(list, false, config.frames)) {
+            std::fprintf(stderr, "[aot-capture] invalid PS2_CAPTURE_AOT_FRAMES list\n");
+            return config;
+        }
+        std::vector<std::uint64_t> parsed_bases;
+        if (!parse_list(base_list, true, parsed_bases)) {
+            std::fprintf(stderr, "[aot-capture] invalid PS2_CAPTURE_AOT_BASES list\n");
+            config.frames.clear();
+            return config;
+        }
+        for (const auto base : parsed_bases) {
+            constexpr std::uint32_t unit = 0x4000u;
+            if (base == 0 || base > kRamSize - unit || base % unit != 0) {
+                std::fprintf(stderr, "[aot-capture] invalid EE RAM base: %llX\n",
+                             static_cast<unsigned long long>(base));
+                config.frames.clear();
+                config.bases.clear();
+                return config;
+            }
+            config.bases.push_back(static_cast<std::uint32_t>(base));
+        }
+        std::sort(config.frames.begin(), config.frames.end());
+        config.frames.erase(std::unique(config.frames.begin(), config.frames.end()), config.frames.end());
+        std::sort(config.bases.begin(), config.bases.end());
+        config.bases.erase(std::unique(config.bases.begin(), config.bases.end()), config.bases.end());
+        return config;
+    }();
+    if (!aot_capture.frames.empty() &&
+        std::binary_search(aot_capture.frames.begin(), aot_capture.frames.end(), g_frames)) {
+        std::error_code error;
+        std::filesystem::create_directories(aot_capture.dir, error);
+        if (error) std::fprintf(stderr, "[aot-capture] cannot create directory: %s\n", error.message().c_str());
+        else for (const std::uint32_t base : aot_capture.bases) {
+            constexpr std::uint32_t unit = 0x4000u, cap = 0x400000u;
+            std::uint32_t size = 0;
+            while (size < cap && base + size + unit <= kRamSize &&
+                   std::any_of(g_ram + base + size, g_ram + base + size + unit,
+                               [](std::uint8_t byte) { return byte != 0; })) size += unit;
+            if (!size) continue;
+            char filename[80];
+            std::snprintf(filename, sizeof filename, "frame_%010llu_%08X.bin",
+                          static_cast<unsigned long long>(g_frames), base);
+            const auto path = (std::filesystem::path(aot_capture.dir) / filename).string();
+            if (std::FILE *file = os::open(path, "wb")) {
+                const auto written = std::fwrite(g_ram + base, 1, size, file);
+                std::fclose(file);
+                std::fprintf(stderr, "[aot-capture] frame %llu base %08X bytes %u written %zu\n",
+                             static_cast<unsigned long long>(g_frames), base, size, written);
+            } else std::fprintf(stderr, "[aot-capture] cannot write %s\n", path.c_str());
+        }
+    }
     report_load();
     time_frames();
     apply_presses();
@@ -300,7 +389,7 @@ void vblank() {
     if (g_options.on_vblank) g_options.on_vblank();
     iop::sio2::flush_cards();
     if (g_options.trace_iop_modules && g_frames % 25 == 0) std::fprintf(stderr, "[frame] %llu prims %llu\n", static_cast<unsigned long long>(g_frames), static_cast<unsigned long long>(gs::primitives_drawn()));
-    if (!g_options.frames_dir.empty() && g_options.frame_every && g_frames % g_options.frame_every == 0) dump_frame();
+    if (!g_options.frames_dir.empty() && frame_capture_requested(g_frames)) dump_frame();
     hw::vblank_start();
     iop::vblank(true);
     schedule(hw::kEventVblankEnd + 100, now() + hblank_cycles() * 22u, [] { iop::vblank(false); });
@@ -404,7 +493,7 @@ std::uint32_t video_options() { return g_video_options.load(std::memory_order_re
 namespace {
 
 constexpr char kStateMagic[8] = {'P', 'S', '2', 'S', 'T', 'A', 'T', 'E'};
-constexpr std::uint32_t kStateVersion = 6;
+constexpr std::uint32_t kStateVersion = 9;
 
 std::function<void()> event_action(int id, std::uint64_t at) {
     if (id == hw::kEventVblank) return vblank;
@@ -430,8 +519,11 @@ void machine_state(state::Stream &s) {
     s.pod(version);
     if (std::memcmp(magic, kStateMagic, sizeof magic) != 0) throw std::runtime_error("not a state file");
     // Our version 4 differs from upstream's 4 (Cpu and thread layouts); 5 adds upstream's waiting HLE RPC replies; 6 adds the disc stream
-    // of the IOP (sceCdSt*, where it is and whether it runs), so a state saved while a film or a music stream plays goes on streaming.
-    if (version != kStateVersion && !(s.loading() && (version == 4 || version == 5))) throw std::runtime_error("state file from another version");
+    // of the IOP (sceCdSt*, where it is and whether it runs), so a state saved while a film or a music stream plays goes on streaming;
+    // 7 adds the SIF RPC endpoints kept per server (guest servers, their order) and the IOP-to-EE request packet ring (SIF RPC rework, PR #27);
+    // 8 adds the IOP's low-level hardware timers (AllocHardTimer, SetTimerCompare, SetTimerMode) that raise an interrupt;
+    // 9 adds the count of GS FINISH events that wait until the game has cleared CSR.FINISH.
+    if (version != kStateVersion && !(s.loading() && (version >= 4 && version <= 8))) throw std::runtime_error("state file from another version");
     s.set_version(version);
     s.tag("ee");
     s.pod(g_cpu);
@@ -469,9 +561,9 @@ bool save_state(const std::string &path) {
     try {
         state::Writer w;
         machine_state(w);
-        std::ofstream out(os::path(path), std::ios::binary);
-        out.write(reinterpret_cast<const char *>(w.out.data()), static_cast<std::streamsize>(w.out.size()));
-        if (!out) throw std::runtime_error("cannot write " + path);
+        // temp file + rename: a crash, a kill or a full disk during the write keeps the state that was there before
+        std::string why;
+        if (!os::replace_file(path, w.out.data(), w.out.size(), &why)) throw std::runtime_error(why);
         std::fprintf(stderr, "[state] saved frame %llu to %s (%zu KB)\n", static_cast<unsigned long long>(g_frames), path.c_str(), w.out.size() >> 10);
         return true;
     } catch (const std::exception &e) {
@@ -544,10 +636,33 @@ bool load_elf(const std::string &path, std::uint32_t &entry) {
     // earlier one. Memory is zero at power-on, so this is what a loader that only copies the file contents gives.
     for (const bool copy : {false, true}) {
         for (std::uint32_t i = 0; i < u16(44); ++i) {
-            const std::size_t ph = phoff + i * u16(42);
+            const std::uint64_t ph = phoff + std::uint64_t{i} * u16(42);
+            // The ELF comes from the disc: a program header past the end of the file, or a segment whose sums wrap round 4 GiB,
+            // would read past the file or write past the 32 MiB of memory. ELF spec: p_offset + p_filesz lies inside the file and
+            // the segment (p_vaddr up to p_memsz, and the p_filesz bytes copied) inside memory.
+            if (ph > data.size() || data.size() - ph < 24) {
+                std::fprintf(stderr, "[elf] %s is damaged: program header %u lies past the end of the file\n", path.c_str(), i);
+                return false;
+            }
             if (u32(ph) != 1) continue;
+            // A segment placed in the scratchpad (0x70000000..0x70003FFF) loads there instead of into main memory
+            // (follows upstream 8ebb09b); the same checks apply, against the 16 KiB.
+            if (const std::uint32_t at = u32(ph + 8); (at >> 14) == (kScratchpadBase >> 14)) {
+                const std::uint32_t offset = u32(ph + 4), filesz = u32(ph + 16), memsz = u32(ph + 20);
+                const std::uint32_t start = at & (kScratchpadSize - 1);
+                if (std::uint64_t{start} + std::max(memsz, filesz) > kScratchpadSize || std::uint64_t{offset} + filesz > data.size()) {
+                    std::fprintf(stderr, "[elf] %s is damaged: segment %u does not fit in the file or in the scratchpad\n", path.c_str(), i);
+                    return false;
+                }
+                if (copy) std::memcpy(g_spr + start, data.data() + offset, filesz);
+                else if (memsz > filesz) std::memset(g_spr + start + filesz, 0, memsz - filesz);
+                continue;
+            }
             const std::uint32_t offset = u32(ph + 4), vaddr = physical(u32(ph + 8)), filesz = u32(ph + 16), memsz = u32(ph + 20);
-            if (vaddr + memsz > kRamSize || offset + filesz > data.size()) return false;
+            if (std::uint64_t{vaddr} + std::max(memsz, filesz) > kRamSize || std::uint64_t{offset} + filesz > data.size()) {
+                std::fprintf(stderr, "[elf] %s is damaged: segment %u does not fit in the file or in memory\n", path.c_str(), i);
+                return false;
+            }
             if (copy) {
                 std::memcpy(g_ram + vaddr, data.data() + offset, filesz);
                 watch_span(vaddr, filesz, "boot:load_exec");
@@ -624,10 +739,6 @@ int __stdcall SetProcessInformation(void *, int, void *, unsigned long);
 unsigned long __stdcall GetCurrentProcessorNumber(void);
 }
 #endif
-#ifdef __SWITCH__
-// libnx's own declaration (switch.h is left out: its Event, u32 and friends would meet the runtime's names here)
-extern "C" std::uint32_t svcSetThreadCoreMask(std::uint32_t handle, std::int32_t core_id, std::uint32_t affinity_mask);
-#endif
 
 namespace {
 
@@ -670,22 +781,6 @@ void thread_tune(Who who) {
     if (!mask.empty() && mask != "-") SetThreadAffinityMask(GetCurrentThread(), std::strtoull(mask.c_str(), nullptr, 16));
     const std::string prio = tune_item("PS2_PRIO", static_cast<int>(who));
     if (!prio.empty() && prio != "-") SetThreadPriority(GetCurrentThread(), std::atoi(prio.c_str()));
-#elif defined(__SWITCH__)
-    // Horizon never moves a thread to another core by itself: every thread libnx starts stays on the core of the process (core 0),
-    // so the three would share one core. A game gets cores 0 to 2: the window thread (drawing, SDL) keeps core 0, the emulation
-    // takes core 1 and the vector units core 2.
-    // PS2_SWITCH_CORES=e,v,w picks other cores for the emulation, vector-unit and window threads (0 to 2), for trying placements
-    static const auto cores = [] {
-        std::array<std::int32_t, 3> c{1, 2, 0};
-        const std::string spec = os::env("PS2_SWITCH_CORES");
-        if (spec.size() == 5 && spec[1] == ',' && spec[3] == ',')
-            for (int i = 0; i < 3; ++i)
-                if (spec[i * 2] >= '0' && spec[i * 2] <= '2') c[i] = spec[i * 2] - '0';
-        return c;
-    }();
-    const std::int32_t core = cores[static_cast<std::size_t>(who)];
-    if (svcSetThreadCoreMask(0xFFFF8000u /* CUR_THREAD_HANDLE */, core, 1u << core) != 0)
-        std::fprintf(stderr, "[switch] cannot move a thread to core %d\n", static_cast<int>(core));
 #else
     (void)who;
 #endif
@@ -723,7 +818,6 @@ void core_sample(Who who) {
 
 int run() {
     thread_tune(Who::Emulation);
-    part::start();
     Cpu &c = g_cpu;
     const std::uint64_t started_at = now();  // for the share of waiting loops skipped (hw.cpp)
     if (!g_resumed) set_budget(c, kMaxSlice);
@@ -750,14 +844,10 @@ int run() {
             quick::service();
         }
         c.pc &= ~kUnwind;
-        {
-            part::Scope mark(part::kEvents);
-            run_due_events();
-            kernel::service(c);
-        }
+        run_due_events();
+        kernel::service(c);
         if (g_halted) break;
         if (c.pc == kIdle) {
-            part::Scope mark(part::kIdle);
             idle(c);
             continue;
         }
@@ -830,7 +920,7 @@ void run_vu_thread() {
         core_sample(Who::Vu);
         while (in.peek(h, payload)) {
             switch (h.type) {
-            case gs::queue::kVif1: vif::transfer(1, payload, h.arg0); break;
+            case gs::queue::kVif1: vif::transfer_words(1, reinterpret_cast<const std::uint32_t *>(payload), h.arg0); break;
             case gs::queue::kVif1Write: vif::write(1, h.arg0, h.arg1); break;
             case gs::queue::kGif: gif::transfer(static_cast<int>(h.arg0), payload, h.arg1); break;
             case gs::queue::kPath3Idle: gif::vif1_idle(); break;

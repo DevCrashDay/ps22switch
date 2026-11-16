@@ -42,7 +42,15 @@ std::vector<std::pair<std::uint32_t, std::uint32_t>> checks_for_window(const Snr
 // For an image with data between its code (a program the game reads into memory as one piece): the checks are only the first words
 // of every function, up to its return, at most 16. A data word that the search for functions took for code and that the game writes
 // later (a counter) would otherwise make the whole image look changed. A different image in the same place still differs in these.
-std::vector<std::pair<std::uint32_t, std::uint32_t>> entry_head_checks(const Snr2Module &o, const Program &program);
+// The entries that only a guess made (Program::weak: a word of data that points at code, a place after a return) are often data after
+// all, and the game writes data (a counter, a table); a changed word there must not make the whole image look changed. Their first words
+// are not in `hard` but in `soft` (groups of {entry offset, n, n * {offset, word}}, Translation::soft): the runner looks at the words of
+// an entry when it is called and lets only that entry go when they differ.
+struct HeadChecks {
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> hard;
+    std::vector<std::uint32_t> soft;
+};
+HeadChecks entry_head_checks(const Snr2Module &o, const Program &program);
 
 // ---------------------------------------------------------------------------------------------------------------- capturing
 
@@ -72,6 +80,9 @@ class StaticProgram {
 public:
     StaticProgram(const std::string &elf_path, const std::vector<std::uint32_t> &entries);
     std::vector<std::uint32_t> calls_into(std::uint32_t base, std::uint32_t size) const;
+    // The stretch of the program that holds its code: from the first to the last instruction the analysis reached (and the `.text` section
+    // when the file has one). The rest of an executable segment is data; {0, 0} when nothing was reached.
+    std::pair<std::uint32_t, std::uint32_t> code_range() const;
 
 private:
     Image image_;
@@ -87,6 +98,9 @@ struct LiveRequest {
     std::uint64_t stamp = 0;             // not 0: the stamp the library carries (CodegenOptions::live_stamp)
     bool focused = false;                // true: translate only what the entries reach (an earlier library covers the rest of the image)
     bool sparse_checks = false;          // true: the image is checked by the first words of its functions (entry_head_checks)
+    std::vector<std::uint32_t> candidates;  // words of memory that point into the image: possible function starts (Search::candidates)
+    std::uint32_t text_begin = 0, text_end = 0;   // not 0: the image holds code only in [text_begin, text_end), the rest is data and no pointer into it is a function
+    std::vector<std::uint32_t> served;      // calls and jumps to these addresses of the image are not followed: something else translated them (Search::served)
 };
 
 struct LiveResult {

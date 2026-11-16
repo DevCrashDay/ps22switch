@@ -50,6 +50,7 @@ struct Options {
     bool trace_iop_hle = false;
     std::string frames_dir;
     std::uint32_t frame_every = 60;
+    std::vector<std::uint64_t> frame_capture_frames; // additional exact frames requested by --frame-at
     bool sync_pictures = false;  // render_pending reads each picture back at once instead of a picture or two later (headless runs with threads)
     std::vector<Press> presses;
     std::vector<AxisPress> axis_presses;
@@ -92,6 +93,7 @@ void save_context(const Cpu &c, ThreadContext &t);
 void load_context(Cpu &c, const ThreadContext &t);
 
 std::uint64_t now();
+bool frame_capture_requested(std::uint64_t frame);
 std::uint64_t rtc_seconds();  // the clock the game reads, in seconds since 1970 (UTC), see Options::rtc_epoch
 std::uint64_t hblank_cycles();
 void set_budget(Cpu &c, std::int64_t cycles);
@@ -119,7 +121,7 @@ std::uint64_t frame_count();
 bool display_frame(std::vector<std::uint32_t> &rgba, std::uint32_t &width, std::uint32_t &height);
 
 struct WindowTarget {
-    enum Kind { X11, Wayland, Canvas, Win32, Vi } kind = X11;
+    enum Kind { X11, Wayland, Canvas, Win32, Metal } kind = X11;
     void *display = nullptr;
     std::uint64_t window = 0;
     void *surface = nullptr;
@@ -168,6 +170,10 @@ void flush_memory_card(bool hurry = false);
 // A copy of the memory card as the game sees it now (the file may be up to 50 frames behind). false when no card is in use. With
 // wait false the card is given up after a moment if a card command holds it.
 bool memory_card_image(std::vector<std::uint8_t> &out, bool wait);
+// For a crash handler (runtime/src/iop/sio2.cpp): the newest card goes to "<card>.crash.ps2" beside the card file, never over it.
+// Returns 0 when the card had not changed since it was last written, 1 when the copy was written (`where`, if not null, names it),
+// 2 when the card was busy, 3 when the copy could not be written. It prints nothing.
+int save_memory_card_after_crash(const char **where);
 
 // --- Keys of a window run (docs/play-keys.md): F5 quick save, F8 quick load, F9 problem report ---
 enum class QuickKey { save, load, report };

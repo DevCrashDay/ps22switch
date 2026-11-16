@@ -245,30 +245,67 @@ function Get-InstallProblem {
     $null
 }
 
+# True when the file is a disc image: an .iso with 2048-byte sectors, or a CD dumped as .bin with 2352-byte sectors (a sync pattern
+# starts every sector). Either way the volume descriptor, "CD001", lies in sector 16.
+function Test-DiscBytes([string]$path) {
+    $stream = [IO.File]::Open($path, 'Open', 'Read', 'ReadWrite')
+    try {
+        $head = New-Object byte[] 16
+        $got = $stream.Read($head, 0, 16)
+        $at = 0x8000
+        if ($got -eq 16 -and $head[0] -eq 0 -and $head[11] -eq 0 -and @($head[1..10] | Where-Object { $_ -ne 255 }).Count -eq 0) {
+            $at = 16 * 2352 + $(if ($head[15] -eq 1) { 16 } else { 24 })
+        }
+        $id = New-Object byte[] 6
+        [void]$stream.Seek($at, 'Begin')
+        $read = $stream.Read($id, 0, 6)
+    } finally { $stream.Dispose() }
+    return ($read -eq 6 -and $id[0] -eq 1 -and [Text.Encoding]::ASCII.GetString($id, 1, 5) -eq 'CD001')
+}
+
+# The .bin file a .cue sheet names (its first FILE line), next to the sheet; $null when there is none.
+function Get-CueTarget([string]$cue) {
+    foreach ($line in (Get-Content -LiteralPath $cue -TotalCount 40 -ErrorAction SilentlyContinue)) {
+        if ($line -match '^\s*FILE\s+(?:"([^"]+)"|(\S+))') {
+            $name = if ($Matches[1]) { $Matches[1] } else { $Matches[2] }
+            $target = Join-Path (Split-Path -Parent $cue) $name
+            if (Test-Path -LiteralPath $target -PathType Leaf) { return $target }
+            return $null
+        }
+    }
+    $null
+}
+
 function Test-DiscImage([string]$path) {
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return 'That file does not exist.' }
     switch ([IO.Path]::GetExtension($path).ToLower()) {
         '.iso' {
-            $stream = [IO.File]::Open($path, 'Open', 'Read', 'ReadWrite')
-            try { $head = New-Object byte[] 6; [void]$stream.Seek(0x8000, 'Begin'); $got = $stream.Read($head, 0, 6) } finally { $stream.Dispose() }
-            if ($got -ne 6 -or $head[0] -ne 1 -or [Text.Encoding]::ASCII.GetString($head, 1, 5) -ne 'CD001') {
+            if (-not (Test-DiscBytes $path)) {
                 return 'This does not look like a PS2 disc image. It has to be an .iso file with normal 2048-byte sectors, made from the DVD.'
             }
+        }
+        { $_ -in '.bin', '.img' } {
+            if (-not (Test-DiscBytes $path)) { return 'This does not look like a PS2 disc image. It has to be a .bin (with its .cue file) or an .iso made from the disc.' }
+        }
+        '.cue' {
+            $target = Get-CueTarget $path
+            if (-not $target) { return 'This .cue file names a .bin file that is not in the same folder.' }
+            if (-not (Test-DiscBytes $target)) { return 'The .bin file of this .cue does not look like a PS2 disc image.' }
         }
         '.zip' {
             Add-Type -AssemblyName System.IO.Compression.FileSystem
             try {
                 $zip = [IO.Compression.ZipFile]::OpenRead($path)
-                try { $hasIso = @($zip.Entries | Where-Object { $_.FullName -like '*.iso' }).Count -gt 0 } finally { $zip.Dispose() }
+                try { $hasIso = @($zip.Entries | Where-Object { $_.FullName -match '\.(iso|bin|img)$' }).Count -gt 0 } finally { $zip.Dispose() }
             } catch { return 'This .zip file cannot be opened.' }
-            if (-not $hasIso) { return 'There is no .iso file inside this .zip.' }
+            if (-not $hasIso) { return 'There is no .iso or .bin file inside this .zip.' }
         }
         '.7z' {
             if (-not (Test-Path -LiteralPath (Join-Path $env:ProgramFiles '7-Zip\7z.exe'))) {
                 return 'A .7z file needs the free program 7-Zip (7-zip.org). Install it, or unpack the .iso yourself and choose that.'
             }
         }
-        default { return 'Please choose an .iso file, or a .zip or .7z file with an .iso inside.' }
+        default { return 'Please choose an .iso file (or a .bin with its .cue file), or a .zip or .7z file with one inside.' }
     }
     $null
 }
@@ -435,15 +472,22 @@ try {
         $r = Open-Get $url $accept 10000
         try { (New-Object IO.StreamReader($r.GetResponseStream(), [Text.Encoding]::UTF8)).ReadToEnd() } finally { $r.Close() }
     }
-    if ($mode -eq 'check') {
-        $newest = (Get-Text "$api/commits/main" 'application/vnd.github.sha').Trim()
-        if ($newest -notmatch '^[0-9a-f]{40}$') { throw 'unexpected answer' }
-        $sh.Sha = $newest
-        $installed = ''
-        try { $installed = (Get-Content -LiteralPath (Join-Path $dir 'installed.txt') -Raw).Trim() } catch { }
-        if ($installed -eq $newest) { $sh.Result = 'current'; return }
-        # Not the version this app recorded (or none): are the files the same as the newest version's anyway?
-        $tree = (Get-Text "$api/git/trees/${newest}?recursive=1" 'application/vnd.github+json') | ConvertFrom-Json
+    function Get-BlobSha([byte[]]$bytes) {
+        $head = [Text.Encoding]::ASCII.GetBytes("blob $($bytes.Length)`0")
+        $hash = [Security.Cryptography.SHA1]::Create()
+        [void]$hash.TransformBlock($head, 0, $head.Length, $null, 0)
+        [void]$hash.TransformFinalBlock($bytes, 0, $bytes.Length)
+        ($hash.Hash | ForEach-Object { $_.ToString('x2') }) -join ''
+    }
+    function ConvertTo-Lf([byte[]]$bytes) {
+        $out = New-Object IO.MemoryStream
+        for ($i = 0; $i -lt $bytes.Length; $i++) {
+            if ($bytes[$i] -eq 13 -and $i + 1 -lt $bytes.Length -and $bytes[$i + 1] -eq 10) { continue }
+            $out.WriteByte($bytes[$i])
+        }
+        ,$out.ToArray()
+    }
+    function Compare-TreeToFiles($tree, [string]$root) {
         $same = $true
         $count = 0
         foreach ($entry in $tree.tree) {
@@ -454,13 +498,26 @@ try {
             $file = Join-Path $root ($path.Replace('/', '\'))
             if (-not (Test-Path -LiteralPath $file -PathType Leaf)) { $same = $false; break }
             $bytes = [IO.File]::ReadAllBytes($file)
-            $head = [Text.Encoding]::ASCII.GetBytes("blob $($bytes.Length)`0")
-            $hash = [Security.Cryptography.SHA1]::Create()
-            [void]$hash.TransformBlock($head, 0, $head.Length, $null, 0)
-            [void]$hash.TransformFinalBlock($bytes, 0, $bytes.Length)
-            $hex = ($hash.Hash | ForEach-Object { $_.ToString('x2') }) -join ''
-            if ($hex -ne [string]$entry.sha) { $same = $false; break }
+            if ((Get-BlobSha $bytes) -eq [string]$entry.sha) { continue }
+            # GitHub's zip applies .gitattributes (eol=crlf for .ps1/.cmd/.bat), so such a file holds CRLF while git stores LF:
+            # compare once more with CRLF turned into LF (git's own text normalisation), only for files that contain a CR.
+            if ([Array]::IndexOf($bytes, [byte]13) -ge 0 -and (Get-BlobSha (ConvertTo-Lf $bytes)) -eq [string]$entry.sha) { continue }
+            $same = $false; break
         }
+        @{ Same = $same; Count = $count }
+    }
+    if ($mode -eq 'check') {
+        $newest = (Get-Text "$api/commits/main" 'application/vnd.github.sha').Trim()
+        if ($newest -notmatch '^[0-9a-f]{40}$') { throw 'unexpected answer' }
+        $sh.Sha = $newest
+        $installed = ''
+        try { $installed = (Get-Content -LiteralPath (Join-Path $dir 'installed.txt') -Raw).Trim() } catch { }
+        if ($installed -eq $newest) { $sh.Result = 'current'; return }
+        # Not the version this app recorded (or none): are the files the same as the newest version's anyway?
+        $tree = (Get-Text "$api/git/trees/${newest}?recursive=1" 'application/vnd.github+json') | ConvertFrom-Json
+        $cmp = Compare-TreeToFiles $tree $root
+        $same = $cmp.Same
+        $count = $cmp.Count
         if ($same -and $count -gt 20) {
             New-Item -ItemType Directory -Force -Path $dir | Out-Null
             Set-Content -LiteralPath (Join-Path $dir 'installed.txt') -Value $newest -Encoding ASCII
@@ -649,7 +706,7 @@ if (-not $created) {
 # ---------------------------------------------------------------------------------------------------------------------
 # Child processes
 
-$State = @{ Build = $null; Image = ''; Name = ''; Game = $null; Playing = $null; Seq = 0; Patch = $null; Newest = ''; UpdateJob = $null; Batch = $null; Restarting = $false }
+$State = @{ Build = $null; Image = ''; Name = ''; Game = $null; Playing = $null; PlayStarted = [datetime]::MinValue; Seq = 0; Patch = $null; Newest = ''; UpdateJob = $null; Batch = $null; Restarting = $false }
 
 # PCSX2 patches of the chosen game (optional). Status: idle (not asked yet), working, found, none (the collection has no file for
 # this game) or error. Chosen holds the ticked section names; Items the tick boxes (Key = section name, S = what pnach.py says).
@@ -883,7 +940,7 @@ $w = $P['welcome']
 [void](Add-Label $w 'title' $AppTitle 38 16 720 54 (New-Font 28 $false $TitleFont) $C.Ink)
 [void](Add-Label $w 'subtitle' 'Turn your own PlayStation 2 game into a program for this PC.' 41 70 720 26 (New-Font 12) $C.Muted)
 $steps = @(
-    @('1', 'Choose your disc', 'An .iso file ripped from a PS2 DVD you own (or a .zip or .7z with an .iso inside).'),
+    @('1', 'Choose your disc', 'An .iso file ripped from a PS2 disc you own (or a .bin with its .cue file, or a .zip or .7z with one inside).'),
     @('2', 'Press Build', "Free build tools are downloaded once (about $ToolsDownloadMb MB). Then the game becomes a PC program: 5 to 30 minutes."),
     @('3', 'Press Play', 'Start the game from here, or make a desktop shortcut and start it from there next time.')
 )
@@ -934,7 +991,7 @@ $card = New-Glass $w 'DiscCard' 40 108 720 238
 [void](Add-Label $card 'cardTitle1' 'Your disc image' 56 16 400 26 (New-Font 13 $true) $C.Ink)
 $U.choose = Add-Button $card 'ChooseImage' 'Choose disc image...' 16 54 250 50 'primary' 14
 $U.fileName = Add-Label $card 'fileName' 'No disc image chosen yet.' 284 52 420 26 (New-Font 12.5 $true) $C.Muted
-$U.filePath = Add-Label $card 'filePath' 'An .iso made from a PS2 DVD you own, or a .zip or .7z file that holds one.' 284 80 420 24 (New-Font 9.5) $C.Muted
+$U.filePath = Add-Label $card 'filePath' 'An .iso made from a PS2 disc you own (or a .bin with its .cue file), or a .zip or .7z file that holds one.' 284 80 420 24 (New-Font 9.5) $C.Muted
 $U.filePath.AutoEllipsis = $true
 $U.imageError = Add-Label $card 'imageError' '' 16 110 688 38 (New-Font 11 $true) $C.Danger
 [void](Add-Label $card 'nameLabel' 'Name of the game' 16 150 300 22 (New-Font 11 $true) $C.Ink)
@@ -1053,7 +1110,7 @@ $U.fasterBox.Visible = $false
 [void](Add-Label $U.fasterBox 'FasterText' 'Was the game slow in places you saw for the first time? Make it faster (takes a few minutes at most).' 16 6 470 46 (New-Font 11) $C.Ink)
 $U.fasterCount = Add-Label $U.fasterBox 'FasterCount' '' 16 54 470 22 (New-Font 10) $C.Muted
 $U.faster = Add-Button $U.fasterBox 'MakeFaster' 'Make it faster' 496 15 208 50 'secondary' 14
-[void](Add-Label $w 'doneTip' 'Tip: in the game window, F1 shows the keys and F11 switches full screen on and off.' 40 470 720 22 (New-Font 10) $C.Muted 'TopCenter')
+[void](Add-Label $w 'doneTip' 'Tip: in the game window, F1 opens the menu (saves, keys, picture) and F11 switches full screen on and off.' 40 470 720 22 (New-Font 10) $C.Muted 'TopCenter')
 $U.another = Add-Button $w 'BuildAnother' 'Add another game' 40 512 210 48 'secondary' 12
 $U.changeExtras = Add-Button $w 'ChangeExtras' 'Change extras...' 262 512 210 48 'secondary' 12
 $U.close = Add-Button $w 'Close' 'Close' 620 512 140 48 'secondary' 12
@@ -1180,10 +1237,39 @@ function Start-Game([string]$name) {
     $psi.WorkingDirectory = $play.Dir
     $psi.UseShellExecute = $false
     $psi.CreateNoWindow = $true
+    $State.PlayStarted = Get-Date
     $State.Playing = [Diagnostics.Process]::Start($psi)
     $State.PlayingName = $name
     $playTimer.Start()
     $true
+}
+
+# The log file the game wrote in this run, or $null. The game writes it first thing into games\<name>\logs (next to its memory card),
+# or into %TEMP%\ps2run-logs when it cannot write there. A program that Windows could not even start (a missing DLL, a file that
+# does not fit this Windows) never gets that far and leaves none.
+function Find-GameLog([string]$name, [datetime]$since) {
+    $found = @()
+    foreach ($folder in (Get-GameFile $name 'logs'), (Join-Path ([IO.Path]::GetTempPath()) 'ps2run-logs')) {
+        if (-not (Test-Path -LiteralPath $folder -PathType Container)) { continue }
+        $found += @(Get-ChildItem -LiteralPath $folder -Filter 'ps2run_*.log' -File -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -ge $since.AddSeconds(-5) })
+    }
+    $found | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+}
+
+# What the exit code of a program that stopped means, in words (the codes are Windows' own).
+function Get-ExitCodeText([int]$code) {
+    $hex = '{0:X8}' -f [BitConverter]::ToUInt32([BitConverter]::GetBytes($code), 0)
+    $why = switch ($hex) {
+        'C0000135' { 'Windows could not find a file the game program needs (a .dll)' }
+        'C000007B' { 'a file of the game program does not fit this Windows (32 and 64 bit mixed)' }
+        'C0000142' { 'a file of the game program could not start' }
+        'C0000005' { 'the program used a wrong memory address' }
+        'C00000FD' { 'the program ran out of stack memory' }
+        'C0000409' { 'the program stopped itself after a failed check' }
+        '00000003' { 'the program stopped itself after a failed check' }
+        default { '' }
+    }
+    if ($why) { "code $hex, $why" } else { "code $hex" }
 }
 
 # While a game that this app started is open: when it ends, look again whether it recorded vector programs (Make it faster). A game
@@ -1198,7 +1284,15 @@ $playTimer.Add_Tick({
             $State.Playing = $null; $playTimer.Stop(); Update-FasterOffers
             if ($code -ne 0) {
                 $logs = Get-GameFile $State.PlayingName 'logs'
-                [void][Windows.Forms.MessageBox]::Show("The game '$($State.PlayingName)' stopped with an error. If it keeps happening, the newest file in this folder says what went wrong:`n$logs", $AppTitle, 'OK', 'Information')
+                $meaning = Get-ExitCodeText $code
+                $log = Find-GameLog $State.PlayingName $State.PlayStarted
+                Write-AppLog "the game '$($State.PlayingName)' ended with $meaning; log: $(if ($log) { $log.FullName } else { 'none was written' })"
+                if ($log) {
+                    [void][Windows.Forms.MessageBox]::Show("The game '$($State.PlayingName)' stopped with an error ($meaning). If it keeps happening, the newest file in this folder says what went wrong:`n$($log.DirectoryName)", $AppTitle, 'OK', 'Information')
+                } else {
+                    # no log of this run: the program did not get as far as writing one, so the folder above would be empty or hold old files
+                    [void][Windows.Forms.MessageBox]::Show("The game '$($State.PlayingName)' stopped with an error ($meaning) before it could write a log, so there is no new file in:`n$logs`nPlease send this message with your report (and the file games\app.log in the program folder).", $AppTitle, 'OK', 'Information')
+                }
             }
         }
     } catch { $playTimer.Stop(); Write-AppLog $_.Exception.ToString() }
@@ -1301,7 +1395,8 @@ function Set-Image([string]$path) {
         $U.name.Text = ''
     } else {
         $State.Image = $path
-        $U.fileName.Text = '{0}   ({1})' -f [IO.Path]::GetFileName($path), (Format-Size (Get-Item -LiteralPath $path).Length)
+        $sizeOf = if ($path -match '\.cue$') { Get-CueTarget $path } else { $path }  # a .cue sheet is tiny: show the size of its .bin
+        $U.fileName.Text = '{0}   ({1})' -f [IO.Path]::GetFileName($path), (Format-Size (Get-Item -LiteralPath $sizeOf).Length)
         $U.fileName.ForeColor = $C.Ink
         $U.filePath.Text = $path
         $U.name.Text = Get-FreeName (Get-SafeName $path) $path
@@ -1315,7 +1410,7 @@ $U.chooseBack.Add_Click({ Show-Screen 'welcome' })
 $U.choose.Add_Click({
     $dialog = New-Object Windows.Forms.OpenFileDialog
     $dialog.Title = 'Choose your PS2 disc image'
-    $dialog.Filter = 'PS2 disc images (*.iso, *.zip, *.7z)|*.iso;*.zip;*.7z'
+    $dialog.Filter = 'PS2 disc images (*.iso, *.cue, *.bin, *.zip, *.7z)|*.iso;*.cue;*.bin;*.zip;*.7z'
     $dialog.CheckFileExists = $true
     if (Test-Path -LiteralPath (Join-Path $Root 'isos')) { $dialog.InitialDirectory = Join-Path $Root 'isos' }
     if ($dialog.ShowDialog($form) -eq 'OK') { Set-Image $dialog.FileName }
@@ -1462,7 +1557,7 @@ function Start-PatchLookup {
     $p = $State.Patch
     if ($p.Run) { return }
     if (-not (Get-PatchImage)) {
-        Set-PatchError 'This disc image is an archive.' 'Looking for patches needs a plain .iso file. Unpack the .iso from the archive and choose that file instead.'
+        Set-PatchError 'This disc image is not a plain .iso file.' 'Looking for patches needs a plain .iso file. Unpack or convert the image to an .iso and choose that file instead.'
         Show-PatchState
         return
     }
@@ -2109,7 +2204,8 @@ function Get-FailureMessage($b) {
         'setup' { return 'The libraries or translator tools could not be prepared. If your internet connection was down, try again.' }
     }
     if ($tail -match 'not an ISO 9660 image') { return 'This file is not a PS2 disc image. It has to be an .iso made from the DVD.' }
-    if ($tail -match 'no \.iso inside the archive') { return 'There is no .iso file inside that archive.' }
+    if ($tail -match 'no \.iso, \.bin or \.img inside the archive') { return 'There is no disc image (.iso or .bin) inside that archive.' }
+    if ($tail -match 'cue sheet names') { return 'The .cue file names a .bin file that is not in the same folder.' }
     if ($tail -match '7z not found') { return 'A .7z file needs the free program 7-Zip (7-zip.org). Install it, or unpack the .iso yourself.' }
     if ($tail -match 'BOOT2') { return 'This disc has no PS2 game program that the app can start. Is it a PS2 game disc?' }
     switch ($b.Step) {

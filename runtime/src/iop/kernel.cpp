@@ -61,6 +61,7 @@ std::map<std::string, std::uint32_t> g_hle_versions;
 std::map<std::string, std::uint32_t> g_libraries;
 std::map<std::string, HleModuleStart> g_hle_modules;
 std::map<int, Module> g_modules;
+std::map<int, std::string> g_module_paths;  // the path a module was linked from (argv[0] of its start routine); not part of a save state
 int g_next_module = 1;
 
 std::map<int, Thread> g_threads;
@@ -68,6 +69,7 @@ int g_current = 0;
 int g_next_thread = 1;
 std::uint64_t g_order = 0;
 bool g_switch = false;
+std::uint64_t g_switch_count = 0;  // thread switches so far (statistics for ReferSystemStatus; not part of the save state)
 
 std::map<std::uint32_t, std::uint32_t> g_used;
 std::uint32_t g_kernel_top = kKernelBase;
@@ -100,6 +102,7 @@ void do_switch() {
     Thread *cur = current();
     Thread *next = best_ready();
     if (next == cur && cur && cur->status == kRun) return;
+    ++g_switch_count;
     if (cur && cur->status != kDormant) {
         cur->context = g_cpu;
         cur->suspended = g_suspended;
@@ -168,15 +171,34 @@ void relink_hle_imports() {
     for (const auto &[at, id] : g_hle_stubs) set_ram32(at, (kHleOpcode << 26) | id);
 }
 
+// A module comes from the disc or from the game's memory, so it is untrusted: every read is checked against the file, and a read
+// past its end gives 0 and marks the module bad (the loader then refuses it).
 struct Elf {
     const std::vector<std::uint8_t> &data;
-    std::uint32_t u32(std::size_t o) const { std::uint32_t v; std::memcpy(&v, data.data() + o, 4); return v; }
-    std::uint16_t u16(std::size_t o) const { std::uint16_t v; std::memcpy(&v, data.data() + o, 2); return v; }
+    mutable bool bad = false;
+    bool has(std::uint64_t o, std::uint64_t n) const { return o <= data.size() && n <= data.size() - o; }
+    std::uint32_t u32(std::uint64_t o) const {
+        std::uint32_t v = 0;
+        if (has(o, 4)) std::memcpy(&v, data.data() + o, 4); else bad = true;
+        return v;
+    }
+    std::uint16_t u16(std::uint64_t o) const {
+        std::uint16_t v = 0;
+        if (has(o, 2)) std::memcpy(&v, data.data() + o, 2); else bad = true;
+        return v;
+    }
 };
 
 void relocate(const Elf &elf, std::uint32_t base, std::uint32_t size, bool v2) {
     const std::uint32_t shoff = elf.u32(32);
     const std::uint16_t shentsize = elf.u16(46), shnum = elf.u16(48);
+    // The section headers and each relocation table (ELF spec, SHT_REL = 9: 8-byte entries) must lie inside the file; the loader
+    // refuses the module otherwise (elf.bad), before anything was relocated.
+    for (std::uint32_t i = 0; i < shnum; ++i) {
+        const std::uint64_t sh = shoff + std::uint64_t{i} * shentsize;
+        if (!elf.has(sh, 24)) { elf.bad = true; return; }
+        if (elf.u32(sh + 4) == 9 && !elf.has(elf.u32(sh + 16), elf.u32(sh + 20) / 8 * 8ull)) { elf.bad = true; return; }
+    }
     auto word = [&](std::int64_t offset) -> std::uint8_t * {
         static std::uint32_t dummy;
         if (offset < 0 || offset + 4 > size) return reinterpret_cast<std::uint8_t *>(&dummy);
@@ -293,6 +315,15 @@ Thread *thread(int id) {
     auto it = g_threads.find(id);
     return it == g_threads.end() ? nullptr : &it->second;
 }
+
+std::vector<int> thread_ids() {
+    std::vector<int> ids;
+    ids.reserve(g_threads.size());
+    for (const auto &[id, t] : g_threads) ids.push_back(id);
+    return ids;
+}
+
+std::uint64_t switch_count() { return g_switch_count; }
 
 int create_thread(std::uint32_t entry, std::uint32_t stack_size, int priority, std::uint32_t gp, std::uint32_t attr, std::uint32_t option) {
     Thread t;
@@ -525,6 +556,7 @@ void boot() {
     g_libraries.clear();
     g_hle_modules.clear();
     g_modules.clear();
+    g_module_paths.clear();
     g_threads.clear();
     g_used.clear();
     while (!g_events.empty()) g_events.pop();
@@ -663,17 +695,31 @@ std::int32_t load_module_buffer(const std::vector<std::uint8_t> &data, const std
         if (done) done(id, 0);
         return id;
     }
+    const std::int32_t id = link_module(data, path);
+    if (id < 0) return id;
+    start_module(id, args, std::move(done));
+    return id;
+}
+
+// Link a module into IOP memory without running it (modload's LoadModuleBuffer links, StartModule runs it later); -1 when it is refused.
+std::int32_t link_module(const std::vector<std::uint8_t> &data, const std::string &path) {
+    using namespace kernel;
+    const std::string name = module_name_of(path);
     if (data.size() < 52 || std::memcmp(data.data(), "\x7f" "ELF", 4) != 0) {
         std::fprintf(stderr, "[iop] %s is not an ELF module\n", path.c_str());
         return -1;
     }
     const Elf elf{data};
+    const auto refuse = [&](const char *why) {
+        std::fprintf(stderr, "[iop] %s is damaged: %s (module refused)\n", path.c_str(), why);
+        return -1;
+    };
     const std::uint16_t type = elf.u16(16);
     const std::uint32_t phoff = elf.u32(28);
     const std::uint16_t phnum = elf.u16(44), phentsize = elf.u16(42);
     std::uint32_t iopmod = 0, load_off = 0, load_size = 0, mem_size = 0;
     for (std::uint32_t i = 0; i < phnum; ++i) {
-        const std::size_t ph = phoff + i * phentsize;
+        const std::uint64_t ph = phoff + std::uint64_t{i} * phentsize;
         const std::uint32_t ptype = elf.u32(ph);
         if (ptype == 0x70000080u) iopmod = elf.u32(ph + 4);
         if (ptype == 1 && !load_size) {
@@ -682,17 +728,30 @@ std::int32_t load_module_buffer(const std::vector<std::uint8_t> &data, const std
             mem_size = elf.u32(ph + 20);
         }
     }
+    if (elf.bad) return refuse("a program header lies past the end of the file");
     if (!iopmod || !load_size) {
         std::fprintf(stderr, "[iop] %s has no iopmod/load segment (type 0x%X)\n", path.c_str(), type);
         return -1;
     }
-    const std::uint32_t entry = elf.u32(iopmod + 4), gp = elf.u32(iopmod + 8);
-    const std::uint32_t total = std::max(mem_size, elf.u32(iopmod + 12) + elf.u32(iopmod + 16) + elf.u32(iopmod + 20));
+    const std::uint32_t entry = elf.u32(std::uint64_t{iopmod} + 4), gp = elf.u32(std::uint64_t{iopmod} + 8);
+    const std::uint64_t sizes = std::uint64_t{elf.u32(std::uint64_t{iopmod} + 12)} + elf.u32(std::uint64_t{iopmod} + 16) + elf.u32(std::uint64_t{iopmod} + 20);
+    const std::uint64_t whole = std::max<std::uint64_t>(mem_size, sizes);
+    // ELF spec: the file contents (p_filesz) lie inside the file and are no larger than the segment in memory; and the module has
+    // to fit in the IOP's 2 MiB. Anything else would copy past the module's block or wrap the sizes round 4 GiB.
+    if (elf.bad) return refuse("its iopmod record lies past the end of the file");
+    if (!elf.has(load_off, load_size)) return refuse("its contents lie past the end of the file");
+    if (whole >= kRamSize) return refuse("it is larger than the IOP's memory");
+    if (load_size > whole) return refuse("its contents are larger than its memory");
+    const std::uint32_t total = static_cast<std::uint32_t>(whole);
     const std::uint32_t base = alloc(total + 0x40u);
     if (!base) return -1;
     std::memset(ram_ptr(base), 0, total);
     std::memcpy(ram_ptr(base), data.data() + load_off, load_size);
     relocate(elf, base, total, type == 0xFF81u);
+    if (elf.bad) {
+        kernel::free(base);
+        return refuse("a section header or relocation table lies past the end of the file");
+    }
     link_imports(base, total);
 
     // A module the EE sent as a buffer has no file name: it is known by the name in its own header (the iopmod record, version first,
@@ -704,9 +763,20 @@ std::int32_t load_module_buffer(const std::vector<std::uint8_t> &data, const std
     }
     const int id = g_next_module++;
     g_modules[id] = Module{id, module_name, base, total, base + entry, base + gp};
+    g_module_paths[id] = path;
     if (g_trace_modules) std::fprintf(stderr, "[iop] module %d %s at 0x%08X size 0x%X entry 0x%08X\n", id, module_name.c_str(), base, total, base + entry);
+    return id;
+}
 
-    std::vector<std::string> argv{path};
+// Run the start routine of a linked module on a thread of its own; `done(module, result)` is called when it returns. False when there
+// is no such module or it has nothing to run (a module handled natively).
+bool start_module(int id, const std::string &args, std::function<void(int, int)> done) {
+    using namespace kernel;
+    const auto found = g_modules.find(id);
+    if (found == g_modules.end() || !found->second.entry) return false;
+    const std::uint32_t entry = found->second.entry, gp = found->second.gp;
+    const auto known = g_module_paths.find(id);
+    std::vector<std::string> argv{known != g_module_paths.end() ? known->second : found->second.name};
     std::size_t start = 0;
     while (start < args.size()) {
         const auto end = args.find('\0', start);
@@ -725,7 +795,7 @@ std::int32_t load_module_buffer(const std::vector<std::uint8_t> &data, const std
     }
     set_ram32(argv_at + 4u * static_cast<std::uint32_t>(argv.size()), 0);
 
-    const int tid = create_thread(base + entry, 0x4000u, kDefaultModulePriority, base + gp, 0x02000000u, 0);
+    const int tid = create_thread(entry, 0x4000u, kDefaultModulePriority, gp, 0x02000000u, 0);
     Thread *t = thread(tid);
     t->on_exit = [id, tid, argv_at, done]() {
         const std::uint32_t result = thread(tid)->context.r[2];
@@ -738,7 +808,7 @@ std::int32_t load_module_buffer(const std::vector<std::uint8_t> &data, const std
         }
     };
     start_thread(tid, static_cast<std::uint32_t>(argv.size()), argv_at);
-    return id;
+    return true;
 }
 
 void set_trace(bool modules_on, bool hle_on) {

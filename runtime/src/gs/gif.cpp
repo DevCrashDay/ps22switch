@@ -1,4 +1,3 @@
-#include "ps2/part.hpp"
 #include "gif.hpp"
 
 #include "gs.hpp"
@@ -258,13 +257,11 @@ void render_reset() {
 }
 
 void render(int path, const std::uint8_t *data, std::uint32_t qwc) {
-    part::Scope mark(part::kGif);
     GsSink sink{path};
     walk(g_paths[path], data, qwc, sink);
 }
 
 void transfer(int path, const std::uint8_t *data, std::uint32_t qwc) {
-    part::Scope mark(part::kGif);
     Held &h = g_held;
     if (!hold_here()) {
         out(path, data, qwc);

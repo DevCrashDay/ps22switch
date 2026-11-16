@@ -5,7 +5,7 @@
 // side and linking them into a library, loading a library, and the small helpers around that. Moved out of vu_live.cpp unchanged in
 // behaviour when ee_live.cpp needed the same machinery (docs/ee-live.md).
 
-#if !defined(__EMSCRIPTEN__) && !defined(__SWITCH__)
+#ifndef __EMSCRIPTEN__
 
 #include <atomic>
 #include <chrono>

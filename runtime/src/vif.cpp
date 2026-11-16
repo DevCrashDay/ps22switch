@@ -1,4 +1,3 @@
-#include "ps2/part.hpp"
 #include "vif.hpp"
 
 #include "dmac.hpp"
@@ -9,9 +8,14 @@
 
 #include "ps2/state.hpp"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <vector>
+
+#if defined(__SSE4_1__)
+#include <immintrin.h>
+#endif
 
 namespace ps2::vif {
 
@@ -38,6 +42,82 @@ bool on_vu_thread() { return gs::queue::role() == gs::queue::Role::Vu; }
 bool shadow(int unit) { return unit == 1 && gs::queue::vu_active() && !on_vu_thread(); }
 Unit &state(int unit) { return unit == 1 && on_vu_thread() ? g_vu_side : g_units[unit]; }
 
+// The last 8 commands a unit decoded, for the log when a unit loses its place in the stream (a float or a vertex read as a command).
+// Three slots: VIF0, VIF1 and VIF1's copy on the VU thread. Not part of the save state. Per command the cost is three stores.
+struct Seen {
+    std::uint32_t cmd = 0, words = 0;
+    std::uint64_t at = 0;  // the command's place in the stream, counted in words from the last reset
+};
+struct History {
+    Seen last[8];
+    std::uint32_t head = 0;
+    std::uint64_t received = 0, unknown = 0;
+};
+History g_hist[3];
+constexpr const char *kLabel[3] = {"vif0", "vif1", "vif1/vu"};
+
+int hist_index(int unit) { return unit == 1 && on_vu_thread() ? 2 : unit; }
+
+const char *command_name(std::uint32_t cmd) {
+    const std::uint32_t op = (cmd >> 24) & 0x7Fu;
+    switch (op) {
+    case 0x00: return "NOP";
+    case 0x01: return "STCYCL";
+    case 0x02: return "OFFSET";
+    case 0x03: return "BASE";
+    case 0x04: return "ITOP";
+    case 0x05: return "STMOD";
+    case 0x06: return "MSKPATH3";
+    case 0x07: return "MARK";
+    case 0x10: return "FLUSHE";
+    case 0x11: return "FLUSH";
+    case 0x13: return "FLUSHA";
+    case 0x14: return "MSCAL";
+    case 0x15: return "MSCALF";
+    case 0x17: return "MSCNT";
+    case 0x20: return "STMASK";
+    case 0x30: return "STROW";
+    case 0x31: return "STCOL";
+    case 0x4A: return "MPG";
+    case 0x50: return "DIRECT";
+    case 0x51: return "DIRECTHL";
+    default: return (op & 0x60u) == 0x60u ? "UNPACK" : "unknown";
+    }
+}
+
+// The first unknown command of a unit prints the commands before it and the DMA channel's registers, a few more print short,
+// then only a count: a unit that lost its place reads every following word as a command, thousands of lines.
+void note_unknown(int unit, std::uint32_t cmd) {
+    const int idx = hist_index(unit);
+    History &h = g_hist[idx];
+    const char *who = kLabel[idx];
+    const std::uint64_t n = ++h.unknown;
+    const Seen &now = h.last[(h.head - 1) & 7u];
+    if (n == 1) {
+        float as_float;
+        std::memcpy(&as_float, &cmd, 4);
+        std::fprintf(stderr, "[%s] lost the stream at word %llu: 0x%08X is not a command (as a float: %g). The commands before it, oldest first:\n",
+                     who, static_cast<unsigned long long>(now.at), cmd, static_cast<double>(as_float));
+        const std::uint32_t before = std::min<std::uint32_t>(h.head - 1, 7u);
+        for (std::uint32_t i = before; i >= 1; --i) {
+            const Seen &s = h.last[(h.head - 1 - i) & 7u];
+            std::fprintf(stderr, "[%s]   word %llu: 0x%08X %s, %u data words\n", who, static_cast<unsigned long long>(s.at), s.cmd, command_name(s.cmd), s.words);
+        }
+        if (!before) std::fprintf(stderr, "[%s]   (none: it is the first command since the reset)\n", who);
+        if (idx < 2) {
+            const std::uint32_t base = idx ? 0x10009000u : 0x10008000u;
+            const std::uint32_t chcr = dmac::read(base);
+            std::fprintf(stderr, "[%s]   DMA channel %d now: CHCR 0x%08X (last tag id %u) MADR 0x%08X QWC %u TADR 0x%08X; the data may also have come through the direct FIFO port\n",
+                         who, idx, chcr, (chcr >> 28) & 7u, dmac::read(base + 0x10), dmac::read(base + 0x20), dmac::read(base + 0x30));
+        }
+    } else if (n <= 5) {
+        std::fprintf(stderr, "[%s] unknown command 0x%08X at word %llu\n", who, cmd, static_cast<unsigned long long>(now.at));
+        if (n == 5) std::fprintf(stderr, "[%s] more unknown commands are counted, not printed\n", who);
+    } else if (n == 100 || n == 10000 || n == 1000000 || n == 100000000) {
+        std::fprintf(stderr, "[%s] %llu unknown commands so far\n", who, static_cast<unsigned long long>(n));
+    }
+}
+
 std::uint8_t *vu_data(int unit) { return unit ? g_vu1_mem : g_vu0_mem; }
 std::uint32_t vu_qwords(int unit) { return unit ? 1024u : 256u; }
 
@@ -56,23 +136,41 @@ std::uint32_t write_length(const Unit &u) {
     return wl ? wl : 256u;
 }
 
+// CYCLE = 0 (the state after power-on, before any STCYCL, or an explicit STCYCL 0) acts like CL = WL: a normal write, every output
+// takes its own data and nothing is skipped. FIFA Street 2 sends an UNPACK there with its data behind it (Ridge Racer V's log shows
+// CL 0 but not WL), and the stream stays in step on the console. A cycle length of 0 with a write length above 0 is not that: Tekken 5 sends STCYCL 0x0500, a
+// STMASK and then several UNPACK headers back to back with no data, so that stays a filling write that takes none. What the console does
+// at CL 0 is not measured (dma/vif/stcycl shows only where the quadwords land, and no test unpacks with CL 0); see docs/vif-cycle.md.
+std::uint32_t cycle_length(const Unit &u, std::uint32_t wl) {
+    const std::uint32_t cl = u.cycle & 0xFFu;
+    return cl == 0 && (u.cycle & 0xFF00u) == 0 ? wl : cl;
+}
+
 std::uint32_t unpack_words(std::uint32_t cmd, const Unit &u, std::uint32_t num) {
     const std::uint32_t vn = (cmd >> 26) & 3u, vl = (cmd >> 24) & 3u;
-    const std::uint32_t cl = u.cycle & 0xFFu, wl = write_length(u);
+    const std::uint32_t wl = write_length(u), cl = cycle_length(u, wl);
     std::uint32_t data = num;
     if (wl > cl) data = (num / wl) * cl + std::min(num % wl, cl);
     const std::uint32_t bits = (vn == 3 && vl == 3) ? 16u : (vn + 1) * element_bits(vl);
     return (data * bits + 31) / 32;
 }
 
-void run_vu(int unit, std::uint32_t address) {
-    Unit &u = state(unit);
+// What run() works out once per call instead of once per command: which copy of the unit it is (the vector thread keeps its own,
+// g_vu_side) and whether it is the emulation thread only following VIF1 (shadow). Each of the two asks a function in another file.
+struct Ctx {
+    Unit &u;
+    bool vu_thread;
+    bool dry;
+};
+
+void run_vu(int unit, std::uint32_t address, const Ctx &c) {
+    Unit &u = c.u;
     if (unit == 1) {
         u.top = u.tops;
         u.itop = u.itops;
         u.dbf = !u.dbf;
         u.tops = u.base + (u.dbf ? u.ofst : 0);
-        if (shadow(unit)) return;
+        if (c.dry) return;
         vu::set_tops(u.top, u.itop);
     } else {
         u.itop = u.itops;  // VU0 reads it from here (vif::itop); VU1's TOP and ITOP are not VU0's to change
@@ -80,6 +178,92 @@ void run_vu(int unit, std::uint32_t address) {
     vu::run(unit, address);
 }
 
+#if defined(__SSE4_1__)
+// One element of an UNPACK as the four words it becomes in the vector unit's memory: sign or zero extended, a one-component element
+// repeated, a two-component element as x y x y, a three-component one with w = 0. Reads exactly the bytes of the element (the last
+// element of a command may end the data), so it never looks past them.
+template <std::uint32_t Bits, std::uint32_t Components, bool Usn>
+__attribute__((always_inline)) inline __m128i unpack_element(const std::uint8_t *p) {
+    if constexpr (Bits == 32) {
+        if constexpr (Components == 4) {
+            return _mm_loadu_si128(reinterpret_cast<const __m128i *>(p));
+        } else if constexpr (Components == 3) {
+            std::uint32_t c;
+            std::memcpy(&c, p + 8, 4);
+            return _mm_insert_epi32(_mm_loadl_epi64(reinterpret_cast<const __m128i *>(p)), static_cast<int>(c), 2);
+        } else if constexpr (Components == 2) {
+            return _mm_shuffle_epi32(_mm_loadl_epi64(reinterpret_cast<const __m128i *>(p)), 0x44);
+        } else {
+            std::uint32_t a;
+            std::memcpy(&a, p, 4);
+            return _mm_set1_epi32(static_cast<int>(a));
+        }
+    } else if constexpr (Bits == 16) {
+        if constexpr (Components == 1) {
+            std::uint16_t h;
+            std::memcpy(&h, p, 2);
+            return _mm_set1_epi32(Usn ? static_cast<int>(h) : static_cast<int>(static_cast<std::int16_t>(h)));
+        } else {
+            __m128i x;
+            if constexpr (Components == 4) {
+                x = _mm_loadl_epi64(reinterpret_cast<const __m128i *>(p));
+            } else {
+                std::uint32_t a;
+                std::memcpy(&a, p, 4);
+                x = _mm_cvtsi32_si128(static_cast<int>(a));
+                if constexpr (Components == 3) {
+                    std::uint16_t c;
+                    std::memcpy(&c, p + 4, 2);
+                    x = _mm_insert_epi16(x, c, 2);
+                }
+            }
+            const __m128i wide = Usn ? _mm_cvtepu16_epi32(x) : _mm_cvtepi16_epi32(x);
+            if constexpr (Components == 2) return _mm_shuffle_epi32(wide, 0x44);
+            else return wide;
+        }
+    } else {
+        if constexpr (Components == 1) {
+            return _mm_set1_epi32(Usn ? static_cast<int>(p[0]) : static_cast<int>(static_cast<std::int8_t>(p[0])));
+        } else {
+            std::uint32_t a;
+            if constexpr (Components == 4) {
+                std::memcpy(&a, p, 4);
+            } else if constexpr (Components == 3) {
+                std::uint16_t h;
+                std::memcpy(&h, p, 2);
+                a = h | (static_cast<std::uint32_t>(p[2]) << 16);
+            } else {
+                std::uint16_t h;
+                std::memcpy(&h, p, 2);
+                a = h;
+            }
+            const __m128i x = _mm_cvtsi32_si128(static_cast<int>(a));
+            const __m128i wide = Usn ? _mm_cvtepu8_epi32(x) : _mm_cvtepi8_epi32(x);
+            if constexpr (Components == 2) return _mm_shuffle_epi32(wide, 0x44);
+            else return wide;
+        }
+    }
+}
+
+template <std::uint32_t Bits, std::uint32_t Components, bool Usn>
+void unpack_fast(std::uint8_t *mem, std::uint32_t mask, std::uint32_t addr, std::uint32_t wl, std::uint32_t skip, const std::uint8_t *bytes, std::uint32_t num) {
+    constexpr std::size_t stride = static_cast<std::size_t>(Components) * Bits / 8;
+    if (skip == 0) {
+        for (std::uint32_t n = 0; n < num; ++n)
+            _mm_storeu_si128(reinterpret_cast<__m128i *>(mem + static_cast<std::size_t>((addr + n) & mask) * 16), unpack_element<Bits, Components, Usn>(bytes + n * stride));
+        return;
+    }
+    std::uint32_t cycle = 0;
+    for (std::uint32_t n = 0; n < num; ++n) {
+        _mm_storeu_si128(reinterpret_cast<__m128i *>(mem + static_cast<std::size_t>(addr & mask) * 16), unpack_element<Bits, Components, Usn>(bytes + n * stride));
+        ++addr;
+        if (++cycle >= wl) {
+            addr += skip;
+            cycle = 0;
+        }
+    }
+}
+#else
 template <std::uint32_t Bits, std::uint32_t Components, bool Usn>
 void unpack_fast(std::uint8_t *mem, std::uint32_t mask, std::uint32_t addr, std::uint32_t wl, std::uint32_t skip, const std::uint8_t *bytes, std::uint32_t num) {
     std::uint32_t cycle = 0;
@@ -114,6 +298,8 @@ void unpack_fast(std::uint8_t *mem, std::uint32_t mask, std::uint32_t addr, std:
     }
 }
 
+#endif
+
 using FastUnpack = void (*)(std::uint8_t *, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, const std::uint8_t *, std::uint32_t);
 
 template <std::uint32_t Bits>
@@ -133,9 +319,9 @@ constexpr FastUnpack kFastUnpack[4][4][2] = {
     {{fast_pair<16>(1, false), fast_pair<16>(1, true)}, {fast_pair<16>(2, false), fast_pair<16>(2, true)}, {fast_pair<16>(3, false), fast_pair<16>(3, true)}, {fast_pair<16>(4, false), fast_pair<16>(4, true)}},
 };
 
-void unpack(int unit, std::uint32_t cmd, const std::uint32_t *data) {
-    Unit &u = state(unit);
-    const bool dry = shadow(unit);
+void unpack(int unit, std::uint32_t cmd, const std::uint32_t *data, const Ctx &c) {
+    Unit &u = c.u;
+    const bool dry = c.dry;
     if (dry && u.mode < 2) {
         u.num = 0;
         return;
@@ -147,7 +333,7 @@ void unpack(int unit, std::uint32_t cmd, const std::uint32_t *data) {
     if (!num) num = 256;
     std::uint32_t addr = cmd & 0x3FFu;
     if (unit == 1 && ((cmd >> 15) & 1u)) addr += u.tops;
-    const std::uint32_t cl = u.cycle & 0xFFu, wl = write_length(u);
+    const std::uint32_t wl = write_length(u), cl = cycle_length(u, wl);
     const std::uint32_t components = vn + 1;
     const std::uint32_t bits = element_bits(vl);
     std::size_t bit_pos = 0;
@@ -213,8 +399,7 @@ void unpack(int unit, std::uint32_t cmd, const std::uint32_t *data) {
     u.num = 0;
 }
 
-std::uint32_t data_words(int unit, std::uint32_t cmd) {
-    const Unit &u = state(unit);
+std::uint32_t data_words(std::uint32_t cmd, const Unit &u) {
     const std::uint32_t op = (cmd >> 24) & 0x7Fu;
     const std::uint32_t num = (cmd >> 16) & 0xFFu;
     switch (op) {
@@ -228,11 +413,11 @@ std::uint32_t data_words(int unit, std::uint32_t cmd) {
     }
 }
 
-void execute(int unit, std::uint32_t cmd, const std::uint32_t *data) {
-    Unit &u = state(unit);
+void execute(int unit, std::uint32_t cmd, const std::uint32_t *data, const Ctx &c) {
+    Unit &u = c.u;
     const std::uint32_t op = (cmd >> 24) & 0x7Fu, imm = cmd & 0xFFFFu, num = (cmd >> 16) & 0xFFu;
     u.code = cmd;
-    if (!on_vu_thread()) ++g_commands[unit][op];
+    if (!c.vu_thread) ++g_commands[unit][op];
     switch (op) {
     case 0x00: break;
     case 0x01: u.cycle = imm; break;
@@ -243,13 +428,13 @@ void execute(int unit, std::uint32_t cmd, const std::uint32_t *data) {
     case 0x06: gif::set_path3_masked((imm >> 15) & 1u); break;
     case 0x07: u.mark = imm; u.stat |= kStatMrk; break;
     case 0x10: case 0x11: case 0x13: break;
-    case 0x14: case 0x15: run_vu(unit, imm * 8u); break;
-    case 0x17: run_vu(unit, shadow(unit) ? 0u : vu::tpc(unit)); break;
+    case 0x14: case 0x15: run_vu(unit, imm * 8u, c); break;
+    case 0x17: run_vu(unit, c.dry ? 0u : vu::tpc(unit), c); break;
     case 0x20: u.mask = data[0]; break;
     case 0x30: std::memcpy(u.row, data, 16); break;
     case 0x31: std::memcpy(u.col, data, 16); break;
     case 0x4A: {
-        if (shadow(unit)) break;
+        if (c.dry) break;
         std::uint8_t *code = unit ? g_vu1_code : g_vu0_code;
         const std::uint32_t size = unit ? 16384u : 4096u;
         const std::uint32_t count = num ? num : 256u;
@@ -264,12 +449,12 @@ void execute(int unit, std::uint32_t cmd, const std::uint32_t *data) {
         break;
     }
     case 0x50: case 0x51:
-        if (shadow(unit)) gif::scan_signals(2, reinterpret_cast<const std::uint8_t *>(data), imm ? imm : 0x10000u);
+        if (c.dry) gif::scan_signals(2, reinterpret_cast<const std::uint8_t *>(data), imm ? imm : 0x10000u);
         else gif::transfer(2, reinterpret_cast<const std::uint8_t *>(data), imm ? imm : 0x10000u);
         break;
     default:
-        if ((op & 0x60u) == 0x60u) unpack(unit, cmd, data);
-        else std::fprintf(stderr, "[vif%d] unknown command 0x%08X\n", unit, cmd);
+        if ((op & 0x60u) == 0x60u) unpack(unit, cmd, data, c);
+        else note_unknown(unit, cmd);
         break;
     }
     if ((cmd & 0x80000000u) && !(u.err & 1u)) {
@@ -279,7 +464,7 @@ void execute(int unit, std::uint32_t cmd, const std::uint32_t *data) {
             u.stat |= kStatVis;
             u.stalled = true;
         }
-        if (!on_vu_thread()) hw::intc_raise(4u + static_cast<unsigned>(unit));
+        if (!c.vu_thread) hw::intc_raise(4u + static_cast<unsigned>(unit));
     }
 }
 
@@ -293,18 +478,24 @@ void decode(int unit, std::uint32_t cmd) {
     }
 }
 
-std::size_t run(int unit, const std::uint32_t *words, std::size_t count) {
-    Unit &u = state(unit);
+// `base` is the stream position of words[0], for the history.
+std::size_t run(int unit, const std::uint32_t *words, std::size_t count, std::uint64_t base) {
+    const bool vu_thread = on_vu_thread();
+    const bool side = unit == 1 && vu_thread;  // the vector thread's own copy of VIF1
+    const Ctx c{side ? g_vu_side : g_units[unit], vu_thread, unit == 1 && gs::queue::vu_active() && !vu_thread};
+    Unit &u = c.u;
+    History &h = g_hist[side ? 2 : unit];
     std::size_t pos = 0;
     while (pos < count && !u.stalled) {
         const std::uint32_t cmd = words[pos];
         const std::size_t start = pos + 1;
-        const std::uint32_t need = data_words(unit, cmd);
+        const std::uint32_t need = data_words(cmd, u);
         if (start + need > count) {
             decode(unit, cmd);
             break;
         }
-        execute(unit, cmd, words + start);
+        h.last[h.head++ & 7u] = {cmd, need, base + pos};
+        execute(unit, cmd, words + start, c);
         pos = start + need;
     }
     return pos;
@@ -312,7 +503,7 @@ std::size_t run(int unit, const std::uint32_t *words, std::size_t count) {
 
 void process(int unit) {
     Unit &u = state(unit);
-    const std::size_t pos = run(unit, u.pending.data(), u.pending.size());
+    const std::size_t pos = run(unit, u.pending.data(), u.pending.size(), g_hist[hist_index(unit)].received - u.pending.size());
     u.pending.erase(u.pending.begin(), u.pending.begin() + static_cast<std::ptrdiff_t>(pos));
 }
 
@@ -320,9 +511,13 @@ void process(int unit) {
 
 void reset() {
     for (Unit &u : g_units) u = Unit{};
+    for (History &h : g_hist) h = History{};
 }
 
-void reset_vu_side() { g_vu_side = Unit{}; }
+void reset_vu_side() {
+    g_vu_side = Unit{};
+    g_hist[2] = History{};
+}
 
 std::uint32_t itop(int unit) { return g_units[unit].itop; }
 
@@ -333,23 +528,29 @@ void stats() {
             if (g_commands[u][op]) std::fprintf(stderr, " %02X:%llu", op, static_cast<unsigned long long>(g_commands[u][op]));
         std::fprintf(stderr, "\n");
     }
+    for (int i = 0; i < 3; ++i)
+        if (g_hist[i].unknown) std::fprintf(stderr, "[%s] %llu unknown commands in this run\n", kLabel[i], static_cast<unsigned long long>(g_hist[i].unknown));
 }
 
-void transfer(int unit, const std::uint8_t *data, std::uint32_t qwc) {
-    part::Scope mark(part::kVif);
-    if (shadow(unit)) gs::queue::vu().post(gs::queue::kVif1, qwc, 0, data, qwc * 16);
+// `count` words, not quadwords: the 64 bits of a DMA tag that a chain with the tag transfer enabled sends ahead of its data are two
+// words, and a command waiting for data (an UNPACK that spans several tags) takes exactly those two.
+void transfer_words(int unit, const std::uint32_t *words, std::uint32_t count) {
+    if (shadow(unit)) gs::queue::vu().post(gs::queue::kVif1, count, 0, words, count * 4);
     Unit &u = state(unit);
+    g_hist[hist_index(unit)].received += count;
     if (u.pending.empty() && !u.stalled) {
-        const auto *words = reinterpret_cast<const std::uint32_t *>(data);
-        const std::size_t count = static_cast<std::size_t>(qwc) * 4;
-        const std::size_t pos = run(unit, words, count);
+        const std::size_t pos = run(unit, words, count, g_hist[hist_index(unit)].received - count);
         if (pos < count) u.pending.assign(words + pos, words + count);
         return;
     }
     const std::size_t old = u.pending.size();
-    u.pending.resize(old + static_cast<std::size_t>(qwc) * 4);
-    std::memcpy(u.pending.data() + old, data, static_cast<std::size_t>(qwc) * 16);
+    u.pending.resize(old + static_cast<std::size_t>(count));
+    std::memcpy(u.pending.data() + old, words, static_cast<std::size_t>(count) * 4);
     process(unit);
+}
+
+void transfer(int unit, const std::uint8_t *data, std::uint32_t qwc) {
+    transfer_words(unit, reinterpret_cast<const std::uint32_t *>(data), qwc * 4);
 }
 
 // The DMA keeps sending into a stalled unit until the unit's FIFO is full.
@@ -399,11 +600,22 @@ void write(int unit, std::uint32_t reg, std::uint32_t value) {
         break;
     case 0x10:
         if (value & 1u) {
-            // A reset leaves the filling registers alone, as in PCSX2: Downhill
-            // Domination sets ROW once and resets the VIF before every frame.
+            // A reset stops the unit and clears its status, error and mark and the command it was decoding. The registers that
+            // VIF commands set (the write cycle, the add-row mode, the mask, ROW and COL, ITOPS, BASE and OFFSET) keep their values:
+            // Downhill Domination sets ROW once and resets the VIF before every frame, and Zone of the Enders sets the write
+            // cycle (STCYCL 4,4) once at start-up, resets the VIF later without sending it again, and then unpacks with it. A cycle
+            // that a reset had cleared to 0 made every UNPACK take no data, so the vectors that follow were read as commands (CL 0
+            // is a normal write now, see cycle_length, but the cycle a game set is still the one it unpacks with).
             Unit fresh{};
             std::memcpy(fresh.row, u.row, sizeof fresh.row);
             std::memcpy(fresh.col, u.col, sizeof fresh.col);
+            fresh.cycle = u.cycle;
+            fresh.mode = u.mode;
+            fresh.mask = u.mask;
+            fresh.itops = u.itops;
+            fresh.base = u.base;
+            fresh.ofst = u.ofst;
+            fresh.tops = u.base;  // the double-buffer flag is clear again, so the next buffer is at BASE
             u = fresh;
         }
         if (value & 8u) {

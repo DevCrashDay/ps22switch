@@ -2,11 +2,8 @@
 #include "ps2/system.hpp"
 #include "ps2/ee_live.hpp"
 #include "ps2/vu_live.hpp"
-#include "ps2/deko_stage0.h"
-#include "thread.hpp"
-#include "switch_clock.hpp"
-#include "switch_crash.hpp"
 
+#include "big_stack_thread.hpp"
 #ifdef PS2_WINDOW
 #include "window.hpp"
 #endif
@@ -15,13 +12,15 @@
 #endif
 
 #include <algorithm>
-#include <cctype>
 #include <cstdio>
+#include <csignal>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <filesystem>
 #include <string>
+#include <stdexcept>
 #include <string_view>
 #include <system_error>
 #include <vector>
@@ -42,18 +41,16 @@
 #include <fcntl.h>
 #include <io.h>
 #include <windows.h>
+#include <timeapi.h>
 #include <shellapi.h>
 #else
-#include <csignal>
+#include <cerrno>
 #include <unistd.h>
 #ifdef __GLIBC__
 #include <execinfo.h>
 #endif
 #ifdef PS2_WINDOW
 #include <fcntl.h>
-#endif
-#ifdef __SWITCH__
-#include <switch.h>
 #endif
 #endif
 
@@ -66,7 +63,7 @@ int usage() {
     std::fprintf(stderr,
                  "usage: ps2run <elf> [--arg text]... [--frames n] [--ntsc] [--misses file]\n"
                  "              [--disc image.iso] [--memcard card.ps2] [--pal | --ntsc] [--trace-syscalls] [--trace-io] [--trace-threads]\n"
-                 "              [--trace-iop] [--trace-iop-hle] [--frames-dir dir] [--frame-every n]\n"
+                 "              [--trace-iop] [--trace-iop-hle] [--frames-dir dir] [--frame-every n] [--frame-at n]...\n"
                  "              [--press frame:button[+button][:frames]]... [--window] [--fullscreen]\n"
                  "              [--save-state frame:file] [--load-state file|newest] [--quick-dir dir] [--widescreen] [--patches file]\n"
                  "              [--record file] [--no-record] [--replay file [--replay-continue]] [--rtc seconds]\n");
@@ -110,6 +107,35 @@ void connect_output() {
 }
 #endif
 
+// PS2_CRASH_TEST=<where>:<what> (a test aid, off unless set; docs/nolog.md): makes the program fail on purpose, to see that the log
+// then ends with the crash line. where: main (the window thread, after the log copy started), emu (the emulation thread), tee (the thread that copies the log). what: access (a write to address 0), stack (endless
+// recursion: a stack overflow), abort, throw (an exception nobody catches), param (a C runtime call with an argument it refuses).
+__attribute__((noinline)) int crash_test_recurse(int depth) {
+    // A frame this big is probed from the top down, so the overflow is found while most of a page is still left (under Wine the
+    // handler has no room at all when the last bytes are used up one small frame after the other: its own limit, not a bug here).
+    volatile char pad[1000000];  // not a power of two: the last level then ends well above the limit
+    pad[0] = static_cast<char>(depth);
+    return crash_test_recurse(depth + 1) + pad[0];
+}
+
+[[maybe_unused]] void crash_test(const char *where) {
+    static const std::string setting = ps2::os::env("PS2_CRASH_TEST");
+    const std::string want = std::string(where) + ":";
+    if (setting.rfind(want, 0) != 0) return;
+    const std::string what = setting.substr(want.size());
+    std::fprintf(stderr, "[crash-test] %s at %s\n", what.c_str(), where);
+    std::fflush(stderr);
+    if (what == "access") *static_cast<volatile int *>(nullptr) = 1;
+    else if (what == "stack") std::exit(crash_test_recurse(0));
+    else if (what == "abort") std::abort();
+    else if (what == "throw") throw std::runtime_error("PS2_CRASH_TEST");
+    else if (what == "param") {
+#ifdef _WIN32
+        _close(12345);  // the C runtime calls its invalid-parameter handler for a file number that is not open
+#endif
+    }
+}
+
 #ifdef PS2_WINDOW
 // While a window is open the runner's log (stderr) is kept in two more places: in memory (the last lines go into an F9 report) and
 // in a file, logs\ps2run_<date>_<time>.log next to the memory card (the newest 10 are kept). A program started by a double-click or a
@@ -120,31 +146,41 @@ class LogTee {
 public:
     ~LogTee() { stop(); }
 
+    // The log goes into `folder`; if no file can be made there (a folder that cannot be created or written), into a folder of the
+    // system's temporary files instead, and the first lines say so. The pipe and the thread start either way.
     bool start(const std::filesystem::path &folder) {
         if (active_) return true;
         std::error_code error;
-        std::filesystem::create_directories(folder, error);
-        std::vector<std::filesystem::path> old;
-        for (std::filesystem::directory_iterator it(folder, error), end; !error && it != end; it.increment(error)) {
-            const std::string name = ps2::os::utf8(it->path().filename());
-            if (name.rfind("ps2run_", 0) == 0 && name.size() > 4 && name.compare(name.size() - 4, 4, ".log") == 0) old.push_back(it->path());
-        }
-        std::sort(old.begin(), old.end());
-        for (std::size_t i = 0; i + 9 < old.size(); ++i) std::filesystem::remove(old[i], error);
-        const std::time_t t = std::time(nullptr);
-        std::tm local{};
+        std::filesystem::path place = folder;
+        for (int attempt = 0; attempt < 2 && !file_; ++attempt) {
+            if (attempt) {
+                place = std::filesystem::temp_directory_path(error) / "ps2run-logs";
+                if (error) break;
+            }
+            std::filesystem::create_directories(place, error);
+            std::vector<std::filesystem::path> old;
+            for (std::filesystem::directory_iterator it(place, error), end; !error && it != end; it.increment(error)) {
+                const std::string name = ps2::os::utf8(it->path().filename());
+                if (name.rfind("ps2run_", 0) == 0 && name.size() > 4 && name.compare(name.size() - 4, 4, ".log") == 0) old.push_back(it->path());
+            }
+            std::sort(old.begin(), old.end());
+            for (std::size_t i = 0; i + 9 < old.size(); ++i) std::filesystem::remove(old[i], error);
+            const std::time_t t = std::time(nullptr);
+            std::tm local{};
 #ifdef _WIN32
-        localtime_s(&local, &t);
+            localtime_s(&local, &t);
 #else
-        localtime_r(&t, &local);
+            localtime_r(&t, &local);
 #endif
-        char stamp[32];
-        std::strftime(stamp, sizeof stamp, "%Y-%m-%d_%H-%M-%S", &local);
-        // two runs that start in the same second must not share a file
-        std::filesystem::path file = folder / (std::string("ps2run_") + stamp + ".log");
-        for (int n = 2; std::filesystem::exists(file, error) && n < 100; ++n) file = folder / (std::string("ps2run_") + stamp + "_" + std::to_string(n) + ".log");
-        path_ = ps2::os::utf8(file);
-        file_ = ps2::os::open(path_, "wb");
+            char stamp[32];
+            std::strftime(stamp, sizeof stamp, "%Y-%m-%d_%H-%M-%S", &local);
+            // two runs that start in the same second must not share a file
+            std::filesystem::path file = place / (std::string("ps2run_") + stamp + ".log");
+            for (int n = 2; std::filesystem::exists(file, error) && n < 100; ++n) file = place / (std::string("ps2run_") + stamp + "_" + std::to_string(n) + ".log");
+            path_ = ps2::os::utf8(file);
+            // "ab": every write goes to the end of the file, so a line written beside the copy thread (write_direct) is never written over
+            file_ = ps2::os::open(path_, "ab");
+        }
         int fds[2];
 #ifdef _WIN32
         // The descriptor the stderr stream really writes to. It is 2 when the parent passed a stderr, but not when the program
@@ -163,8 +199,6 @@ public:
         if (_dup2(fds[1], err_fd_) != 0) return false;
         _setmode(err_fd_, _O_BINARY);
         SetStdHandle(STD_ERROR_HANDLE, reinterpret_cast<HANDLE>(_get_osfhandle(err_fd_)));  // code that writes to the handle (wgpu-native) too
-#elif defined(__SWITCH__)
-        return false;
 #else
         if (pipe(fds) != 0) return false;
         saved_ = dup(2);
@@ -175,17 +209,41 @@ public:
         write_fd_ = fds[1];
         active_ = true;
         thread_ = std::thread([this] { pump(); });
-        std::fprintf(stderr, "[log] this log is also written to %s\n", path_.c_str());
+        if (!file_) std::fprintf(stderr, "[log] no log file could be made in %s or in the temporary folder: this log is not written to disk\n", ps2::os::utf8(folder).c_str());
+        else if (place != folder) std::fprintf(stderr, "[log] %s cannot be written to; this log is written to %s instead\n", ps2::os::utf8(folder).c_str(), path_.c_str());
+        else std::fprintf(stderr, "[log] this log is also written to %s\n", path_.c_str());
         return true;
+    }
+
+    // Like flush(), and when the copy thread has not got to the line in time (it is slow or stuck, for example while a virus scanner
+    // holds the file), `last` is appended to the log file from here, so a crash line is in the file even then. Used by the crash handlers.
+    void flush_or_write(int wait_ms, const char *last, std::size_t size) {
+        if (!active_) return;
+        if (flush(wait_ms)) return;
+        if (path_.empty() || !size) return;
+#ifdef _WIN32
+        const HANDLE h = CreateFileW(ps2::os::path(path_).c_str(), FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, 0, nullptr);
+        if (h == INVALID_HANDLE_VALUE) return;
+        DWORD written = 0;
+        WriteFile(h, last, static_cast<DWORD>(size), &written, nullptr);
+        CloseHandle(h);
+#else
+        const int fd = open(path_.c_str(), O_WRONLY | O_APPEND);
+        if (fd < 0) return;
+        const ssize_t ignored = write(fd, last, size);
+        (void)ignored;
+        close(fd);
+#endif
     }
 
     // Everything written so far has been passed on and recorded when this returns (or wait_ms has passed). It takes no lock, so it
     // is safe in a crash handler even when the thread that crashed was holding one.
-    void flush(int wait_ms) {
-        if (!active_) return;
+    bool flush(int wait_ms) {
+        if (!active_) return true;
         const std::uint64_t want = ++sent_;
         put(write_fd_, kMarker, sizeof kMarker - 1);
         for (int waited = 0; seen_.load() < want && waited < wait_ms; ++waited) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        return seen_.load() >= want;
     }
 
     // stderr goes straight to where it went before; the file is closed. Safe to call twice.
@@ -198,7 +256,7 @@ public:
         _setmode(err_fd_, _O_BINARY);
         SetStdHandle(STD_ERROR_HANDLE, reinterpret_cast<HANDLE>(_get_osfhandle(err_fd_)));
         _close(write_fd_);
-#elif !defined(__SWITCH__)
+#else
         dup2(saved_, 2);
         close(write_fd_);
 #endif
@@ -206,7 +264,7 @@ public:
 #ifdef _WIN32
         _close(read_fd_);
         _close(saved_);
-#elif !defined(__SWITCH__)
+#else
         close(read_fd_);
         close(saved_);
 #endif
@@ -249,6 +307,7 @@ private:
 
     void pump() {
         char buffer[8192];
+        crash_test("tee");
         for (;;) {
 #ifdef _WIN32
             const int n = _read(read_fd_, buffer, sizeof buffer);
@@ -306,46 +365,217 @@ private:
 LogTee g_log;
 #endif
 
+// After a crash the card is never written over the card file (the card in memory may be half of a save, or damaged): the newest
+// card, if it changed since the file was last written, goes to "<card>.crash.ps2" beside it. This saves it and puts the line about
+// it into `line` (snprintf only: no allocation, no stream lock), returning the line's length, 0 for none.
+int crash_card_line(char *line, std::size_t size) {
+    const char *where = nullptr;
+    int length = 0;
+    switch (ps2::save_memory_card_after_crash(&where)) {
+    case 1:
+        length = std::snprintf(line, size, "[mc] the card changed less than a second before the crash; that newest card is kept in %s (the card file keeps the last card written normally)\n", where);
+        break;
+    case 2: length = std::snprintf(line, size, "[mc] the card was being changed when the program crashed; the card file keeps the last card written normally\n"); break;
+    case 3: length = std::snprintf(line, size, "[mc] the card changed before the crash, but no copy could be written; the card file keeps the last card written normally\n"); break;
+    default: break;
+    }
+    return length < 0 ? 0 : std::min<int>(length, static_cast<int>(size) - 1);
+}
+
 #ifdef _WIN32
 // The memory card file is written when the game saves (50 frames after its last write) and again whenever the game ends. These
-// two cover the ways a Windows program can be ended from outside while it is running, so a save made a moment ago is not lost:
-//   - Ctrl+C, Ctrl+Break or closing the console window the program was started from (it is told, then given a few seconds);
-//   - a crash (an unhandled exception in the program itself).
-// Both write the card in a hurry (they do not wait long for the thread that may be the one that crashed) and then let the
-// system do what it would have done anyway: the program ends.
+// two cover the ways a Windows program can be ended from outside while it is running:
+//   - Ctrl+C, Ctrl+Break or closing the console window the program was started from (it is told, then given a few seconds):
+//     the card file is written, as when the window is closed (unless a card command is in the middle of a page right then);
+//   - a crash (an unhandled exception in the program itself): the newest card goes beside the card file, never over it
+//     (crash_card_line).
+// Both then let the system do what it would have done anyway: the program ends.
 BOOL WINAPI on_console_event(DWORD) {
     ps2::flush_memory_card(true);
     return FALSE;
 }
 
-LONG WINAPI on_crash(EXCEPTION_POINTERS *info) {
-    static volatile LONG running = 0;
-    if (InterlockedExchange(&running, 1) == 0) {  // not twice if the writing itself crashes
-#ifdef PS2_WINDOW
-        // the last thing in the log file, so a player who sends it shows what happened
-        // written to the handle directly: another thread may hold the lock of the C stream
-        char line[160];
-        const int length = std::snprintf(line, sizeof line, "[crash] the program crashed: exception %08lX at address %p\n", static_cast<unsigned long>(info->ExceptionRecord->ExceptionCode),
-                                         info->ExceptionRecord->ExceptionAddress);
-        DWORD written = 0;
-        if (length > 0) WriteFile(GetStdHandle(STD_ERROR_HANDLE), line, static_cast<DWORD>(length), &written, nullptr);
-        g_log.flush(300);
-#else
-        (void)info;
-#endif
-        ps2::flush_memory_card(true);
+// What a Windows exception code means, for the crash line (a log is read by people who do not know the codes).
+const char *describe(DWORD code) {
+    switch (code) {
+    case 0xC0000005: return " (access violation: a wrong memory address)";
+    case 0xC00000FD: return " (stack overflow)";
+    case 0xC0000094: return " (integer division by zero)";
+    case 0xC000001D: return " (illegal instruction)";
+    case 0xC0000409: return " (the program stopped itself after a failed check)";
+    case 0xC0000374: return " (damaged heap)";
+    case 0x20474343:
+    case 0xE06D7363: return " (a C++ exception nobody caught)";
+    default: return "";
     }
+}
+
+// The crash line and the log. A crash is reported by a helper thread that was started with the handlers and has a stack of its own:
+// the crashing thread may have no stack left (a stack overflow leaves about one page, and formatting a line needs more), and a
+// second fault inside the handler used to end the process before the log had anything. The crashing thread only wakes the helper
+// and waits (a few bytes of stack). Four ways end a program without the line, and all four come here:
+//   - an unhandled exception (an access violation, a stack overflow, ...): on_crash;
+//   - abort(), which a failed check or std::terminate ends in: on_abort (UCRT's own abort writes nothing to a window program);
+//   - an exception nobody caught: on_terminate, which also says what it was;
+//   - a refused argument of the C runtime (a bad file number, say), which the runtime answers with a fast fail that no handler
+//     sees: on_invalid_parameter.
+namespace crash {
+HANDLE g_ask = nullptr, g_done = nullptr;
+volatile LONG g_running = 0;
+volatile DWORD g_reporter = 0;  // the thread that is writing the report
+DWORD g_code = 0;
+void *g_address = nullptr;
+char g_text[400];
+
+void report(DWORD code, void *address, const char *text) {
+    // written to the handle directly: another thread may hold the lock of the C stream
+    char line[640];
+    DWORD written = 0;
+    int length = 0;
+#ifdef PS2_WINDOW
+    // the last thing in the log file, so a player who sends it shows what happened
+    if (text) length = std::snprintf(line, sizeof line, "[crash] %s\n", text);
+    else length = std::snprintf(line, sizeof line, "[crash] the program crashed: exception %08lX%s at address %p\n", static_cast<unsigned long>(code), describe(code), address);
+    if (length > 0) WriteFile(GetStdHandle(STD_ERROR_HANDLE), line, static_cast<DWORD>(std::min<std::size_t>(length, sizeof line - 1)), &written, nullptr);
+#else
+    (void)code, (void)address, (void)text;
+#endif
+    char card[640];
+    const int card_length = crash_card_line(card, sizeof card);
+    if (card_length > 0) WriteFile(GetStdHandle(STD_ERROR_HANDLE), card, static_cast<DWORD>(card_length), &written, nullptr);
+#ifdef PS2_WINDOW
+    // if the copy thread is stuck, the lines go into the file from here
+    if (length > 0) {
+        char both[1300];
+        int size = std::min<int>(length, static_cast<int>(sizeof line) - 1);
+        std::memcpy(both, line, static_cast<std::size_t>(size));
+        if (card_length > 0) {
+            std::memcpy(both + size, card, static_cast<std::size_t>(card_length));
+            size += card_length;
+        }
+        g_log.flush_or_write(1500, both, static_cast<std::size_t>(size));
+    }
+#endif
+}
+
+DWORD WINAPI helper(void *) {
+    for (;;) {
+        if (WaitForSingleObject(g_ask, INFINITE) != WAIT_OBJECT_0) return 0;
+        g_reporter = GetCurrentThreadId();
+        report(g_code, g_address, g_text[0] ? g_text : nullptr);
+        SetEvent(g_done);
+    }
+}
+
+// The first crash writes the report (on the helper thread, or on the spot when there is none); a second thread that crashes at the
+// same time waits for it, so the process is not ended in the middle of the report. A crash inside the report itself (the reporting
+// thread comes back here) is not reported again.
+void run(DWORD code, void *address, const char *text) {
+    const DWORD me = GetCurrentThreadId();
+    if (InterlockedCompareExchange(&g_running, 1, 0) != 0) {
+        if (g_reporter != me && g_done) WaitForSingleObject(g_done, 5000);
+        return;
+    }
+    g_code = code;
+    g_address = address;
+    if (text) {
+        std::snprintf(g_text, sizeof g_text, "%s", text);
+    } else {
+        g_text[0] = 0;
+    }
+    if (g_ask && g_done) {
+        SetEvent(g_ask);
+        WaitForSingleObject(g_done, 8000);
+    } else {
+        g_reporter = me;
+        report(code, address, text);
+    }
+}
+
+LONG WINAPI on_crash(EXCEPTION_POINTERS *info) {
+    run(info->ExceptionRecord->ExceptionCode, info->ExceptionRecord->ExceptionAddress, nullptr);
     return EXCEPTION_CONTINUE_SEARCH;
 }
+
+void on_abort(int) {
+    run(0, nullptr, "the program called abort() (a check of the program failed, or an exception nobody caught)");
+    std::_Exit(3);
+}
+
+void on_terminate() {
+    char what[300] = "unknown exception";
+    try {
+        if (const auto current = std::current_exception()) std::rethrow_exception(current);
+    } catch (const std::exception &e) {
+        std::snprintf(what, sizeof what, "%s", e.what());
+    } catch (...) {
+    }
+    char text[400];
+    std::snprintf(text, sizeof text, "the program ended by an exception nobody caught: %s", what);
+    run(0, nullptr, text);
+    std::_Exit(3);
+}
+
+void on_invalid_parameter(const wchar_t *, const wchar_t *function, const wchar_t *, unsigned int, uintptr_t) {
+    char name[120] = "?";
+    if (function) WideCharToMultiByte(CP_UTF8, 0, function, -1, name, sizeof name - 1, nullptr, nullptr);
+    char text[300];
+    std::snprintf(text, sizeof text, "the C runtime refused an argument (in %s)", name);
+    run(0, nullptr, text);
+    std::_Exit(3);
+}
+
+void install() {
+    g_ask = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    g_done = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (g_ask && g_done) {
+        if (const HANDLE h = CreateThread(nullptr, 256 * 1024, helper, nullptr, 0, nullptr)) CloseHandle(h);
+        else g_ask = nullptr;
+    }
+    SetUnhandledExceptionFilter(on_crash);
+    std::signal(SIGABRT, on_abort);
+    std::set_terminate(on_terminate);
+    _set_invalid_parameter_handler(on_invalid_parameter);
+}
+}  // namespace crash
 #endif
 
-#if !defined(_WIN32) && !defined(__SWITCH__)
+#ifndef _WIN32
 // The same for Linux. A run that ended without its closing lines ("[ee] stopped after ..." and the audio summary) used to leave no trace
 // of why: a crash (SIGSEGV), an abort (a failed allocation or an exception nobody caught: SIGABRT) and the terminal closing (SIGHUP) each
 // ended the process at once, and a core dump says nothing in the log. This writes one line and the stack of the thread that got the
 // signal, gives the log copy and the memory card a moment to reach the disk, and then lets the signal do what it would have done (a core
 // dump, if the system makes one). SIGINT and SIGTERM are SDL's: it turns them into "window closed" (window/poll). SIGKILL, which the
 // compositor's "not responding" window and `hyprctl kill` send, cannot be caught; a run that ends with neither line has had one.
+//
+// The memory card is not written inside the handler: almost nothing is safe there (an abort from a damaged heap comes while the
+// allocator's lock is held, and the first allocation would hang the program instead of ending it). A helper thread, started with
+// the handlers, waits on a pipe; the handler wakes it with one byte (write() is safe in a handler) and waits up to two seconds for
+// it. After SIGHUP (the terminal was closed, as Ctrl+C) the helper writes the card file as usual; after a crash or an abort it puts
+// the newest card beside the card file, never over it (crash_card_line).
+int g_card_wake[2] = {-1, -1};
+std::atomic<int> g_card_done{0};  // lock-free, so the handler may read it
+
+void card_helper() {
+    char what = 0;
+    for (;;) {
+        const ssize_t got = read(g_card_wake[0], &what, 1);
+        if (got == 1) break;
+        if (got < 0 && errno == EINTR) continue;
+        return;
+    }
+    if (what == 'h') ps2::flush_memory_card(true);
+    else {
+        char line[640];
+        const int length = crash_card_line(line, sizeof line);
+        if (length > 0) {
+            ssize_t ignored = write(2, line, static_cast<std::size_t>(length));
+            (void)ignored;
+        }
+    }
+    g_card_done.store(1);
+}
+
 void on_fatal_signal(int sig) {
     static volatile std::sig_atomic_t running = 0;
     if (!running) {
@@ -362,10 +592,15 @@ void on_fatal_signal(int sig) {
         const int count = backtrace(frames, 64);
         backtrace_symbols_fd(frames, count, 2);
 #endif
+        const char what = sig == SIGHUP ? 'h' : 'c';
+        if (g_card_wake[1] >= 0 && write(g_card_wake[1], &what, 1) == 1)
+            for (int i = 0; i < 200 && !g_card_done.load(); ++i) {
+                struct timespec pause = {0, 10 * 1000 * 1000};
+                nanosleep(&pause, nullptr);
+            }
 #ifdef PS2_WINDOW
         g_log.flush(300);
 #endif
-        ps2::flush_memory_card(true);
     }
     std::signal(sig, SIG_DFL);
     std::raise(sig);
@@ -376,11 +611,11 @@ void install_signal_handlers() {
     void *warm[2];
     backtrace(warm, 2);  // the first call loads the unwinder (and may allocate): not in the handler
 #endif
+    if (pipe(g_card_wake) == 0) std::thread(card_helper).detach();
+    else g_card_wake[0] = g_card_wake[1] = -1;
     for (const int sig : {SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT, SIGHUP}) std::signal(sig, on_fatal_signal);
     std::signal(SIGPIPE, SIG_IGN);  // a log pipe whose reader went away makes a write fail instead of ending the run without a word
 }
-#elif defined(__SWITCH__)
-void install_signal_handlers() {}
 #endif
 
 // A name for the calling thread that Windows tools show (Process Explorer, a debugger, a profiler), so the CPU time of the
@@ -448,48 +683,25 @@ static void log_machine() {
 // --frames-dir works too: the pictures are read back here, on the drawing side, at the same frames as in a run with one thread, under the
 // same names (a picture that cannot be shown, such as one while the display is off, is skipped).
 static int run_threads_headless(const std::function<int()> &emulate) {
-#ifdef PS2_PROFILE
-    // PS2_PROFILE samples the emulation thread. PS2_PROFILE_RENDER=<file> samples the thread that draws instead (the window thread,
-    // where the drawing commands are recorded and the picture is handed over), which is where a run below full speed can lose its time.
-    // The same PS2_PROFILE_FROM=<frame> says when it starts.
-    struct RenderProfile {
-        std::string path;
-        std::uint64_t from = 0;
-        bool armed = false;
-        RenderProfile() {
-            if (const char *p = std::getenv("PS2_PROFILE_RENDER"); p && *p) path = p;
-            if (const char *f = std::getenv("PS2_PROFILE_FROM")) from = std::strtoull(f, nullptr, 10);
-        }
-        void tick() {
-            if (armed || path.empty() || ps2::frame_count() < from) return;
-            armed = true;
-            start_profile(0);  // 0: arm now, on this thread
-        }
-        void finish() {
-            if (armed) write_profile(path.c_str());
-        }
-    } render_profile;
-#endif
     ps2::init_graphics();
     ps2::g_options.on_vblank = [] { ps2::post_present(); };
     const std::string pictures = ps2::g_options.frames_dir;
-    const std::uint32_t every = ps2::g_options.frame_every ? ps2::g_options.frame_every : 1;
     ps2::g_options.frames_dir.clear();  // the emulation thread must not read the picture back itself
     ps2::g_options.sync_pictures = true;
     ps2::start_render_thread();
     if (!std::getenv("PS2_NO_VU_THREAD")) {
         ps2::start_vu_thread();
-        HostThread(ps2::run_vu_thread).detach();
+        std::thread(ps2::run_vu_thread).detach();
     }
     std::atomic<bool> done{false};
     int result = 0;
-    HostThread emulation([&] {
+    ps2::host::BigStackThread emulation([&] {
         result = emulate();
         done.store(true);
         ps2::wake_render_thread();
     });
     const std::function<void(const std::uint32_t *, std::uint32_t, std::uint32_t)> none, save = [&](const std::uint32_t *rgba, std::uint32_t width, std::uint32_t height) {
-        if (ps2::picture_frame() % every) return;
+        if (!ps2::frame_capture_requested(ps2::picture_frame())) return;
         char name[48];
         std::snprintf(name, sizeof name, "/frame_%05u.ppm", ps2::picture_frame());
         if (std::FILE *f = ps2::os::open(pictures + name, "wb")) {
@@ -501,167 +713,20 @@ static int run_threads_headless(const std::function<int()> &emulate) {
             std::fclose(f);
         }
     };
-    while (!done.load()) {
+    while (!done.load())
         if (ps2::render_pending(false, pictures.empty() ? none : save, nullptr, 8.0) == ps2::Rendered::idle) ps2::wait_render_work(4);
-#ifdef PS2_PROFILE
-        render_profile.tick();
-#endif
-    }
-#ifdef PS2_PROFILE
-    render_profile.finish();
-#endif
     emulation.join();
     std::fflush(nullptr);
     std::_Exit(result);
 }
 
-#ifdef __SWITCH__
-// The NAME=value lines of launch.txt set before any static object is made, so switches the runtime reads while starting up (PS2_IOP_LOAD
-// and the like) see them as they would see the shell's on the PC. libnx has the arguments and the SD card ready by then.
-// Memory for the GPU (the Vulkan renderer). NVK takes its memory through nvmap, outside the newlib heap, and needs a larger transfer
-// memory than libnx's default; libnx's own heap setup gives newlib everything that is left, so a large GPU allocation could find
-// nothing. The heap is set up as libnx does it, less a reserve for the GPU. The same as NetherSX2's Switch port (source/main.c).
-extern "C" {
-u32 __nx_nv_transfermem_size = 16 * 1024 * 1024;
-extern char *fake_heap_start;
-extern char *fake_heap_end;
-
-void __libnx_initheap(void) {
-    void *addr = nullptr;
-    std::size_t size = 0;
-    if (envHasHeapOverride()) {
-        addr = envGetHeapOverrideAddr();
-        size = envGetHeapOverrideSize();
-    } else {
-        u64 available = 0, used = 0;
-        svcGetInfo(&available, InfoType_TotalMemorySize, CUR_PROCESS_HANDLE, 0);
-        svcGetInfo(&used, InfoType_UsedMemorySize, CUR_PROCESS_HANDLE, 0);
-        if (available > used + 0x200000) size = (available - used - 0x200000) & ~std::size_t{0x1FFFFF};
-        // leave this much unmapped for the GPU: 512 MB with a game's memory (title takeover), 128 MB in the album
-        const std::size_t reserve = std::size_t{size > (std::size_t{2} << 30) ? 512u : 128u} << 20;
-        if (size > reserve + (std::size_t{256} << 20)) size = (size - reserve) & ~std::size_t{0x1FFFFF};
-        if (size == 0) size = 0x2000000 * 16;
-        if (R_FAILED(svcSetHeapSize(&addr, size))) diagAbortWithResult(MAKERESULT(Module_Libnx, LibnxError_HeapAllocFailed));
-    }
-    fake_heap_start = static_cast<char *>(addr);
-    fake_heap_end = static_cast<char *>(addr) + size;
-}
-}
-
-extern "C" char **__system_argv __attribute__((weak));
-extern "C" int __system_argc __attribute__((weak));
-__attribute__((constructor(101))) void switch_early_environment() {
-    if (!&__system_argc || !&__system_argv || __system_argc < 1 || !__system_argv || !__system_argv[0]) return;
-    std::string path = __system_argv[0];
-    const std::size_t slash = path.find_last_of('/');
-    path = (slash == std::string::npos ? std::string() : path.substr(0, slash + 1)) + "launch.txt";
-    std::FILE *f = std::fopen(path.c_str(), "rb");
-    if (!f) return;
-    char line[512];
-    while (std::fgets(line, sizeof line, f)) {
-        std::string s = line;
-        while (!s.empty() && (s.back() == '\n' || s.back() == '\r' || s.back() == ' ')) s.pop_back();
-        const std::size_t eq = s.find('=');
-        if (eq == std::string::npos || eq == 0) continue;
-        if (!std::all_of(s.begin(), s.begin() + static_cast<std::ptrdiff_t>(eq), [](char c) { return std::isupper(static_cast<unsigned char>(c)) || std::isdigit(static_cast<unsigned char>(c)) || c == '_'; }))
-            continue;
-        setenv(s.substr(0, eq).c_str(), s.substr(eq + 1).c_str(), 1);
-    }
-    std::fclose(f);
-}
-
-// The homebrew menu starts an .nro with no arguments: what a command line gives ps2run elsewhere (the program, --disc, --patches,
-// --widescreen and the rest) comes from launch.txt next to the .nro (or in its RomFS), one argument to a line, with paths relative to
-// the folder of the file. scripts/switch_port.py writes it. Without one, the folder is searched for a program and a disc image.
-std::vector<std::string> switch_arguments() {
-    std::error_code error;
-    const auto read_lines = [](const std::string &path, std::vector<std::string> &lines) {
-        std::FILE *f = std::fopen(path.c_str(), "rb");
-        if (!f) return false;
-        std::string text;
-        char buffer[4096];
-        for (std::size_t n; (n = std::fread(buffer, 1, sizeof buffer, f)) > 0;) text.append(buffer, n);
-        std::fclose(f);
-        std::size_t start = 0;
-        while (start <= text.size()) {
-            std::size_t end = text.find('\n', start);
-            if (end == std::string::npos) end = text.size();
-            std::string line = text.substr(start, end - start);
-            while (!line.empty() && (line.back() == '\r' || line.back() == ' ' || line.back() == '\t')) line.pop_back();
-            const std::size_t first = line.find_first_not_of(" \t");
-            if (first != std::string::npos && line[first] != '#') lines.push_back(line.substr(first));
-            start = end + 1;
-        }
-        return true;
-    };
-    for (const std::string dir : {"./", "romfs:/"}) {
-        std::vector<std::string> lines;
-        if (!read_lines(dir + "launch.txt", lines) || lines.empty()) continue;
-        if (dir != "./") chdir(dir.c_str());  // the paths in it are relative to its folder
-        std::fprintf(stderr, "[switch] arguments from %slaunch.txt\n", dir.c_str());
-        // A line NAME=value sets an environment variable instead (PS2_VK_PROFILE=1 and the other switches the PC takes from the shell)
-        std::vector<std::string> args;
-        for (const std::string &line : lines) {
-            const std::size_t eq = line.find('=');
-            const bool setting = eq != std::string::npos && eq > 0 &&
-                                 std::all_of(line.begin(), line.begin() + static_cast<std::ptrdiff_t>(eq), [](char c) { return std::isupper(static_cast<unsigned char>(c)) || std::isdigit(static_cast<unsigned char>(c)) || c == '_'; });
-            if (setting) {
-                setenv(line.substr(0, eq).c_str(), line.substr(eq + 1).c_str(), 1);
-                std::fprintf(stderr, "[switch] %s\n", line.c_str());
-            } else {
-                args.push_back(line);
-            }
-        }
-        return args;
-    }
-    // No launch.txt: the first PS2 program and the first disc image here or in disc/
-    const auto ends_with = [](std::string name, const char *suffix) {
-        std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-        const std::size_t n = std::strlen(suffix);
-        return name.size() > n && name.compare(name.size() - n, n, suffix) == 0;
-    };
-    std::string program, disc;
-    for (const std::string dir : {".", "disc"}) {
-        if (!std::filesystem::is_directory(dir, error)) continue;
-        for (const auto &entry : std::filesystem::directory_iterator(dir, error)) {
-            if (!entry.is_regular_file(error)) continue;
-            const std::string name = entry.path().filename().string();
-            const bool boot_program = name.size() == 11 && name[4] == '_' && name[8] == '.';  // SLUS_203.28, SCES_501.48, ...
-            if (program.empty() && (boot_program || name == "core.elf" || ends_with(name, ".elf"))) program = (std::filesystem::path(dir) / name).string();
-            if (disc.empty() && ends_with(name, ".iso")) disc = (std::filesystem::path(dir) / name).string();
-        }
-    }
-    if (program.empty()) return {};
-    std::vector<std::string> args{program};
-    if (!disc.empty()) args.insert(args.end(), {"--disc", disc});
-    args.insert(args.end(), {"--memcard", "memcard.ps2"});  // the game's saves are kept next to the .nro
-    return args;
-}
-
-// Without a console to print to, a start that cannot go on says why on the screen until + is pressed.
-int switch_error(const char *text) {
-    std::fprintf(stderr, "[switch] %s\n", text);
-    consoleInit(nullptr);
-    padConfigureInput(1, HidNpadStyleSet_NpadStandard);
-    PadState pad;
-    padInitializeDefault(&pad);
-    std::printf("ps2run\n\n%s\n\nThe log is ps2run.log next to the .nro.\n\nPress + to return to the homebrew menu.\n", text);
-    while (appletMainLoop()) {
-        padUpdate(&pad);
-        if (padGetButtonsDown(&pad) & HidNpadButton_Plus) break;
-        consoleUpdate(nullptr);
-    }
-    consoleExit(nullptr);
-    return 1;
-}
-#endif
-
 int main(int argc, char **argv) {
-#ifdef __SWITCH__
-    romfsInit();
-    std::atexit([] { romfsExit(); });
-#endif
 #ifdef _WIN32
+    // first: what can go wrong from here on is reported (crash::install), and this thread keeps stack for the report
+    ps2::host::reserve_crash_stack();
+    crash::install();
+    // The runtime uses short SDL/condition-variable waits; request 1 ms timer granularity for Windows pacing.
+    timeBeginPeriod(1);
     connect_output();
     // argv is in the ANSI code page and loses every character outside it: take the UTF-16 command line and use it as UTF-8
     std::vector<std::string> utf8_args;
@@ -676,52 +741,43 @@ int main(int argc, char **argv) {
         argv = utf8_argv.data();
     }
 #endif
-#ifdef __SWITCH__
-    // The folder of the .nro (the homebrew menu gives its path as argv[0]) is where launch.txt, the program, the disc image, the
-    // memory card and the log are.
-    if (argc >= 1 && argv[0]) {
-        const std::string self = argv[0];
-        const std::size_t slash = self.find_last_of('/');
-        if (slash != std::string::npos) chdir(self.substr(0, slash + 1).c_str());
-    }
-    if (std::FILE *log = std::freopen("ps2run.log", "w", stderr)) std::setvbuf(log, nullptr, _IOLBF, 0);
-    // stdout too, and on descriptors 1 and 2 as well as the C streams: code that writes there directly (Mesa's shader compiler, in
-    // Rust, with NAK_DEBUG) stopped the program when nothing was behind them
-    if (std::FILE *out = std::freopen("ps2run.stdout.log", "w", stdout)) {
-        std::setvbuf(out, nullptr, _IOLBF, 0);
-        if (fileno(out) != 1) dup2(fileno(out), 1);
-    }
-    if (fileno(stderr) != 2) dup2(fileno(stderr), 2);
-    switch_crash_report();  // host/switch_crash.cpp: from here on, a CPU fault names itself in the log instead of cutting it short
-    std::vector<std::string> switch_args;
-    std::vector<char *> switch_argv;
-    if (argc < 2) {
-        switch_args = switch_arguments();
-        if (switch_args.empty()) return switch_error("No PS2 program found: put launch.txt (scripts/switch_port.py writes one) or the game's ELF next to the .nro.");
-        switch_argv.push_back(argv[0]);
-        for (std::string &a : switch_args) switch_argv.push_back(a.data());
-        switch_argv.push_back(nullptr);
-        argc = static_cast<int>(switch_argv.size()) - 1;
-        argv = switch_argv.data();
-    }
-#endif
     if (argc < 2) return usage();
-#ifdef __SWITCH__
-    switch_clock_start();
+#ifdef PS2_WINDOW
+    // The log copy starts before anything else that can fail (the arguments, the window, the translation set-up, the disc), so
+    // whatever ends the run later leaves a log file behind: the app points a player at it ("Logs are not being created", public
+    // issue 42). Only the arguments that say where it goes are read here; main reads them all again below.
+    {
+        // PS2_LOG_COPY=1 (a test aid): a headless run keeps the log copy too, so the log file can be tested without a window
+        bool window_run = ps2::os::env("PS2_LOG_COPY") == "1";
+        for (int i = 2; i < argc; ++i) {
+            const std::string a = argv[i];
+            if (a == "--window" || a == "--fullscreen") window_run = true;
+            else if (a == "--memcard" && i + 1 < argc) ps2::g_options.memcard_path = argv[++i];
+            else if (a == "--quick-dir" && i + 1 < argc) ps2::g_options.quick_dir = argv[++i];
+        }
+        ps2::g_options.program_path = argv[1];
+        // PS2_NO_LOG_COPY=1 leaves the log alone (no memory copy, no file): the way back if the pipe is ever in the way
+        if (window_run && ps2::os::env("PS2_NO_LOG_COPY").empty() && g_log.start(ps2::os::path(ps2::quick_folder("logs")))) {
+            ps2::g_options.recent_log = [](std::size_t lines) { return g_log.tail(lines); };
+            ps2::g_options.first_log = [](std::size_t lines) { return g_log.head(lines); };
+            ps2::g_options.on_exit = [] { g_log.stop(); };
+            std::atexit([] { g_log.stop(); });  // the window run that returns from main
+        }
+    }
 #endif
+    crash_test("main");
 #ifdef _WIN32
     SetConsoleCtrlHandler(on_console_event, TRUE);
-    SetUnhandledExceptionFilter(on_crash);
 #else
     install_signal_handlers();
 #endif
-    std::atexit([] { ps2::flush_memory_card(); });  // whatever way the program ends through exit()
+#ifdef _WIN32
+    std::atexit([] { timeEndPeriod(1); ps2::flush_memory_card(); });
+#else
+    std::atexit([] { ps2::flush_memory_card(); });
+#endif
     std::vector<std::string> args{argv[1]};
     [[maybe_unused]] bool window = false, fullscreen = false;
-#ifdef __SWITCH__
-    window = true;
-    fullscreen = true;
-#endif
     std::string load_path;
     bool no_record = false;
     ps2::g_options.program_path = argv[1];
@@ -750,6 +806,7 @@ int main(int argc, char **argv) {
         else if (a == "--trace-iop") ps2::g_options.trace_iop_modules = true;
         else if (a == "--trace-iop-hle") ps2::g_options.trace_iop_hle = true;
         else if (a == "--frames-dir" && i + 1 < argc) ps2::g_options.frames_dir = argv[++i];
+        else if (a == "--frame-at" && i + 1 < argc) ps2::g_options.frame_capture_frames.push_back(std::strtoull(argv[++i], nullptr, 10));
         else if (a == "--press" && i + 1 < argc) {
             ps2::Press press;
             if (!ps2::parse_press(argv[++i], press)) return usage();
@@ -781,47 +838,35 @@ int main(int argc, char **argv) {
         else if (a == "--quick-dir" && i + 1 < argc) ps2::g_options.quick_dir = argv[++i];
         else return usage();
     }
+    std::sort(ps2::g_options.frame_capture_frames.begin(), ps2::g_options.frame_capture_frames.end());
+    ps2::g_options.frame_capture_frames.erase(
+        std::unique(ps2::g_options.frame_capture_frames.begin(), ps2::g_options.frame_capture_frames.end()),
+        ps2::g_options.frame_capture_frames.end());
 
-#ifdef PS2_DEKO3D
-    // PS2_DEKO3D=1 (or =<frames>): stage 0 of the deko3d renderer (runtime/src/gs/gpu/deko/deko_stage0.cpp) instead of the game.
-    // It has to run before open_window() below, because SDL takes the console's window for its own, and deko3d cannot present into a
-    // window that SDL's EGL surface already owns (that is where the Vulkan present path stopped).
-    if (const std::string deko = ps2::os::env("PS2_DEKO3D"); !deko.empty() && deko != "0") return ps2::deko_stage0();
-#endif
 
 #ifdef PS2_WINDOW
-    // PS2_NO_LOG_COPY=1 leaves the log alone (no memory copy, no file): the way back if the pipe is ever in the way
-    if (window && ps2::os::env("PS2_NO_LOG_COPY").empty() && g_log.start(ps2::os::path(ps2::quick_folder("logs")))) {
-        ps2::g_options.recent_log = [](std::size_t lines) { return g_log.tail(lines); };
-        ps2::g_options.first_log = [](std::size_t lines) { return g_log.head(lines); };
-        ps2::g_options.on_exit = [] { g_log.stop(); };
-        std::atexit([] { g_log.stop(); });  // the window run that returns from main
-    }
-#endif
-
-#ifdef PS2_WINDOW
-    // Playing records the vector programs that are not compiled into this build into the vu1 folder of the game that port.sh
-    // made, games/<name>/vu1, so `port.sh <name> <image> --no-explore` can compile them afterwards (docs/gow2.md). Without that, a
-    // game is slow wherever the exploring runs did not go: unknown programs run in the interpreter. A PS2_VU_RECORD the user set
-    // wins. This runs before anything reads the variable (the vector unit code reads it on its first program, long after main).
-    // The game folder is found from the program first: port.sh always extracts it into the game folder (disc/<program>,
-    // patched/<program>, or core.elf at the top), so the folder is the program's own or the one above it. The disc image is no
-    // guide on its own: port.sh hard-links it into the game folder, but a hard link cannot reach another drive, and an image on
-    // another drive is played from where it is, with no vu1 folder next to it. Next to the disc image is still looked at last.
-    if (window && ps2::os::env("PS2_VU_RECORD").empty()) {
+    // Record unknown microprograms beside the game that port.sh prepared.
+    // Explicit per-unit recording directories take precedence. Find the game
+    // folder from the executable (disc/, patched/ or a top-level core ELF),
+    // then use the disc image's folder as a final fallback.
+    if (window) {
         std::error_code error;
         std::vector<std::filesystem::path> places;
         const std::filesystem::path program = std::filesystem::absolute(ps2::os::path(argv[1]), error);
         if (!error) places = {program.parent_path(), program.parent_path().parent_path()};
         if (!ps2::g_options.disc_path.empty()) {
-            const std::filesystem::path disc = std::filesystem::absolute(ps2::os::path(ps2::g_options.disc_path), error);
+            const auto disc = std::filesystem::absolute(ps2::os::path(ps2::g_options.disc_path), error);
             if (!error) places.push_back(disc.parent_path());
         }
-        for (const std::filesystem::path &place : places) {
-            const std::filesystem::path vu1 = (place / "vu1").lexically_normal();
-            if (std::filesystem::is_directory(vu1, error) && ps2::os::set_env("PS2_VU_RECORD", ps2::os::utf8(vu1))) {
-                std::fprintf(stderr, "[vu1] recording vector programs that are not compiled yet into %s\n", ps2::os::env("PS2_VU_RECORD").c_str());
-                break;
+        for (int unit : {1, 0}) {
+            const char *setting = unit ? "PS2_VU_RECORD" : "PS2_VU0_RECORD";
+            if (!ps2::os::env(setting).empty()) continue;
+            for (const auto &place : places) {
+                const auto directory = (place / (unit ? "vu1" : "vu0")).lexically_normal();
+                if (std::filesystem::is_directory(directory, error) && ps2::os::set_env(setting, ps2::os::utf8(directory))) {
+                    std::fprintf(stderr, "[vu%d] recording unknown vector programs into %s\n", unit, ps2::os::env(setting).c_str());
+                    break;
+                }
             }
         }
     }
@@ -877,6 +922,7 @@ int main(int argc, char **argv) {
     }
     const auto emulate = [&]() -> int {
         name_thread(L"ps2 emulation");
+        crash_test("emu");
         std::uint32_t entry = 0;
         if (!ps2::load_elf(argv[1], entry)) {
             std::fprintf(stderr, "cannot load %s\n", argv[1]);
