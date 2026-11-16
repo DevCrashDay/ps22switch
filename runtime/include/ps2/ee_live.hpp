@@ -10,6 +10,7 @@
 
 #include <cstdint>
 #include <string>
+#include <span>
 
 namespace ps2::ee::live {
 
@@ -18,6 +19,8 @@ namespace ps2::ee::live {
 // (entries.txt and overlays\ in it get what was found), or empty. Loads what earlier runs left in the cache. With no C++ compiler
 // found it logs one line and only the loaded libraries are used.
 void start(const std::string &program, const std::string &cache, const std::string &game_dir);
+// Copies the ELF bytes; the caller need not keep them alive. Uses the same cache stamp and analysis as file boot.
+void start(std::span<const std::uint8_t> program, const std::string &cache, const std::string &game_dir);
 
 bool active();
 
@@ -41,10 +44,22 @@ namespace ps2 {
 // the game does.
 bool window_covered(std::uint32_t base, std::uint32_t size);
 
+// A line of text about every fixed base module that covers pc: its name, size, how many of its check words differ from the memory now
+// and the first one that does (a debugging aid for PS2_EE_LIVE_VERBOSE: why was a module that was translated for this code not used).
+std::string module_report(std::uint32_t pc);
+
 struct ModuleInfo;
 
 // add_modules (generated.hpp) with a rank: of two modules of the same content that are both in place and both have the function, the
 // one of the higher rank runs. A quick library (rank 0) is followed by one made with the normal flags (rank 1) for the same window.
-void add_modules_ranked(const ModuleInfo *modules, std::uint32_t count, int rank);
+//
+// `soft` (one entry per module, or null): the groups of check words a live library keeps for the entries that only a guess made
+// (recomp::HeadChecks): {entry offset, n, n * {offset, word}}. They do not decide whether the module is in place; the words of an entry
+// are compared when that entry is entered, and an entry whose words differ is not served (the game misses it and a new library has it).
+struct SoftChecks {
+    const std::uint32_t *words = nullptr;
+    std::uint32_t count = 0;
+};
+void add_modules_ranked(const ModuleInfo *modules, std::uint32_t count, int rank, const SoftChecks *soft = nullptr);
 
 }  // namespace ps2

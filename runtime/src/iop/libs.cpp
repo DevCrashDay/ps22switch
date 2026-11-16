@@ -1,17 +1,56 @@
 #include "kernel.hpp"
 
 #include "hw.hpp"
+#include "sif.hpp"
 
 #include "ps2/state.hpp"
 #include "ps2/system.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <deque>
 #include <map>
+#include <memory>
 #include <set>
 #include <vector>
+
+// Guest pointers and sizes that reach past the end of a memory. Real games never pass such values; a bad call or a damaged module
+// may. These helpers are shared by the IOP's files (sif.cpp, io.cpp, cdvd.cpp, cdvdfsv.cpp, spu2.cpp declare them where they use them).
+namespace ps2::iop {
+
+// The first few are said with what was done about them, so a game that does it in a loop does not flood the log.
+void bad_span(const char *what, std::uint32_t address, std::uint64_t size, const char *outcome) {
+    static std::atomic<unsigned> said{0};
+    const unsigned n = said.fetch_add(1, std::memory_order_relaxed);
+    if (n < 8)
+        std::fprintf(stderr, "[iop] %s: 0x%08X size 0x%llX reaches past the end of memory, %s%s\n", what, address,
+                     static_cast<unsigned long long>(size), outcome, n == 7 ? " (further ones are not shown)" : "");
+}
+
+namespace {
+bool ram_fits(std::uint32_t a, std::uint64_t n) { return (phys(a) & (kRamSize - 1)) + n <= kRamSize; }
+}
+
+// Writes n bytes into IOP memory at the masked address: one memcpy as before when they fit, else byte by byte round the 2 MiB
+// (the RAM is mirrored), so a string or a block near the end never lands past g_ram.
+void put_ram(const char *what, std::uint32_t dst, const void *data, std::size_t n) {
+    if (ram_fits(dst, n)) { std::memcpy(ram_ptr(dst), data, n); return; }
+    bad_span(what, dst, n, "written round to the start");
+    const auto *bytes = static_cast<const std::uint8_t *>(data);
+    for (std::size_t i = 0; i < n; ++i) *ram_ptr(dst + static_cast<std::uint32_t>(i)) = bytes[i];
+}
+
+// The same for a fill. More than the whole memory is cut to 2 MiB (after one round every byte has the value anyway).
+void fill_ram(const char *what, std::uint32_t dst, std::uint8_t value, std::uint64_t n) {
+    if (ram_fits(dst, n)) { std::memset(ram_ptr(dst), value, static_cast<std::size_t>(n)); return; }
+    bad_span(what, dst, n, "written round to the start");
+    n = std::min<std::uint64_t>(n, kRamSize);
+    for (std::uint32_t i = 0; i < n; ++i) *ram_ptr(dst + i) = value;
+}
+
+}
 
 namespace ps2::iop::kernel {
 
@@ -29,6 +68,7 @@ constexpr int kErrorEventCondition = -421;
 constexpr int kErrorMbxNone = -424;
 constexpr int kErrorNoMemory = -400;
 constexpr int kErrorUnknownModule = -202;
+constexpr int kErrorIllegalObject = -201;
 
 std::uint32_t arg(const Cpu &c, int i) { return i < 4 ? c.r[4 + i] : read32(c.r[29] + 16u + static_cast<std::uint32_t>(i - 4) * 4u); }
 
@@ -220,6 +260,37 @@ std::uint64_t timer_cycles(const HardTimer &t, std::uint32_t ticks) {
 
 void arm_hard_timer(std::uint32_t id);
 
+// A hardware timer a game sets up with the low-level calls (AllocHardTimer, SetTimerCompare, SetTimerMode, then an interrupt handler
+// on the timer's line) counts at once and raises its interrupt when the counter reaches the compare value (mode bit 4), again and
+// again with the repeat bit (bit 6). Lines: the 16-bit timers use 4 to 6, the 32-bit ones 14 to 16 (the IOP's root counters).
+// The call numbers and mode bits are those of ps2sdk's timrman (iop/kernel/include/timrman.h, AFL-2.0); Zone of the Enders' IOP_MAIN.IRX
+// uses a 5 ms timer this way (compare 0x2D000, mode 0x158) to wake its worker thread.
+struct IrqTimer {
+    std::uint32_t compare = 0, mode = 0, source = 1, prescale = 1, line = 14;
+    std::uint64_t generation = 0;
+};
+std::map<std::uint32_t, IrqTimer> g_irq_timers;
+// The "compare value reached" flag (0x800) of the timers' mode register, which GetTimerStatus returns and clears. Kept apart from
+// IrqTimer so that struct, and with it the save-state layout, stays as it was; a flag that was set at the moment of a save is lost.
+std::map<std::uint32_t, std::uint32_t> g_irq_timer_reached;
+std::uint32_t g_irq_timers_16 = 0, g_irq_timers_32 = 0;
+
+void arm_irq_timer(std::uint32_t id) {
+    IrqTimer &t = g_irq_timers[id];
+    const std::uint64_t generation = ++t.generation;
+    if (!(t.mode & 0x10u) || !t.compare) return;
+    const std::uint64_t per_tick = (t.source & 4u) ? 2343u : std::max<std::uint32_t>(t.prescale, 1u);
+    schedule(now() + static_cast<std::uint64_t>(t.compare) * per_tick, Job{kJobHardTimer, id | 0x80000000u, static_cast<std::uint32_t>(generation), static_cast<std::uint32_t>(generation >> 32)});
+}
+
+void fire_irq_timer(std::uint32_t id, std::uint64_t generation) {
+    const auto it = g_irq_timers.find(id);
+    if (it == g_irq_timers.end() || it->second.generation != generation) return;
+    g_irq_timer_reached[id] |= 0x800u;
+    hw::raise_interrupt(it->second.line);
+    if (it->second.mode & 0x40u) arm_irq_timer(id);
+}
+
 std::uint32_t hard_timer_counter(std::uint32_t id) {
     const auto it = g_hard_timers.find(id);
     if (it == g_hard_timers.end()) return 0;
@@ -228,6 +299,10 @@ std::uint32_t hard_timer_counter(std::uint32_t id) {
 }
 
 void fire_hard_timer(std::uint32_t id, std::uint64_t generation) {
+    if (id & 0x80000000u) {
+        fire_irq_timer(id & 0x7FFFFFFFu, generation);
+        return;
+    }
     auto it = g_hard_timers.find(id);
     if (it == g_hard_timers.end() || !it->second.running || it->second.generation != generation || !it->second.handler) return;
     const std::uint32_t next = call_guest(it->second.handler, it->second.common);
@@ -325,6 +400,29 @@ void install_intrman() {
     });
     def("intrman", 23, "QueryIntrContext", [](Cpu &c) { c.r[2] = in_interrupt() ? 1u : 0u; });
 }
+
+// thbase, the IOP thread manager. The export numbers and names are those of ps2sdk's thread manager
+// (iop/system/threadman/src/exports.tab, AFL-2.0): 3 GetThreadmanData, 4 CreateThread ... 41 GetSystemStatusFlag, and from export
+// version 1.2 on (iop/system/threadman/include/xthbase.h) 42 GetThreadCurrentPriority, 43 GetSystemTimeLow, 44 ReferSystemStatus,
+// 45 ReferThreadRunStatus, 46 GetThreadStackFreeSize, 47 GetThreadmanIdList. Argument layouts, constants and error codes come from
+// ps2sdk's thbase.h, xthbase.h, kerr.h and thbase.c; where ps2sdk only has a stub or keeps no such statistics, the comment says so.
+
+// The wait types of ps2sdk thbase.h (TSW_*) for the wait kinds of this kernel.
+int sdk_wait_type(WaitKind kind) {
+    switch (kind) {
+    case kWaitNone: return 0;
+    case kWaitSleep: return 1;
+    case kWaitDelay: return 2;
+    case kWaitSema: return 3;
+    case kWaitEvent: return 4;
+    case kWaitMbx: return 5;
+    case kWaitVpl: return 6;
+    case kWaitFpl: return 7;
+    default: return 1;  // the waits this kernel uses inside its own libraries (vblank, SIF RPC): a sleep as far as a game can tell
+    }
+}
+
+bool waiting(const Thread &t) { return t.status == kWait || t.status == kWaitSuspend; }
 
 void install_thbase() {
     register_hle_library("thbase", 0x0101);
@@ -427,7 +525,7 @@ void install_thbase() {
             write32(p + 24, t->gp);
             write32(p + 28, static_cast<std::uint32_t>(t->init_priority));
             write32(p + 32, static_cast<std::uint32_t>(t->priority));
-            write32(p + 36, static_cast<std::uint32_t>(t->wait));
+            write32(p + 36, waiting(*t) ? static_cast<std::uint32_t>(sdk_wait_type(t->wait)) : 0u);
             write32(p + 40, static_cast<std::uint32_t>(t->wait_id));
             write32(p + 44, static_cast<std::uint32_t>(t->wakeups));
         }
@@ -444,7 +542,7 @@ void install_thbase() {
     auto wakeup = [](Cpu &c) {
         Thread *t = thread(static_cast<int>(arg(c, 0)));
         if (!t) { c.r[2] = static_cast<std::uint32_t>(kErrorUnknownThread); return; }
-        if (t->status == kWait && t->wait == kWaitSleep) {
+        if (waiting(*t) && t->wait == kWaitSleep) {
             wake(*t, 0);
             reschedule();
         } else {
@@ -461,8 +559,42 @@ void install_thbase() {
     };
     def("thbase", 27, "CancelWakeupThread", cancel_wakeup);
     def("thbase", 28, "iCancelWakeupThread", cancel_wakeup);
-    def("thbase", 29, "SuspendThread", [](Cpu &c) { c.r[2] = 0; });
-    def("thbase", 31, "ResumeThread", [](Cpu &c) { c.r[2] = 0; });
+    // SuspendThread / ResumeThread (and the i- variants for interrupt handlers). ps2sdk's own thread manager only has stubs that
+    // return KE_ERROR here, so the behaviour is that of the console's thread manager as its documentation describes it: a ready or
+    // running thread becomes SUSPEND, a waiting one WAIT-SUSPEND (it stays suspended when the wait ends); a dormant thread gives
+    // KE_DORMANT, a thread that is suspended already KE_ERROR; thid 0 (TH_SELF) is not allowed (KE_ILLEGAL_THID, as in
+    // StartThread of thbase.c). ResumeThread on a thread that is not suspended gives KE_NOT_SUSPEND.
+    auto suspend = [](Cpu &c) {
+        const int id = static_cast<int>(arg(c, 0));
+        if (id == 0) { c.r[2] = static_cast<std::uint32_t>(-406); return; }
+        Thread *t = thread(id);
+        if (!t) { c.r[2] = static_cast<std::uint32_t>(kErrorUnknownThread); return; }
+        c.r[2] = 0;
+        switch (t->status) {
+        case kDormant: c.r[2] = static_cast<std::uint32_t>(-413); break;
+        case kSuspend:
+        case kWaitSuspend: c.r[2] = static_cast<std::uint32_t>(-1); break;
+        case kWait: t->status = kWaitSuspend; break;
+        default:
+            t->status = kSuspend;
+            reschedule();
+            break;
+        }
+    };
+    auto resume = [](Cpu &c) {
+        const int id = static_cast<int>(arg(c, 0));
+        if (id == 0) { c.r[2] = static_cast<std::uint32_t>(-406); return; }
+        Thread *t = thread(id);
+        if (!t) { c.r[2] = static_cast<std::uint32_t>(kErrorUnknownThread); return; }
+        c.r[2] = 0;
+        if (t->status == kSuspend) ready(*t);
+        else if (t->status == kWaitSuspend) t->status = kWait;
+        else c.r[2] = static_cast<std::uint32_t>(-415);
+    };
+    def("thbase", 29, "SuspendThread", suspend);
+    def("thbase", 30, "iSuspendThread", suspend);
+    def("thbase", 31, "ResumeThread", resume);
+    def("thbase", 32, "iResumeThread", resume);
     def("thbase", 33, "DelayThread", [](Cpu &c) {
         Thread *t = current();
         c.r[2] = 0;
@@ -497,6 +629,115 @@ void install_thbase() {
     });
     def("thbase", 41, "GetSystemStatusFlag", [](Cpu &c) { c.r[2] = 0; });
     def("thbase", 43, "GetSystemTimeLow", [](Cpu &c) { c.r[2] = static_cast<std::uint32_t>(now()); });
+
+    // 42 GetThreadCurrentPriority: KE_ILLEGAL_CONTEXT inside an interrupt handler, else the running thread's current priority
+    // (thbase.c). With no thread running the idle thread is meant, whose priority is 127 (CreateThread refuses anything above 126).
+    def("thbase", 42, "GetThreadCurrentPriority", [](Cpu &c) {
+        if (in_interrupt()) { c.r[2] = static_cast<std::uint32_t>(-100); return; }
+        const Thread *t = current();
+        c.r[2] = static_cast<std::uint32_t>(t ? t->priority : 127);
+    });
+
+    // 44 ReferSystemStatus(info, size): size below sizeof(iop_sys_status_t) (0x40) gives KE_ERROR; else `size` bytes are zeroed and
+    // status (0 in a thread, 3 with interrupts disabled, 4 in an interrupt handler), systemLowTimerWidth (32), idleClocks, kernelClocks,
+    // comesOutOfIdleCount and threadSwitchCount are filled (thbase.c). This kernel keeps no clock statistics, so those stay 0.
+    def("thbase", 44, "ReferSystemStatus", [](Cpu &c) {
+        const std::uint32_t p = arg(c, 0), size = arg(c, 1);
+        if (size < 0x40u) { c.r[2] = static_cast<std::uint32_t>(-1); return; }
+        for (std::uint32_t i = 0; i < size; i += 4) write32(p + i, 0);
+        write32(p + 0, in_interrupt() ? 4u : (interrupts_suspended() ? 3u : 0u));
+        write32(p + 4, 32);
+        write32(p + 28, static_cast<std::uint32_t>(switch_count()));
+        c.r[2] = 0;
+    });
+
+    // 45 ReferThreadRunStatus(thid, stat, size): KE_ILLEGAL_CONTEXT in an interrupt handler, KE_UNKNOWN_THID for a bad id (0 means the
+    // running thread), KE_ILLEGAL_SIZE (-432) when size is below sizeof(iop_thread_run_status_t) (0x2C). Layout (thbase.h):
+    // status, currentPriority, waitType, waitId, wakeupCount, regContext, runClocks (lo, hi), intrPreemptCount, threadPreemptCount,
+    // releaseCount. The register context and the run statistics are not kept here and read 0.
+    def("thbase", 45, "ReferThreadRunStatus", [](Cpu &c) {
+        if (in_interrupt()) { c.r[2] = static_cast<std::uint32_t>(-100); return; }
+        const int id = static_cast<int>(arg(c, 0));
+        const std::uint32_t p = arg(c, 1), size = arg(c, 2);
+        Thread *t = id < 0 ? nullptr : thread(id);
+        if (!t) { c.r[2] = static_cast<std::uint32_t>(kErrorUnknownThread); return; }
+        if (size < 0x2Cu) { c.r[2] = static_cast<std::uint32_t>(-432); return; }
+        for (std::uint32_t i = 0; i < size; i += 4) write32(p + i, 0);
+        write32(p + 0, static_cast<std::uint32_t>(t->status));
+        write32(p + 4, static_cast<std::uint32_t>(t->priority));
+        if (waiting(*t)) {
+            write32(p + 8, static_cast<std::uint32_t>(sdk_wait_type(t->wait)));
+            write32(p + 12, static_cast<std::uint32_t>(t->wait_id));
+        }
+        write32(p + 16, static_cast<std::uint32_t>(t->wakeups));
+        c.r[2] = 0;
+    });
+
+    // 46 GetThreadStackFreeSize(thid): KE_ILLEGAL_CONTEXT in an interrupt handler, KE_UNKNOWN_THID for a bad id (0 means the running
+    // thread). The console's thread manager fills a new stack with 0xFF and returns how much of it was never touched. This kernel
+    // does not fill stacks (a game can depend on what is in there), so it returns the room that is left below the thread's stack
+    // pointer: the same figure at the moment of the call, never smaller than the console's lowest-ever figure.
+    def("thbase", 46, "GetThreadStackFreeSize", [](Cpu &c) {
+        if (in_interrupt()) { c.r[2] = static_cast<std::uint32_t>(-100); return; }
+        const int id = static_cast<int>(arg(c, 0));
+        Thread *t = id < 0 ? nullptr : thread(id);
+        if (!t) { c.r[2] = static_cast<std::uint32_t>(kErrorUnknownThread); return; }
+        std::uint32_t free_bytes = t->stack_size;
+        if (t->status != kDormant) {
+            const std::uint32_t sp = t == current() ? c.r[29] : t->context.r[29];
+            if (sp >= t->stack && sp <= t->stack + t->stack_size) free_bytes = sp - t->stack;
+        }
+        c.r[2] = free_bytes;
+    });
+
+    // 47 GetThreadmanIdList(type, buf, bufsize, *count): writes up to bufsize ids to buf and returns how many it wrote; *count (if
+    // not NULL) gets the number that exist. type 1..9 is TMID_Thread, Semaphore, EventFlag, Mbox, Vpl, Fpl, SleepThread, DelayThread,
+    // DormantThread (xthbase.h); any other value is the id of a semaphore, event flag, mailbox, variable or fixed pool and lists the
+    // threads waiting on it, KE_ILLEGAL_TYPE (-431) when it is none of those (thbase.c). Object ids here are small numbers, so the
+    // first nine objects of a game share their id with a TMID_ type; the type wins, as the ids of the console are far above 9.
+    def("thbase", 47, "GetThreadmanIdList", [](Cpu &c) {
+        if (in_interrupt()) { c.r[2] = static_cast<std::uint32_t>(-100); return; }
+        const int type = static_cast<int>(arg(c, 0));
+        const std::uint32_t buf = arg(c, 1), count_at = arg(c, 3);
+        const int capacity = static_cast<int>(arg(c, 2));
+        std::vector<int> ids;
+        const auto threads_where = [&ids](const std::function<bool(const Thread &)> &pick) {
+            for (const int id : thread_ids())
+                if (const Thread *t = thread(id); t && pick(*t)) ids.push_back(id);
+        };
+        const auto keys = [&ids](const auto &objects) {
+            for (const auto &entry : objects) ids.push_back(entry.first);
+        };
+        switch (type) {
+        case 1: threads_where([](const Thread &) { return true; }); break;
+        case 2: keys(g_semas); break;
+        case 3: keys(g_events); break;
+        case 4: keys(g_mbxs); break;
+        case 5: keys(g_vpls); break;
+        case 6: keys(g_fpls); break;
+        case 7: threads_where([](const Thread &t) { return waiting(t) && t.wait == kWaitSleep; }); break;
+        case 8: threads_where([](const Thread &t) { return waiting(t) && t.wait == kWaitDelay; }); break;
+        case 9: threads_where([](const Thread &t) { return t.status == kDormant; }); break;
+        default: {
+            WaitKind kind = kWaitNone;
+            if (g_semas.count(type)) kind = kWaitSema;
+            else if (g_events.count(type)) kind = kWaitEvent;
+            else if (g_mbxs.count(type)) kind = kWaitMbx;
+            else if (g_vpls.count(type)) kind = kWaitVpl;
+            else if (g_fpls.count(type)) kind = kWaitFpl;
+            if (kind == kWaitNone) { c.r[2] = static_cast<std::uint32_t>(-431); return; }
+            threads_where([kind, type](const Thread &t) { return waiting(t) && t.wait == kind && t.wait_id == type; });
+        }
+        }
+        int written = 0;
+        for (const int id : ids) {
+            if (written >= capacity) break;
+            write32(buf + 4u * static_cast<std::uint32_t>(written), static_cast<std::uint32_t>(id));
+            ++written;
+        }
+        if (count_at) write32(count_at, static_cast<std::uint32_t>(ids.size()));
+        c.r[2] = static_cast<std::uint32_t>(written);
+    });
 }
 
 void install_thsemap() {
@@ -652,6 +893,21 @@ void install_thmsgbx() {
         it->second.messages.pop_front();
         c.r[2] = 0;
     });
+    auto refer = [](Cpu &c) {
+        const auto it = g_mbxs.find(static_cast<int>(arg(c, 0)));
+        if (it == g_mbxs.end()) { c.r[2] = static_cast<std::uint32_t>(kErrorUnknownMbx); return; }
+        const std::uint32_t status = arg(c, 1);
+        write32(status + 0u, it->second.attr);
+        write32(status + 4u, it->second.option);
+        write32(status + 8u, static_cast<std::uint32_t>(it->second.waiters.size()));
+        write32(status + 12u, static_cast<std::uint32_t>(it->second.messages.size()));
+        write32(status + 16u, it->second.messages.empty() ? 0u : it->second.messages.front());
+        write32(status + 20u, 0u);
+        write32(status + 24u, 0u);
+        c.r[2] = 0;
+    };
+    def("thmsgbx", 11, "ReferMbxStatus", refer);
+    def("thmsgbx", 12, "iReferMbxStatus", refer);
 }
 
 void install_thfpool() {
@@ -835,32 +1091,44 @@ void install_sysclib() {
         }
         c.r[2] = 0;
     });
+    // The fast path's bounds are worked out in 64 bits (a size near 4 GiB wrapped the 32-bit sum and passed). The byte loop goes
+    // through write8, which stays inside the memory; more than the whole memory is cut to 2 MiB so it cannot run for minutes.
     auto copy = [](std::uint32_t dst, std::uint32_t src, std::uint32_t n) {
-        if (phys(dst) + n <= kRamSize && phys(src) + n <= kRamSize) std::memmove(ram_ptr(dst), ram_ptr(src), n);
-        else if (dst < src) for (std::uint32_t i = 0; i < n; ++i) write8(dst + i, read8(src + i));
+        if (std::uint64_t{phys(dst)} + n <= kRamSize && std::uint64_t{phys(src)} + n <= kRamSize) { std::memmove(ram_ptr(dst), ram_ptr(src), n); return; }
+        if (n > kRamSize) { bad_span("sysclib memcpy", dst, n, "cut to 2 MiB"); n = kRamSize; }
+        if (dst < src) for (std::uint32_t i = 0; i < n; ++i) write8(dst + i, read8(src + i));
         else for (std::uint32_t i = n; i-- > 0;) write8(dst + i, read8(src + i));
     };
     def("sysclib", 12, "memcpy", [copy](Cpu &c) { watch_copy("memcpy", arg(c, 0), arg(c, 1), arg(c, 2), c.r[31]); copy(arg(c, 0), arg(c, 1), arg(c, 2)); c.r[2] = arg(c, 0); });
     def("sysclib", 13, "memmove", [copy](Cpu &c) { watch_copy("memmove", arg(c, 0), arg(c, 1), arg(c, 2), c.r[31]); copy(arg(c, 0), arg(c, 1), arg(c, 2)); c.r[2] = arg(c, 0); });
     def("sysclib", 14, "memset", [](Cpu &c) {
         watch_copy("memset", arg(c, 0), arg(c, 1), arg(c, 2), c.r[31]);
-        if (phys(arg(c, 0)) + arg(c, 2) <= kRamSize) std::memset(ram_ptr(arg(c, 0)), static_cast<int>(arg(c, 1) & 0xFF), arg(c, 2));
-        else for (std::uint32_t i = 0; i < arg(c, 2); ++i) write8(arg(c, 0) + i, static_cast<std::uint8_t>(arg(c, 1)));
+        if (std::uint64_t{phys(arg(c, 0))} + arg(c, 2) <= kRamSize) std::memset(ram_ptr(arg(c, 0)), static_cast<int>(arg(c, 1) & 0xFF), arg(c, 2));
+        else {
+            std::uint32_t n = arg(c, 2);
+            if (n > kRamSize) { bad_span("sysclib memset", arg(c, 0), n, "cut to 2 MiB"); n = kRamSize; }
+            for (std::uint32_t i = 0; i < n; ++i) write8(arg(c, 0) + i, static_cast<std::uint8_t>(arg(c, 1)));
+        }
         c.r[2] = arg(c, 0);
     });
     def("sysclib", 15, "bcmp", [](Cpu &c) {
-        c.r[2] = std::memcmp(ram_ptr(arg(c, 0)), ram_ptr(arg(c, 1)), arg(c, 2)) ? 1u : 0u;
+        const std::uint32_t a = arg(c, 0), b = arg(c, 1), n = arg(c, 2);
+        if (ram_fits(a, n) && ram_fits(b, n)) { c.r[2] = std::memcmp(ram_ptr(a), ram_ptr(b), n) ? 1u : 0u; return; }
+        bad_span("sysclib bcmp", a, n, "compared round to the start");
+        c.r[2] = 0;
+        for (std::uint32_t i = 0; i < std::min(n, kRamSize); ++i)
+            if (*ram_ptr(a + i) != *ram_ptr(b + i)) { c.r[2] = 1; return; }
     });
     def("sysclib", 16, "bcopy", [copy](Cpu &c) { copy(arg(c, 1), arg(c, 0), arg(c, 2)); });
-    def("sysclib", 17, "bzero", [](Cpu &c) { std::memset(ram_ptr(arg(c, 0)), 0, arg(c, 1)); });
+    def("sysclib", 17, "bzero", [](Cpu &c) { fill_ram("sysclib bzero", arg(c, 0), 0, arg(c, 1)); });
     def("sysclib", 19, "sprintf", [](Cpu &c) {
         const std::string s = format(c, arg(c, 1), 2);
-        std::memcpy(ram_ptr(arg(c, 0)), s.c_str(), s.size() + 1);
+        put_ram("sysclib sprintf", arg(c, 0), s.c_str(), s.size() + 1);
         c.r[2] = static_cast<std::uint32_t>(s.size());
     });
     def("sysclib", 20, "strcat", [](Cpu &c) {
         const std::string a = ram_string(arg(c, 0), 4096), b = ram_string(arg(c, 1), 4096);
-        std::memcpy(ram_ptr(arg(c, 0) + static_cast<std::uint32_t>(a.size())), b.c_str(), b.size() + 1);
+        put_ram("sysclib strcat", arg(c, 0) + static_cast<std::uint32_t>(a.size()), b.c_str(), b.size() + 1);
         c.r[2] = arg(c, 0);
     });
     def("sysclib", 21, "strchr", [](Cpu &c) {
@@ -876,7 +1144,7 @@ void install_sysclib() {
     });
     def("sysclib", 23, "strcpy", [](Cpu &c) {
         const std::string s = ram_string(arg(c, 1), 4096);
-        std::memcpy(ram_ptr(arg(c, 0)), s.c_str(), s.size() + 1);
+        put_ram("sysclib strcpy", arg(c, 0), s.c_str(), s.size() + 1);
         c.r[2] = arg(c, 0);
     });
     def("sysclib", 25, "index", [](Cpu &c) {
@@ -887,7 +1155,7 @@ void install_sysclib() {
     def("sysclib", 27, "strlen", [](Cpu &c) { c.r[2] = static_cast<std::uint32_t>(ram_string(arg(c, 0), 65536).size()); });
     def("sysclib", 28, "strncat", [](Cpu &c) {
         const std::string a = ram_string(arg(c, 0), 4096), b = ram_string(arg(c, 1), arg(c, 2));
-        std::memcpy(ram_ptr(arg(c, 0) + static_cast<std::uint32_t>(a.size())), b.c_str(), b.size() + 1);
+        put_ram("sysclib strncat", arg(c, 0) + static_cast<std::uint32_t>(a.size()), b.c_str(), b.size() + 1);
         c.r[2] = arg(c, 0);
     });
     def("sysclib", 29, "strncmp", [](Cpu &c) {
@@ -896,7 +1164,9 @@ void install_sysclib() {
     });
     def("sysclib", 30, "strncpy", [](Cpu &c) {
         const std::string s = ram_string(arg(c, 1), arg(c, 2));
-        for (std::uint32_t i = 0; i < arg(c, 2); ++i) write8(arg(c, 0) + i, i < s.size() ? static_cast<std::uint8_t>(s[i]) : 0);
+        std::uint32_t n = arg(c, 2);
+        if (n > kRamSize) { bad_span("sysclib strncpy", arg(c, 0), n, "cut to 2 MiB"); n = kRamSize; }
+        for (std::uint32_t i = 0; i < n; ++i) write8(arg(c, 0) + i, i < s.size() ? static_cast<std::uint8_t>(s[i]) : 0);
         c.r[2] = arg(c, 0);
     });
     def("sysclib", 32, "strrchr", [](Cpu &c) {
@@ -971,7 +1241,7 @@ void install_sysclib() {
             else std::snprintf(buf, sizeof buf, (spec + conv).c_str(), v);
             out += buf;
         }
-        std::memcpy(ram_ptr(arg(c, 0)), out.c_str(), out.size() + 1);
+        put_ram("sysclib vsprintf", arg(c, 0), out.c_str(), out.size() + 1);
         c.r[2] = static_cast<std::uint32_t>(out.size());
     });
 }
@@ -987,8 +1257,66 @@ void install_stdio() {
     def("stdio", 7, "puts", [](Cpu &c) { print(ram_string(arg(c, 0), 4096) + "\n"); c.r[2] = 0; });
 }
 
+// The start arguments a game hands over as (length, pointer); empty when they do not lie inside IOP memory.
+std::string module_args(std::uint32_t length, std::uint32_t at) {
+    if (!at || !length || std::uint64_t{phys(at)} + length > kRamSize) return {};
+    return std::string(reinterpret_cast<const char *>(ram_ptr(at)), length);
+}
+
 void install_modload() {
     register_hle_library("modload", 0x0102);
+    // LoadStartModule, StartModule and LoadModuleBuffer (follows upstream 5bcd5fe). The calling thread waits until the module's start
+    // routine returns; what it returned goes to *result. Modules handled natively finish at once, before there is anything to wait for.
+    def("modload", 7, "LoadStartModule", [](Cpu &c) {
+        Thread *caller = current();
+        if (!caller) { c.r[2] = static_cast<std::uint32_t>(kErrorUnknownModule); return; }
+        const std::uint32_t result_at = arg(c, 3);
+        const std::string text = module_args(arg(c, 1), arg(c, 2));
+        const int waiter = caller->id;
+        struct Wait { bool blocked = false, finished = false; };
+        const auto wait = std::make_shared<Wait>();
+        const std::int32_t id = load_module(ram_string(arg(c, 0), 256), text, [waiter, result_at, wait](int module, int result) {
+            if (result_at) write32(result_at, static_cast<std::uint32_t>(result));
+            wait->finished = true;
+            if (wait->blocked)
+                if (Thread *t = thread(waiter)) wake(*t, static_cast<std::uint32_t>(module));
+        });
+        if (id < 0) { c.r[2] = static_cast<std::uint32_t>(kErrorIllegalObject); return; }
+        if (wait->finished) { c.r[2] = static_cast<std::uint32_t>(id); return; }
+        wait->blocked = true;
+        block(c, kWaitHle, 0);
+    });
+    def("modload", 8, "StartModule", [](Cpu &c) {
+        Thread *caller = current();
+        if (!caller) { c.r[2] = static_cast<std::uint32_t>(kErrorUnknownModule); return; }
+        const int id = static_cast<int>(arg(c, 0));
+        const std::uint32_t result_at = arg(c, 4);
+        const std::string text = module_args(arg(c, 2), arg(c, 3));
+        const int waiter = caller->id;
+        const bool started = start_module(id, text, [waiter, result_at](int module, int result) {
+            if (result_at) write32(result_at, static_cast<std::uint32_t>(result));
+            if (Thread *t = thread(waiter)) wake(*t, static_cast<std::uint32_t>(module));
+        });
+        if (!started) { c.r[2] = static_cast<std::uint32_t>(kErrorUnknownModule); return; }
+        block(c, kWaitHle, 0);
+    });
+    // #9 and #10 (rules from ps2sdk's modload, AFL-2.0: iop/system/modload/src/exports.tab and modload.c): LoadModuleBufferAddress(buffer,
+    // addr, offset) links the module image that lies in IOP memory at `buffer` and returns its id; it does not start it (StartModule, #8,
+    // does). LoadModuleBuffer(buffer) is the same call with addr 0 and offset 0. A non-zero `addr` is a block the caller got from
+    // AllocLoadMemory (#28, not here) to place the module in; here a module is always linked into memory of its own, which a
+    // relocatable module cannot tell apart, so `addr` and `offset` are only noted in the log.
+    const auto load_buffer = [](Cpu &c, std::uint32_t buffer) {
+        const std::uint32_t at = phys(buffer);
+        if (at >= kRamSize) { c.r[2] = static_cast<std::uint32_t>(kErrorIllegalObject); return; }
+        const std::uint8_t *p = ram_ptr(at);
+        const std::int32_t id = link_module(std::vector<std::uint8_t>(p, p + (kRamSize - at)), "buffer");
+        c.r[2] = static_cast<std::uint32_t>(id < 0 ? kErrorIllegalObject : id);
+    };
+    def("modload", 9, "LoadModuleBufferAddress", [load_buffer](Cpu &c) {
+        if (arg(c, 1) || arg(c, 2)) std::fprintf(stderr, "[iop] modload LoadModuleBufferAddress: destination 0x%08X offset 0x%X ignored, the module is linked elsewhere\n", arg(c, 1), arg(c, 2));
+        load_buffer(c, arg(c, 0));
+    });
+    def("modload", 10, "LoadModuleBuffer", [load_buffer](Cpu &c) { load_buffer(c, arg(c, 0)); });
     def("modload", 13, "SetCheckKelfPathCallback", [](Cpu &c) { c.r[2] = 0; });
     // #30 takes a module id (from SearchModuleByName) and a flag word (Tekken 5's module 0x22B00 passes 0x40 for two modules); a call that
     // changes nothing here, since modules are never unloaded behind a game's back.
@@ -1020,8 +1348,8 @@ void install_modload() {
         auto it = modules().find(static_cast<int>(arg(c, 0)));
         if (it == modules().end()) { c.r[2] = static_cast<std::uint32_t>(kErrorUnknownModule); return; }
         const std::uint32_t p = arg(c, 1);
-        std::memset(ram_ptr(p), 0, 0x50);
-        std::memcpy(ram_ptr(p), it->second.name.c_str(), std::min<std::size_t>(it->second.name.size(), 55));
+        fill_ram("modload ReferModuleStatus", p, 0, 0x50);
+        put_ram("modload ReferModuleStatus", p, it->second.name.c_str(), std::min<std::size_t>(it->second.name.size(), 55));
         write32(p + 0x38, static_cast<std::uint32_t>(it->first));
         write32(p + 0x40, it->second.entry);
         write32(p + 0x44, it->second.gp);
@@ -1081,18 +1409,47 @@ void install_vblank() {
 
 void install_timrman() {
     register_hle_library("timrman", 0x0101);
-    def("timrman", 4, "AllocHardTimer", [](Cpu &c) { c.r[2] = g_next_hard_timer++; });
+    def("timrman", 4, "AllocHardTimer", [](Cpu &c) {
+        IrqTimer &t = g_irq_timers[g_next_hard_timer];
+        t.source = arg(c, 0);
+        t.prescale = arg(c, 2);
+        t.line = arg(c, 1) == 16 ? 4 + (g_irq_timers_16++ % 3) : 14 + (g_irq_timers_32++ % 3);
+        c.r[2] = g_next_hard_timer++;
+    });
     def("timrman", 5, "ReferHardTimer", [](Cpu &c) { c.r[2] = 1; });
     def("timrman", 6, "FreeHardTimer", [](Cpu &c) { c.r[2] = 0; });
-    def("timrman", 7, "SetTimerMode", [](Cpu &c) { c.r[2] = 0; });
+    def("timrman", 7, "SetTimerMode", [](Cpu &c) {
+        if (const auto it = g_irq_timers.find(arg(c, 0)); it != g_irq_timers.end()) {
+            it->second.mode = arg(c, 1);
+            g_hard_timer_start[arg(c, 0)] = now();
+            arm_irq_timer(arg(c, 0));
+        }
+        c.r[2] = 0;
+    });
+    // GetTimerStatus: the mode register, with the flag that the counter reached the compare value; reading clears the flag
+    // (follows upstream 309e03f; the mode bits are those of ps2sdk's timrman.h, AFL-2.0)
+    def("timrman", 8, "GetTimerStatus", [](Cpu &c) {
+        const auto it = g_irq_timers.find(arg(c, 0));
+        c.r[2] = it == g_irq_timers.end() ? 0u : it->second.mode | g_irq_timer_reached[arg(c, 0)];
+        g_irq_timer_reached[arg(c, 0)] = 0;
+    });
     def("timrman", 9, "SetTimerCounter", [](Cpu &c) {
         const auto it = g_hard_timers.find(arg(c, 0));
         if (it != g_hard_timers.end()) g_hard_timer_start[arg(c, 0)] = now() - std::min<std::uint64_t>(now(), static_cast<std::uint64_t>(arg(c, 1)) * timer_cycles(it->second, 1));
         c.r[2] = 0;
     });
     def("timrman", 10, "GetTimerCounter", [](Cpu &c) { c.r[2] = hard_timer_counter(arg(c, 0)); });
-    def("timrman", 11, "SetTimerCompare", [](Cpu &c) { c.r[2] = 0; });
-    def("timrman", 16, "GetHardTimerIntrCode", [](Cpu &c) { c.r[2] = 14; });
+    def("timrman", 11, "SetTimerCompare", [](Cpu &c) {
+        if (const auto it = g_irq_timers.find(arg(c, 0)); it != g_irq_timers.end()) {
+            it->second.compare = arg(c, 1);
+            arm_irq_timer(arg(c, 0));
+        }
+        c.r[2] = 0;
+    });
+    def("timrman", 16, "GetHardTimerIntrCode", [](Cpu &c) {
+        const auto it = g_irq_timers.find(arg(c, 0));
+        c.r[2] = it == g_irq_timers.end() ? 14u : it->second.line;
+    });
     def("timrman", 20, "SetTimerHandler", [](Cpu &c) {
         HardTimer &t = g_hard_timers[arg(c, 0)];
         t.compare = arg(c, 1);
@@ -1202,6 +1559,9 @@ void install_libraries() {
     g_vblank_end_waiters.clear();
     g_alarms.clear();
     g_hard_timers.clear();
+    g_irq_timers.clear();
+    g_irq_timer_reached.clear();
+    g_irq_timers_16 = g_irq_timers_32 = 0;
     g_hard_timer_start.clear();
     g_vpls.clear();
     g_next_object = 1;
@@ -1290,8 +1650,57 @@ void libs_state(ps2::state::Stream &s) {
     s.pod(g_strtok_next);
     s.pod(g_next_hard_timer);
     s.pod(g_dma_direction);
+    // The low-level hardware timers (state version 8). The job that raises their interrupt is part of the IOP's event queue and names
+    // the timer and its generation, so the generation is kept too. A state older than 8 has no such timers: the game that loads it
+    // sets them up again when it asks for them; a timer already armed in the running program is dropped.
+    if (s.loading()) g_irq_timer_reached.clear();  // the flag is not part of a state
+    if (s.version() >= 8) {
+        s.map(g_irq_timers);
+        s.pod(g_irq_timers_16);
+        s.pod(g_irq_timers_32);
+    } else if (s.loading()) {
+        g_irq_timers.clear();
+        g_irq_timers_16 = g_irq_timers_32 = 0;
+    }
 }
 
+
+// What an IOP thread is doing, in words (the end-of-run list and the F9 report's thread list share this): for a wait,
+// the object (semaphore with its count, event flag with its bits, ...) or the RPC call.
+std::string wait_words(const Thread &t) {
+    char b[200];
+    if (t.status == kDormant) return "not started";
+    if (t.status == kRun) return "running";
+    if (t.status == kReady) return "ready (waits for the processor)";
+    if (t.status == kSuspend) return "suspended";
+    std::string out;
+    switch (t.wait) {
+    case kWaitSleep: out = "asleep (SleepThread: waits for a wake-up)"; break;
+    case kWaitDelay: out = "waits out a delay (DelayThread)"; break;
+    case kWaitSema: {
+        const auto it = g_semas.find(t.wait_id);
+        if (it == g_semas.end()) std::snprintf(b, sizeof b, "waits on semaphore %d (gone)", t.wait_id);
+        else std::snprintf(b, sizeof b, "waits on semaphore %d (count %d, %zu waiting)", t.wait_id, it->second.count, it->second.waiters.size());
+        out = b;
+        break;
+    }
+    case kWaitEvent: {
+        const auto it = g_events.find(t.wait_id);
+        std::snprintf(b, sizeof b, "waits on event flag %d (bits now 0x%X, it wants 0x%X, %s)", t.wait_id, it == g_events.end() ? 0u : it->second.bits,
+                      t.event_bits, (t.event_mode & 1u) ? "any of them" : "all of them");
+        out = b;
+        break;
+    }
+    case kWaitMbx: std::snprintf(b, sizeof b, "waits on message box %d for a message", t.wait_id); out = b; break;
+    case kWaitFpl: case kWaitVpl: std::snprintf(b, sizeof b, "waits on memory pool %d for a free block", t.wait_id); out = b; break;
+    case kWaitVblank: out = t.wait_id ? "waits for the end of the vertical blank" : "waits for the start of the next vertical blank"; break;
+    case kWaitRpc: out = sif::iop_thread_rpc_wait(t.id, t.wait_id); break;
+    case kWaitHle: out = "waits for a disc read or a module start"; break;
+    default: std::snprintf(b, sizeof b, "waits (kind %d, id %d)", static_cast<int>(t.wait), t.wait_id); out = b; break;
+    }
+    if (t.status == kWaitSuspend) out += ", and is suspended";
+    return out;
+}
 }
 
 namespace ps2::iop {

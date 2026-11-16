@@ -1,5 +1,7 @@
 #include "keymap.hpp"
 
+#include "ps2/pace.hpp"
+
 #include <SDL.h>
 
 #include <algorithm>
@@ -45,7 +47,8 @@ constexpr Info kInfo[ActionCount] = {
     {"select", ""},
     {"roll", "roll: while it is held, the walk keys push the right stick as well, which is God of War's evade roll"},
     {"rage", "one key that presses L3 and R3 together (God of War's rage)"},
-    {"help", "the key card (F1 shows it as well)"},
+    {"help", "a key that shows the key card at once (none by default: F1 opens the quick menu, whose Keys entry shows the card)"},
+    {"menu", "another key for the quick menu (none by default: F1 opens it; on a controller: hold Select, then press Start, or press the Guide button)"},
 };
 
 constexpr int kScancodes = SDL_NUM_SCANCODES;
@@ -98,7 +101,17 @@ bool lookup(const std::string &text, int &input) {
     const std::string key = squash(text);
     if (key.empty()) return false;
     const auto it = names().find(key);
-    if (it == names().end()) return false;
+    if (it == names().end()) {
+        // "key 123": a key by its SDL scancode number, which is how keys.ini holds a key that has no name (written by the quick menu's Change keys)
+        if (key.size() > 3 && key.size() <= 6 && key.compare(0, 3, "key") == 0 && std::all_of(key.begin() + 3, key.end(), [](unsigned char c) { return std::isdigit(c) != 0; })) {
+            const int number = std::atoi(key.c_str() + 3);
+            if (number > 0 && number < kScancodes) {
+                input = number;
+                return true;
+            }
+        }
+        return false;
+    }
     input = it->second;
     return true;
 }
@@ -117,27 +130,43 @@ const char *look_word(int look) {
     return words[look < 0 || look >= kLookCount ? 0 : look];
 }
 
-std::string with_look(const std::string &file_text, int look) {
-    const std::string line = std::string("look = ") + look_word(look);
-    std::string out;
-    bool done = false;
+namespace {
+// keys.ini text with its `name` line set to `line` (other lines untouched; the line is added at the end when missing). When the name
+// stands on several lines the last one is replaced, because the reader lets a later line win.
+std::string with_line(const std::string &file_text, const std::string &name, const std::string &line) {
+    std::vector<std::string> rows;
     std::size_t pos = 0;
     while (pos < file_text.size()) {
-        std::size_t end = file_text.find('\n', pos);
-        const bool last = end == std::string::npos;
-        std::string row = file_text.substr(pos, last ? std::string::npos : end - pos);
-        const std::size_t eq = row.find('=');
-        if (!done && eq != std::string::npos && row[0] != '#' && row[0] != ';' && squash(row.substr(0, eq)) == "look") {
-            row = line + (!row.empty() && row.back() == '\r' ? "\r" : "");
-            done = true;
-        }
-        out += row;
-        if (!last) out += '\n';
-        pos = last ? file_text.size() : end + 1;
+        const std::size_t end = file_text.find('\n', pos);
+        rows.push_back(file_text.substr(pos, end == std::string::npos ? std::string::npos : end - pos));
+        pos = end == std::string::npos ? file_text.size() : end + 1;
     }
-    if (!done) out += std::string(out.empty() || out.back() == '\n' ? "" : "\n") + line + "\n";
+    const bool final_newline = file_text.empty() || file_text.back() == '\n';
+    int found = -1;
+    for (int i = 0; i < static_cast<int>(rows.size()); ++i) {
+        const std::string t = trim(rows[i]);
+        const std::size_t eq = t.find('=');
+        if (eq != std::string::npos && t[0] != '#' && t[0] != ';' && squash(t.substr(0, eq)) == name) found = i;
+    }
+    if (found >= 0) rows[found] = line + (!rows[found].empty() && rows[found].back() == '\r' ? "\r" : "");
+    else rows.push_back(line);
+    std::string out;
+    for (std::size_t i = 0; i < rows.size(); ++i) out += rows[i] + (i + 1 < rows.size() || final_newline || found < 0 ? "\n" : "");
     return out;
 }
+
+}  // namespace
+
+std::string with_look(const std::string &file_text, int look) { return with_line(file_text, "look", std::string("look = ") + look_word(look)); }
+
+std::string with_scale(const std::string &file_text, int scale) { return with_line(file_text, "scale", "scale = " + std::to_string(scale)); }
+
+const char *sharp_2d_word(int sharp) {
+    static const char *const kWords[] = {"soft", "sharp", "sharpest"};
+    return kWords[sharp >= 0 && sharp <= 2 ? sharp : 1];
+}
+
+std::string with_sharp_2d(const std::string &file_text, int sharp) { return with_line(file_text, "sharp2d", std::string("sharp_2d = ") + sharp_2d_word(sharp)); }
 
 bool is_reserved(int input) {
     return input == SDL_SCANCODE_F1 || input == SDL_SCANCODE_F2 || input == SDL_SCANCODE_F5 || input == SDL_SCANCODE_F8 || input == SDL_SCANCODE_F9 || input == SDL_SCANCODE_F11;
@@ -163,7 +192,8 @@ Config defaults() {
     set(Select, {SDL_SCANCODE_TAB, SDL_SCANCODE_BACKSPACE});
     set(Roll, {SDL_SCANCODE_LCTRL, kMouseX1});
     set(Rage, {SDL_SCANCODE_V});
-    set(Help, {SDL_SCANCODE_H});
+    set(Help, {});  // H used to be the key card; it was easy to hit by mistake, F1 opens the quick menu now
+    set(Menu, {});
     return c;
 }
 
@@ -247,6 +277,26 @@ void parse(const std::string &text, Config &config, std::vector<std::string> &pr
             else config.look = found;
             continue;
         }
+        if (name == "scale") {
+            const std::string v = squash(value);
+            if (v == "1" || v == "2" || v == "3" || v == "4") config.scale = v[0] - '0';
+            else bad("scale is 1, 2, 3 or 4, ignored");
+            continue;
+        }
+        if (name == "sharp2d") {
+            const std::string v = squash(value);
+            int found = -1;
+            for (int i = 0; i < 3; ++i)
+                if (v == squash(sharp_2d_word(i)) || v == std::to_string(i)) found = i;
+            if (found < 0) bad("sharp_2d is soft, sharp or sharpest, ignored");
+            else config.sharp_2d = found;
+            continue;
+        }
+        if (name == "pace") {
+            if (ps2::pace::parse(value)) config.pace = value;
+            else bad("pace is 30, 20, 15, 60 or off, ignored");
+            continue;
+        }
         if (name == "mousespeed") {
             char *tail = nullptr;
             const double v = std::strtod(value.c_str(), &tail);
@@ -261,6 +311,10 @@ void parse(const std::string &text, Config &config, std::vector<std::string> &pr
             continue;
         }
         std::vector<int> inputs;
+        // 'help = H' and 'menu = M' were the keys of earlier versions (H showed the key card and was easy to hit by mistake): files
+        // that still have them from the old default are not honoured; any other key written there is
+        if (squash(value) == "h" && it->second == Help) continue;
+        if (squash(value) == "m" && it->second == Menu) continue;
         const bool none = squash(value) == "none" || value.empty();
         std::size_t from = 0;
         while (!none && from <= value.size()) {
@@ -308,7 +362,8 @@ std::string default_file_text() {
         "# Keys are written the English way: Space, Enter, Esc, Tab, Left Shift, Left Ctrl, Backspace, Up, Down, A, B, 1, 2, ...\n"
         "# and mean the place on the keyboard, whatever is printed there: on a German keyboard 'Z' is the key labelled Y.\n"
         "# Mouse: Left Mouse, Right Mouse, Middle Mouse, Mouse X1 and Mouse X2 (the two side buttons), Wheel Up, Wheel Down.\n"
-        "# F1, F2, F5, F8, F9 and F11 belong to the program (key card, picture look, quick save, quick load, problem report, full screen).\n"
+        "# F1, F2, F5, F8, F9 and F11 belong to the program (quick menu, picture look, quick save, quick load, problem report,\n"
+        "# full screen). On some laptops they need the Fn key: Fn + F1 opens the quick menu.\n"
         "# A line that cannot be read is ignored and written to the log (logs folder); the rest still works.\n"
         "\n";
     for (int a = 0; a < ActionCount; ++a) {
@@ -331,7 +386,18 @@ std::string default_file_text() {
         "#   crisp_edges   crisp, and the jagged stairs along edges are smoothed\n"
         "#   soft          a smooth blend, like an old TV\n"
         "#   soft_edges    soft, and the jagged stairs along edges are smoothed\n"
-        "look = " + std::string(look_word(kDefaultLook)) + "\n";
+        "look = " + std::string(look_word(kDefaultLook)) + "\n"
+        "\n# The inner resolution: 1, 2, 3 or 4 times the console's (sharper, and more work for the graphics chip). Used when the game\n"
+        "# starts; the quick menu (F1) writes it here. The environment variable PS2_SCALE, when it is set, wins over this line.\n"
+        "# scale = 1\n"
+        "\n# Text, icons and menus drawn at the console's own size, when the inner resolution is above 1: soft (plain bilinear, as\n"
+        "# before), sharp (the default: each texel keeps its colour, its edges stay smooth) or sharpest. Used when the game starts;\n"
+        "# the quick menu (F1) writes it here. PS2_SHARP_2D (0, 1, 2), when it is set, wins over this line.\n"
+        "# sharp_2d = sharp\n"
+        "\n# The picture pace, for a game that runs too fast because it moves on once per picture: 30 holds it to one new picture every\n"
+        "# second TV refresh, as a real PS2 shows it (20: every third). 60 or off turns it off, also for a game the program paces by\n"
+        "# itself. Used when the game starts. PS2_PACE, when it is set, wins over this line.\n"
+        "# pace = 30\n";
     return t;
 }
 
@@ -355,10 +421,91 @@ std::string card_text(const Config &c) {
     line("Select", list(c, Select));
     line("D-pad (menus)", list(c, DpadUp) + ", " + list(c, DpadDown) + ", " + list(c, DpadLeft) + ", " + list(c, DpadRight));
     line("L3, R3 (sticks pressed in)", list(c, L3) + ", " + list(c, R3));
-    t += "\nF5 quick save   F8 quick load   F9 something is wrong   F11 full screen\n";
+    t += "\nF1: the quick menu (save, load, picture look, resolution, full screen, show or change keys, quit)";
+    if (!c.inputs[Menu].empty()) t += "; also " + list(c, Menu);
+    t += "\nOn a controller: hold Select, then press Start (or press the Guide button)\n";
+    t += "F5 quick save   F8 quick load   F9 something is wrong   F11 full screen\n";
     t += "F2 picture look, now: " + std::string(look_name(c.look < 0 ? kDefaultLook : c.look)) + " (sharp + smooth edges, sharp, crisp, crisp + smooth edges, soft, soft + smooth edges)\n";
-    t += "This card: F1 or " + list(c, Help) + ". On some laptops the F keys need Fn held down; the buttons below work without it.\n";
+    t += "On some laptops the F keys need the Fn key held down: Fn + F1 opens the quick menu. The buttons below work without Fn.\n";
+    if (!c.inputs[Help].empty()) t += "This card at once: " + list(c, Help) + "\n";
     return t;
+}
+
+const char *action_label(int action) {
+    static const char *const labels[kChangeableCount] = {
+        "D-pad Up", "D-pad Down", "D-pad Left", "D-pad Right", "Left stick Up", "Left stick Down", "Left stick Left", "Left stick Right",
+        "Right stick Up", "Right stick Down", "Right stick Left", "Right stick Right", "Cross", "Circle", "Square", "Triangle",
+        "L1", "R1", "L2", "R2", "L3", "R3", "Start", "Select", "Roll", "Rage (L3 + R3)"};
+    return action >= 0 && action < kChangeableCount ? labels[action] : action_name(action);
+}
+
+std::string keys_text(const Config &config, int action) { return list(config, action); }
+
+namespace {
+
+// the way a key is written in keys.ini: its name when reading that name gives the key back, else "key <scancode number>"
+std::string file_name(int input) {
+    const std::string name = input_name(input);
+    int back = 0;
+    if (lookup(name, back) && back == input) return name;
+    return "key " + std::to_string(input);
+}
+
+}  // namespace
+
+std::string with_inputs(const std::string &file_text, int action, const std::vector<int> &inputs) {
+    std::string keys;
+    for (int input : inputs) keys += (keys.empty() ? "" : ", ") + file_name(input);
+    if (keys.empty()) keys = "none";
+    const std::string name = kInfo[action].name;
+    return with_line(file_text, squash(name), name + std::string(12 - std::min<std::size_t>(11, name.size()), ' ') + "= " + keys);
+}
+
+bool assign_input(Config &config, int action, int input, std::vector<int> &changed, std::string &message) {
+    changed.clear();
+    if (action < 0 || action >= kChangeableCount) return false;
+    if (is_reserved(input)) {
+        message = input_name(input) + " belongs to the program. Press another key.";
+        return false;
+    }
+    const std::vector<int> old = config.inputs[action];
+    if (old.size() == 1 && old[0] == input) {
+        message = std::string(action_label(action)) + " already has " + input_name(input) + ".";
+        return true;
+    }
+    // what moves to the other button: the keys this line had (without the one it takes)
+    std::vector<int> moved;
+    for (int k : old)
+        if (k != input) moved.push_back(k);
+    config.inputs[action] = {input};
+    changed.push_back(action);
+    std::string swapped;
+    for (int other = 0; other < ActionCount; ++other) {
+        if (other == action) continue;
+        std::vector<int> &keys = config.inputs[other];
+        if (std::find(keys.begin(), keys.end(), input) == keys.end()) continue;
+        keys.erase(std::remove(keys.begin(), keys.end(), input), keys.end());
+        if (other < kChangeableCount)  // (help and menu only lose the key)
+            for (int k : moved)
+                if (std::find(keys.begin(), keys.end(), k) == keys.end()) keys.push_back(k);
+        changed.push_back(other);
+        std::string what;
+        for (int k : moved)
+            if (std::find(keys.begin(), keys.end(), k) != keys.end()) what += (what.empty() ? "" : ", ") + input_name(k);
+        swapped += std::string(" ") + action_label(other) + (what.empty() ? " lost it." : " got " + what + ".");
+    }
+    message = std::string(action_label(action)) + " now has " + input_name(input) + "." + swapped;
+    return true;
+}
+
+void restore_default_inputs(Config &config, std::vector<int> &changed) {
+    changed.clear();
+    const Config d = defaults();
+    for (int a = 0; a < kChangeableCount; ++a) {
+        if (config.inputs[a] == d.inputs[a]) continue;
+        config.inputs[a] = d.inputs[a];
+        changed.push_back(a);
+    }
 }
 
 }  // namespace keymap

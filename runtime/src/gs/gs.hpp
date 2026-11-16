@@ -55,6 +55,7 @@ void signal(std::uint32_t reg, std::uint64_t value);
 void raise_finish();
 void note_transfer(std::uint32_t reg, std::uint64_t value);
 void write_packed(std::uint32_t reg, const Reg128 &q);
+void write_packed_run(const std::uint8_t *data, std::uint32_t count, std::uint64_t regs, std::uint32_t nreg, std::uint32_t reg);
 void write_image(const std::uint8_t *data, std::uint32_t qwords);
 void read_image(std::uint8_t *data, std::uint32_t qwords);
 void render_read_image(std::uint8_t *data, std::uint32_t qwords);
@@ -65,9 +66,21 @@ void write_privileged(std::uint32_t address, std::uint64_t value);
 void vblank(bool start);
 bool interlaced_odd_field();
 
+// Base pointer and buffer width of the texture's mip levels 0 to 6 (TEX0, TEX1 MTBA, MIPTBP1/2), the same for both renderers.
+void mip_levels(const Context &c, std::uint32_t bp[7], std::uint32_t bw[7]);
 std::uint32_t address32(std::uint32_t bp, std::uint32_t bw, std::uint32_t x, std::uint32_t y);
 std::uint32_t read_pixel(std::uint32_t psm, std::uint32_t bp, std::uint32_t bw, std::uint32_t x, std::uint32_t y);
 void write_pixel(std::uint32_t psm, std::uint32_t bp, std::uint32_t bw, std::uint32_t x, std::uint32_t y, std::uint32_t value);
+
+// The second read circuit of the picture: when a game turns on both circuits of the display (PMODE EN1 and EN2), the picture of
+// circuit 2 is the one in `DisplaySource`, and circuit 1 shows over a rectangle of it (a strip, a window) instead of it. Positions are
+// in pixels of the picture, measured from its top left corner; the rectangle may stick out of the picture, which clips it.
+struct DisplayOverlay {
+    bool active = false;
+    std::uint32_t fbp = 0, fbw = 0, psm = 0, dbx = 0, dby = 0;  // where circuit 1 reads, like the source's own
+    std::int32_t x = 0, y = 0;                                  // top left corner of its rectangle in the picture
+    std::uint32_t width = 0, height = 0;                        // size of its rectangle, in picture pixels
+};
 
 struct DisplayRegs {
     std::uint64_t pmode, smode2, dispfb[2], display[2];

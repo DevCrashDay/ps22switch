@@ -38,6 +38,13 @@ constexpr std::uint32_t kBase[10] = {0x10008000u, 0x10009000u, 0x1000A000u, 0x10
 std::uint64_t g_starts[10];
 bool g_mfifo_waiting = false;
 
+// D_ENABLEW bit 16 (CPND) holds every channel. A channel whose STR bit is set while the hold is on does not begin: it begins when
+// the hold ends, with the registers as they are then. Games hold the DMAC while they set up a transfer (Crash of the Titans
+// writes CHCR first and the new TADR after it, inside a hold; starting at the CHCR write ran the old chain a second time).
+// Not part of the save state: a state saved inside a hold is a few instructions long.
+constexpr std::uint32_t kHold = 0x10000u;
+std::uint32_t g_start_pending = 0;
+
 // MFIFO: with D_CTRL.MFD set to VIF1, fromSPR fills a ring buffer in main memory (D_RBOR,
 // D_RBSR) and VIF1 runs a chain out of it, stalling while its tag address has caught up
 // with fromSPR's write address.
@@ -272,10 +279,12 @@ void run_chain(int ch) {
         const std::uint32_t addr = static_cast<std::uint32_t>(tag >> 32) & 0x7FFFFFF0u;
         const std::uint32_t addr_full = addr | (static_cast<std::uint32_t>(tag >> 63) << 31);
         if (tte && (ch == 0 || ch == 1)) {
-            std::uint8_t q[16];
-            std::memcpy(q, tagp, 16);
-            std::memset(q, 0, 8);
-            vif::transfer(ch, q, 1);
+            // The upper 64 bits of the tag go to the unit as two words, nothing else. (Padding them to a quadword with two zero words
+            // looked harmless, since a zero word is a NOP, but a command still waiting for its data takes those words as data:
+            // Tekken 5 sends an UNPACK across a tag, and the two extra words pushed its last two data words out as commands.)
+            std::uint32_t q[2];
+            std::memcpy(q, tagp + 8, 8);
+            vif::transfer_words(ch, q, 2);
         } else if (tte && ch == 9) {
             // toSPR with the tag transfer enabled copies the whole 16-byte tag into the scratchpad ahead of its data (the game
             // reads its list at SADR+16). The tag goes to the SPR address the transfer is at, which then moves on by one quadword.
@@ -351,8 +360,8 @@ void start(int ch) {
     c.tag_end = c.qwc && chain_ends_after_current(c);
     ++g_starts[ch];
     static const bool trace = std::getenv("PS2_TRACE_DMA") != nullptr;
-    if (trace) std::fprintf(stderr, "[dma] ch%d chcr 0x%08X madr 0x%08X qwc %u tadr 0x%08X thread %d%s\n", ch, c.chcr, c.madr, c.qwc, c.tadr,
-                            kernel::current_thread(), kernel::in_handler() ? " (handler)" : "");
+    if (trace) std::fprintf(stderr, "[dma] ch%d chcr 0x%08X madr 0x%08X qwc %u tadr 0x%08X thread %d%s ctrl 0x%X rbsr 0x%X rbor 0x%X pcr 0x%X enable 0x%X\n", ch, c.chcr, c.madr, c.qwc, c.tadr,
+                            kernel::current_thread(), kernel::in_handler() ? " (handler)" : "", g_ctrl, g_rbsr, g_rbor, g_pcr, g_enable);
     if (ch == 5 || ch == 6 || ch == 7) {
         finish(ch);
         return;
@@ -426,15 +435,39 @@ bool ipu_push(const std::uint8_t *qword) {
     Channel &c = g_ch[3];
     if (!(c.chcr & 0x100u) || !c.qwc) return false;
     std::memcpy(target(c.madr), qword, 16);
-    watch_span(c.madr, 16, "dma:ipu_push");
+    if (g_watch_on) watch_span(c.madr, 16, "dma:ipu_push");
     c.madr += 16;
     if (!--c.qwc) finish(3);
     return true;
 }
 
+// Up to `count` quadwords in a row, the same as that many ipu_push calls (it stops where one would return false). A run that lies
+// whole in the first 32 MB of main memory is copied in one piece; anything else (the scratchpad, a vector unit window, a wrap-around
+// of the address, a watched range) goes one quadword at a time.
+std::size_t ipu_push_many(const std::uint8_t *qwords, std::size_t count) {
+    Channel &c = g_ch[3];
+    std::size_t done = 0;
+    while (done < count) {
+        if (!(c.chcr & 0x100u) || !c.qwc) break;
+        const std::size_t n = std::min<std::size_t>(count - done, c.qwc);
+        if (!g_watch_on && static_cast<std::uint64_t>(c.madr) + n * 16 <= kRamSize) {
+            std::memcpy(g_ram + (c.madr & (kRamSize - 16)), qwords + done * 16, n * 16);
+            c.madr += static_cast<std::uint32_t>(n * 16);
+            c.qwc -= static_cast<std::uint32_t>(n);
+            done += n;
+            if (!c.qwc) finish(3);
+        } else {
+            if (!ipu_push(qwords + done * 16)) break;
+            ++done;
+        }
+    }
+    return done;
+}
+
 void reset() {
     for (Channel &c : g_ch) c = Channel{};
     g_ctrl = g_pcr = g_sqwc = g_rbsr = g_rbor = g_stadr = g_enable = 0;
+    g_start_pending = 0;
     g_mfifo_waiting = false;
 }
 
@@ -449,6 +482,18 @@ void stats() {
 bool cpcond0() {
     const std::uint32_t cpc = g_pcr & 0x3FFu;
     return (hw::read32(0x1000E010u) & cpc) == cpc;
+}
+
+// A write to D_ENABLEW (0x1000F590). Ending the hold (bit 16 back to 0) begins the channels that were started during it, lowest first.
+void enable_write(std::uint32_t v) {
+    const bool was_held = g_enable & kHold;
+    g_enable = v;
+    if (!was_held || (v & kHold)) return;
+    for (int ch = 0; ch < 10; ++ch) {
+        if (!(g_start_pending & (1u << ch))) continue;
+        g_start_pending &= ~(1u << ch);
+        if (g_ch[ch].chcr & 0x100u) start(ch);
+    }
 }
 
 bool owns(std::uint32_t a) { return (a >= 0x10008000u && a < 0x1000E000u) || (a >= 0x1000E000u && a < 0x1000E070u); }
@@ -502,9 +547,13 @@ void write(std::uint32_t a, std::uint32_t v) {
             c.chcr = v;
             if (!(v & 0x100u)) {
                 c.paused = false;
+                g_start_pending &= ~(1u << ch);
                 if (ch == 1) g_mfifo_waiting = false;
             }
-            if (!was && (v & 0x100u)) start(ch);
+            if (!was && (v & 0x100u)) {
+                if (g_enable & kHold) g_start_pending |= 1u << ch;
+                else start(ch);
+            }
             break;
         }
         // The scratchpad channels have no SPR bit in MADR: it does not read back and the transfer uses main memory.

@@ -5,6 +5,7 @@
 #include "queue.hpp"
 #include "raster.hpp"
 #include "../hw.hpp"
+#include "../kernel.hpp"
 #ifdef PS2_GPU
 #include "gpu/gpu.hpp"
 #endif
@@ -33,6 +34,7 @@ namespace ps2::gs {
 namespace trace {  // defined further down (PS2_TRACE_DRAWS)
 extern std::uint64_t g_frame, g_number;
 bool traced(std::uint64_t frame);
+extern const bool g_any;  // PS2_TRACE_DRAWS is set: kick() looks at this flag instead of calling into the trace code for every shape
 }
 
 State g_state;
@@ -47,6 +49,8 @@ alignas(64) std::uint8_t g_memory[kMemorySize];
 std::uint64_t g_pmode, g_smode1, g_smode2, g_srfsh, g_synch1, g_synch2, g_syncv;
 std::uint64_t g_dispfb[2], g_display[2], g_extbuf, g_extdata, g_extwrite, g_bgcolor;
 std::uint64_t g_csr = 0x551B4000ull, g_imr = 0x7F00ull, g_busdir, g_siglblid;
+std::uint32_t g_finish_pending = 0;  // FINISH events that arrived while CSR.FINISH was still set; raised as the game clears the bit
+std::uint32_t g_finish_queued = 0;   // FINISH writes that came while an earlier one was still on its way; each gets its own event (not in a state)
 std::uint64_t g_primitives = 0;
 constexpr std::uint64_t kFinishDelay = 1000; // EE cycles from the FINISH write to CSR.FINISH
 
@@ -62,14 +66,60 @@ bool trace_display() {
     static const bool enabled = std::getenv("PS2_TRACE_DISPLAY") != nullptr;
     return enabled;
 }
+// The lines of the picture the video mode displays: DH+1 lines at most, no more than the mode has (PAL 288 a field, NTSC 240; twice
+// that interlaced), and fewer when the game moves the display rectangle down. DY counts lines from the top of the frame and the mode's
+// first line is `top` (36 PAL, 25 NTSC; doubled interlaced): a rectangle that starts `below` lines under it loses that many lines at
+// the bottom of the TV picture. Follows upstream a75fcdd and fe11596 (snuri00/ps2-web-recomp).
+// Only the TV modes have those limits: NTSC (2) and PAL (3) of SetGsCrt, and 0 when it was never called. Progressive scan (480p 0x50),
+// 1080i, 720p and VGA (the mode values of ps2sdk's graph library) show DH+1 lines whatever DY says, so a game moved to 480p by a
+// no-interlacing patch is not cut to half of its height (upstream has this fault).
+std::uint32_t shown_lines(std::uint32_t dh, std::uint32_t dy, std::uint64_t smode2) {
+    const std::uint32_t mode = hw::crt_mode();
+    if (mode != 0u && mode != 2u && mode != 3u) return dh;
+    const std::uint32_t scale = (smode2 & 1u) ? 2u : 1u;
+    const std::uint32_t lines = (ps2::g_options.pal ? 288u : 240u) * scale;
+    const std::uint32_t top = (ps2::g_options.pal ? 36u : 25u) * scale, span = (ps2::g_options.pal ? 256u : 224u) * scale;
+    const std::uint32_t below = dy > top ? std::min(dy - top, span) : 0u;
+    return std::min({dh, lines, below ? span - below : lines});
+}
 // Height of the displayed picture in lines. The display rectangle's height DH+1 counts lines of the video frame, and a TV picture
 // cannot have more than 576 of them (PAL; NTSC has 480). A game in interlaced field mode (SMODE2 INT=1, FFMD=0) that still asks for
 // more (Silent Hill 2 sets 896 for a 448 line picture) counts the lines of both fields: the picture is half of it.
-std::uint32_t display_height(std::uint64_t disp, std::uint64_t smode2) {
+// `crop` is false for circuit 1 of the merged display: its rectangle sits where it sits to land in the picture, so its DY says nothing
+// about lines lost at the bottom (Devil May Cry's message strip).
+std::uint32_t display_height(std::uint64_t disp, std::uint64_t smode2, bool crop = true) {
     const std::uint32_t magv = (static_cast<std::uint32_t>(disp >> 27) & 3u) + 1;
-    std::uint32_t h = ((static_cast<std::uint32_t>(disp >> 44) & 0x7FFu) + 1) / magv;
-    if ((smode2 & 3u) == 1u && h > 576) h /= 2;
-    return h;
+    std::uint32_t dh = (static_cast<std::uint32_t>(disp >> 44) & 0x7FFu) + 1;
+    if ((smode2 & 3u) == 1u && dh / magv > 576) dh /= 2;
+    return shown_lines(dh, crop ? static_cast<std::uint32_t>(disp >> 12) & 0x7FFu : 0u, smode2) / magv;
+}
+// The two read circuits of the display (PMODE bits EN1 and EN2). With both on, the picture is circuit 2's, and circuit 1 shows over its own
+// rectangle of it, blended by PMODE's fixed alpha ALP (MMOD set, bits 8-15). Devil May Cry shows its typed message windows this way: a
+// 512x32 strip with the text sits at the end of video memory, circuit 1 puts it at the bottom of the picture, ALP is 0xFF (all of circuit 1),
+// and nothing else of the picture shows the text. Positions come from DISPLAY1/DISPLAY2 (DX, DY: where the rectangle starts, in video
+// clocks and lines, so the offset between the two is the offset in the picture).
+// Only that case is merged: ALP 0xFF, SLBG clear (circuit 2 is the base, not the background colour), the same magnification. Other
+// blends stay as they were, circuit 2 alone. In particular God of War and Resident Evil 4 turn both circuits on with ALP 0x80 and
+// the same picture one line apart: the hardware's anti-flicker filter, a blur that emulators usually leave out as well.
+// Source: the PMODE and DISPLAYx register descriptions of the GS user's manual, and what Devil May Cry shows.
+DisplayOverlay display_overlay(std::uint64_t pmode, std::uint64_t smode2, std::uint64_t fb1, std::uint64_t disp1, std::uint64_t disp2) {
+    DisplayOverlay o;
+    if ((pmode & 3u) != 3u || !(pmode & 0x20u) || (pmode & 0x80u) || ((pmode >> 8) & 0xFFu) != 0xFFu) return o;
+    const std::uint32_t magh1 = (static_cast<std::uint32_t>(disp1 >> 23) & 0xFu) + 1, magh2 = (static_cast<std::uint32_t>(disp2 >> 23) & 0xFu) + 1;
+    const std::uint32_t magv1 = (static_cast<std::uint32_t>(disp1 >> 27) & 3u) + 1, magv2 = (static_cast<std::uint32_t>(disp2 >> 27) & 3u) + 1;
+    if (magh1 != magh2 || magv1 != magv2) return o;
+    o.width = ((static_cast<std::uint32_t>(disp1 >> 32) & 0xFFFu) + 1) / magh1;
+    o.height = display_height(disp1, smode2, false);
+    if (!o.width || !o.height || o.width > 2048 || o.height > 2048) return o;
+    o.x = (static_cast<std::int32_t>(disp1 & 0xFFFu) - static_cast<std::int32_t>(disp2 & 0xFFFu)) / static_cast<std::int32_t>(magh2);
+    o.y = (static_cast<std::int32_t>((disp1 >> 12) & 0x7FFu) - static_cast<std::int32_t>((disp2 >> 12) & 0x7FFu)) / static_cast<std::int32_t>(magv2);
+    o.fbp = (static_cast<std::uint32_t>(fb1) & 0x1FFu) * 32;
+    o.fbw = static_cast<std::uint32_t>(fb1 >> 9) & 0x3Fu;
+    o.psm = static_cast<std::uint32_t>(fb1 >> 15) & 0x1Fu;
+    o.dbx = static_cast<std::uint32_t>(fb1 >> 32) & 0x7FFu;
+    o.dby = static_cast<std::uint32_t>(fb1 >> 43) & 0x7FFu;
+    o.active = true;
+    return o;
 }
 std::uint64_t g_writes[128];
 std::vector<std::uint32_t> g_gpu_frame;
@@ -180,7 +230,13 @@ struct CachedDownload {
     DownloadKey key;
     std::vector<std::uint8_t> data;
     std::uint64_t used;
+    std::uint64_t frame = 0;  // the frame the game last asked for this rectangle (frames_run)
 };
+
+// A cached download stands in for a fresh one only while the game reads the same rectangle every frame or so (the case the cache is
+// for: the answer is then one frame old). A read of a rectangle last asked for longer ago than this waits for the real contents:
+// Urban Reign reads its pause background once per pause, and the cache gave it the picture of the pause before.
+constexpr std::uint64_t kCacheFrames = 2;
 
 std::mutex g_cache_mutex;
 std::vector<CachedDownload> g_download_cache;
@@ -198,6 +254,7 @@ void remember(const DownloadKey &key, const std::uint8_t *data, std::size_t byte
     }
     it->data.assign(data, data + bytes);
     it->used = ++g_cache_clock;
+    it->frame = frames_run();
 }
 
 void forget(const DownloadKey &key) {
@@ -387,6 +444,30 @@ void swizzle_tables(std::vector<std::uint32_t> &out) {
     for (auto &row : g_off4) out.insert(out.end(), std::begin(row), std::end(row));
 }
 
+// The base pointer (in 256-byte blocks) and buffer width of mip levels 0 to 6 (GS User's Manual: TEX0, TEX1 MTBA, MIPTBP1/2; docs/mipmap.md).
+// MIPTBP1 holds levels 1 to 3 and MIPTBP2 levels 4 to 6, each as a 14-bit base pointer and a 6-bit width, 20 bits a level.
+// With MTBA = 1 the chip works out levels 1 to 3 itself; the rule used here (each level right after the one before, the buffer width halved)
+// is the natural packing and a guess in its details: the manual's restrictions on that mode are not checked.
+void mip_levels(const Context &c, std::uint32_t bp[7], std::uint32_t bw[7]) {
+    bp[0] = static_cast<std::uint32_t>(c.tex0) & 0x3FFFu;
+    bw[0] = static_cast<std::uint32_t>(c.tex0 >> 14) & 0x3Fu;
+    for (int n = 1; n <= 6; ++n) {
+        const std::uint64_t r = n <= 3 ? c.miptbp1 : c.miptbp2;
+        const int shift = ((n - 1) % 3) * 20;
+        bp[n] = static_cast<std::uint32_t>(r >> shift) & 0x3FFFu;
+        bw[n] = static_cast<std::uint32_t>(r >> (shift + 14)) & 0x3Fu;
+    }
+    if (!((c.tex1 >> 9) & 1u)) return;
+    const std::uint32_t psm = static_cast<std::uint32_t>(c.tex0 >> 20) & 0x3Fu;
+    const std::uint32_t tw = std::min<std::uint32_t>(static_cast<std::uint32_t>(c.tex0 >> 26) & 0xFu, 10u), th = std::min<std::uint32_t>(static_cast<std::uint32_t>(c.tex0 >> 30) & 0xFu, 10u);
+    for (std::uint32_t n = 1; n <= 3; ++n) {
+        const std::uint32_t w = 1u << (tw > n - 1 ? tw - (n - 1) : 0u), h = 1u << (th > n - 1 ? th - (n - 1) : 0u);
+        const std::uint32_t bytes = w * h * bits_per_pixel(psm) / 8u;
+        bp[n] = (bp[n - 1] + std::max(1u, (bytes + 255u) / 256u)) & 0x3FFFu;
+        bw[n] = std::max(1u, bw[n - 1] / 2u);
+    }
+}
+
 std::uint32_t address32(std::uint32_t bp, std::uint32_t bw, std::uint32_t x, std::uint32_t y) {
     return wrap(page_address(bp, bw, x, y, 64, 32) + g_off32[y & 31][x & 63]);
 }
@@ -504,6 +585,8 @@ void reset() {
     }
     g_csr = 0x551B4000ull;
     g_imr = 0x7F00ull;
+    g_finish_pending = 0;
+    g_finish_queued = 0;
     if (queue::active()) queue::post(queue::kReset, 0, 0, nullptr, 0);
     else render_reset();
 }
@@ -525,6 +608,8 @@ const char *spec() {
     static const char *value = std::getenv("PS2_TRACE_DRAWS");
     return value;
 }
+
+extern const bool g_any = std::getenv("PS2_TRACE_DRAWS") != nullptr;
 
 std::uint64_t g_frame = 0;  // frame of the draws the render side is doing now
 std::uint64_t g_number = 0; // primitives so far in this frame
@@ -673,13 +758,14 @@ void transfer(const State &s, std::uint64_t dir) {
 
 }
 
-void kick(bool draw) {
+// Inlined into the PACKED run (write_packed_run): as a call of its own it cost the ship about 0.15 ms of the drawing thread a frame.
+[[gnu::always_inline]] static inline void kick(bool draw) {
     State &s = g_state;
     const std::uint32_t prim = static_cast<std::uint32_t>(s.prim) & 7u;
     const int needed = prim == 0 ? 1 : (prim == 1 || prim == 2 || prim == 6) ? 2 : prim == 7 ? 1 : 3;
     if (s.count < needed) return;
     if (draw) {
-        if (trace::draw(s, needed)) {
+        if (!trace::g_any || trace::draw(s, needed)) {
             if (cpu_raster()) raster::draw(s, s.queue, needed);
 #ifdef PS2_GPU
             if (gpu_on()) gpu::draw(s, s.queue, needed);
@@ -707,7 +793,7 @@ void kick(bool draw) {
     }
 }
 
-void vertex(std::uint32_t x, std::uint32_t y, std::uint32_t z, std::uint8_t f, bool draw) {
+[[gnu::always_inline]] static inline void vertex(std::uint32_t x, std::uint32_t y, std::uint32_t z, std::uint8_t f, bool draw) {
     State &s = g_state;
     if (s.count >= 3) s.count = 2;
     Vertex &v = s.queue[s.count++];
@@ -728,14 +814,15 @@ void vertex(std::uint32_t x, std::uint32_t y, std::uint32_t z, std::uint8_t f, b
     kick(draw);
 }
 
+static const char *const g_gsseq = std::getenv("PS2_TRACE_GSSEQ");
+
 void write(std::uint32_t reg, std::uint64_t value) {
     State &s = g_state;
     ++g_writes[reg & 127u];
     constexpr std::uint64_t kVertexRegs = (1ull << 0x01) | (1ull << 0x02) | (1ull << 0x03) | (1ull << 0x04) | (1ull << 0x05) | (1ull << 0x0A) | (1ull << 0x0C) | (1ull << 0x0D);
     if (reg >= 64 || !((kVertexRegs >> reg) & 1u)) ++g_setup_generation;
-    static const char *seq = std::getenv("PS2_TRACE_GSSEQ");
-    if (seq) {
-        static std::uint64_t n = 0, start = std::strtoull(seq, nullptr, 10);
+    if (g_gsseq) [[unlikely]] {
+        static std::uint64_t n = 0, start = std::strtoull(g_gsseq, nullptr, 10);
         if (++n >= start && n < start + 100000) std::fprintf(stderr, "[gs] w %02X %016llX\n", reg, static_cast<unsigned long long>(value));
     }
     switch (reg) {
@@ -826,7 +913,24 @@ void write(std::uint32_t reg, std::uint64_t value) {
     }
 }
 
-void raise_finish() { raise(2); }
+// A game that counts FINISH events (Metal Gear Solid 3) would lose those that land while CSR.FINISH is still set from the one
+// before: they merge into one. So a FINISH that arrives with the bit set waits and is raised, one by one, as the game clears the
+// bit (follows upstream 75ccb0b, where the FINISH is raised at the write itself).
+static bool trace_finish() {
+    static const bool on = !ps2::os::env("PS2_TRACE_FINISH").empty();   // debugging: one line for every FINISH event and every write to CSR
+    return on;
+}
+
+void raise_finish() {
+    if (trace_finish()) std::fprintf(stderr, "[gs] FINISH event f%llu csr %llX imr %llX pending %u\n", static_cast<unsigned long long>(frame_count()),
+                                     static_cast<unsigned long long>(g_csr), static_cast<unsigned long long>(g_imr), g_finish_pending);
+    if (g_csr & 2u) ++g_finish_pending;
+    else raise(2);
+    if (g_finish_queued) {
+        --g_finish_queued;
+        schedule(hw::kEventGsFinish, now() + kFinishDelay, raise_finish);
+    }
+}
 
 void signal(std::uint32_t reg, std::uint64_t value) {
     const std::uint32_t mask = static_cast<std::uint32_t>(value >> 32), id = static_cast<std::uint32_t>(value);
@@ -839,7 +943,14 @@ void signal(std::uint32_t reg, std::uint64_t value) {
         // The GS only gets to FINISH after it has drawn what came before, so it must not be visible the
         // moment the DMA starts: ps2sdk's graph_wait_vsync writes CSR back right after starting the DMA,
         // and a FINISH that is already set would be wiped before draw_wait_finish ever sees it.
-        schedule(hw::kEventGsFinish, now() + kFinishDelay, raise_finish);
+        // The scheduler keeps one event per id, so a second FINISH written before the first has fired would replace it and one event
+        // would be lost; a game that counts them (Metal Gear Solid 3 sends three in a row and waits for all three) then waits for ever.
+        // The later ones wait in g_finish_queued and follow one kFinishDelay apart.
+        if (scheduled_at(hw::kEventGsFinish) != UINT64_MAX) {
+            ++g_finish_queued;
+            if (trace_finish()) std::fprintf(stderr, "[gs] FINISH write f%llu queued behind an earlier one (%u waiting)\n",
+                                             static_cast<unsigned long long>(frame_count()), g_finish_queued);
+        } else schedule(hw::kEventGsFinish, now() + kFinishDelay, raise_finish);
         break;
     case 0x62: {
         const std::uint64_t label = (g_siglblid >> 32 & ~static_cast<std::uint64_t>(mask)) | (id & mask);
@@ -850,7 +961,66 @@ void signal(std::uint32_t reg, std::uint64_t value) {
     }
 }
 
+static void write_packed_generic(std::uint32_t reg, const Reg128 &q);
+
+// The register writes of the PACKED mode that make up almost every shape (colour, texture coordinates, vertices) go straight to the code that
+// stores them; write() would unpack the vertex words into one 64-bit value just for vertex() to take them apart again. It counts the register
+// in g_writes (statistics) and does not change g_setup_generation for these registers, as write() does. The rest, and everything while
+// PS2_TRACE_GSSEQ prints the writes, goes the old way.
+[[gnu::always_inline]] static inline void packed_one(std::uint32_t reg, const Reg128 &q) {
+    State &s = g_state;
+    switch (reg) {
+    case 0x1: {
+        std::uint32_t qbits;
+        std::memcpy(&qbits, &s.q, 4);
+        s.rgbaq = (q.w[0] & 0xFFu) | ((q.w[1] & 0xFFu) << 8) | ((q.w[2] & 0xFFu) << 16) | ((q.w[3] & 0xFFu) << 24) |
+                  (static_cast<std::uint64_t>(qbits) << 32);
+        break;
+    }
+    case 0x2:
+        s.st = q.d[0];
+        std::memcpy(&s.q, &q.w[2], 4);
+        break;
+    case 0x3: s.uv = (q.w[0] & 0x3FFFu) | ((q.w[1] & 0x3FFFu) << 16); break;
+    case 0x4: {
+        const bool adc = (q.d[1] >> 47) & 1u;
+        ++g_writes[adc ? 0x0C : 0x04];
+        vertex(q.w[0] & 0xFFFFu, q.w[1] & 0xFFFFu, (q.w[2] >> 4) & 0xFFFFFFu, static_cast<std::uint8_t>((q.w[3] >> 4) & 0xFFu), !adc);
+        break;
+    }
+    case 0x5: {
+        const bool adc = (q.d[1] >> 47) & 1u;
+        ++g_writes[adc ? 0x0D : 0x05];
+        vertex(q.w[0] & 0xFFFFu, q.w[1] & 0xFFFFu, q.w[2], static_cast<std::uint8_t>(s.fog >> 56), !adc);
+        break;
+    }
+    default: write_packed_generic(reg, q); break;
+    }
+}
+
 void write_packed(std::uint32_t reg, const Reg128 &q) {
+    if (g_gsseq) [[unlikely]] {
+        write_packed_generic(reg, q);
+        return;
+    }
+    packed_one(reg, q);
+}
+
+// `count` qwords of PACKED data in a row, the first for descriptor `reg` of `regs` (`nreg` of them): the same writes in the same order as
+// write_packed for each one, but one call for the run instead of one per qword. On the God of War ship (about 53,000 small triangles a
+// frame, nine qwords each) the calls, the trace check and the reloads around them took about 0.3 ms of the drawing thread a frame.
+void write_packed_run(const std::uint8_t *data, std::uint32_t count, std::uint64_t regs, std::uint32_t nreg, std::uint32_t reg) {
+    for (std::uint32_t k = 0; k < count; ++k) {
+        Reg128 q;
+        std::memcpy(&q, data + static_cast<std::size_t>(k) * 16, 16);
+        const std::uint32_t r = static_cast<std::uint32_t>(regs >> (reg * 4)) & 0xFu;
+        if (g_gsseq) [[unlikely]] write_packed_generic(r, q);
+        else packed_one(r, q);
+        if (++reg >= nreg) reg = 0;
+    }
+}
+
+static void write_packed_generic(std::uint32_t reg, const Reg128 &q) {
     State &s = g_state;
     static const char *const seq = std::getenv("PS2_TRACE_GSSEQ");
     if (seq) [[unlikely]] {
@@ -907,12 +1077,18 @@ void read_image(std::uint8_t *data, std::uint32_t qwords) {
     key.qwords = qwords;
     g_shadow.offset += qwords * 16;
     const std::size_t bytes = static_cast<std::size_t>(qwords) * 16;
-    {
+    // A depth buffer is always read as it is now: a game that reads its depth and writes it back (Digital Devil Saga does it in
+    // every frame) would otherwise put the depth of the frame before back and draw against it (lights that are tested against
+    // the ceiling go missing while the camera moves).
+    const std::uint32_t spsm = static_cast<std::uint32_t>(key.buf >> 24) & 0x3Fu;
+    const bool depth = spsm == PSMZ32 || spsm == PSMZ24 || spsm == PSMZ16 || spsm == PSMZ16S;
+    if (!depth) {
         std::lock_guard lock(g_cache_mutex);
         const auto it = std::find_if(g_download_cache.begin(), g_download_cache.end(), [&](const CachedDownload &c) { return c.key == key; });
-        if (it != g_download_cache.end() && it->data.size() == bytes) {
+        if (it != g_download_cache.end() && it->data.size() == bytes && frames_run() - it->frame <= kCacheFrames) {
             std::memcpy(data, it->data.data(), bytes);
             it->used = ++g_cache_clock;
+            it->frame = frames_run();
             queue::post(queue::kDownloadAsync, qwords, 0, &key, sizeof key);
             return;
         }
@@ -997,7 +1173,10 @@ void write_privileged(std::uint32_t address, std::uint64_t value) {
     case 0x0050: g_synch2 = value; break;
     case 0x0060: g_syncv = value; break;
     case 0x0070:
-        if (trace_display() && value != g_dispfb[0]) std::fprintf(stderr, "[gs] dispfb1 0x%llX\n", static_cast<unsigned long long>(value));
+        if (value != g_dispfb[0]) {
+            if (trace_display()) std::fprintf(stderr, "[gs] dispfb1 0x%llX f%llu\n", static_cast<unsigned long long>(value), static_cast<unsigned long long>(frame_count()));
+            kernel::pace_picture();  // a new picture shown (the end-of-run count; the hold of a game with a picture pace)
+        }
         g_dispfb[0] = value;
         break;
     case 0x0080:
@@ -1005,7 +1184,10 @@ void write_privileged(std::uint32_t address, std::uint64_t value) {
         g_display[0] = value;
         break;
     case 0x0090:
-        if (trace_display() && value != g_dispfb[1]) std::fprintf(stderr, "[gs] dispfb2 0x%llX\n", static_cast<unsigned long long>(value));
+        if (value != g_dispfb[1]) {
+            if (trace_display()) std::fprintf(stderr, "[gs] dispfb2 0x%llX f%llu\n", static_cast<unsigned long long>(value), static_cast<unsigned long long>(frame_count()));
+            kernel::pace_picture();  // a new picture shown (the end-of-run count; the hold of a game with a picture pace)
+        }
         g_dispfb[1] = value;
         break;
     case 0x00A0:
@@ -1017,8 +1199,16 @@ void write_privileged(std::uint32_t address, std::uint64_t value) {
     case 0x00D0: g_extwrite = value; break;
     case 0x00E0: g_bgcolor = value; break;
     case 0x1000:
+        if (trace_finish()) std::fprintf(stderr, "[gs] CSR write %llX f%llu csr %llX pending %u\n", static_cast<unsigned long long>(value),
+                                         static_cast<unsigned long long>(frame_count()), static_cast<unsigned long long>(g_csr), g_finish_pending);
         g_csr &= ~(value & 0x1Fu);
+        if ((value & 2u) && g_finish_pending) {
+            --g_finish_pending;
+            raise(2);
+        }
         if (value & 0x200u) {
+            g_finish_pending = 0;
+            g_finish_queued = 0;
             g_csr = 0x551B4000ull;
             if (queue::active()) queue::post(queue::kSoftReset, 0, 0, nullptr, 0);
             else soft_reset();
@@ -1091,7 +1281,7 @@ bool present(const DisplayRegs &r) {
     const std::uint32_t width = ((static_cast<std::uint32_t>(disp >> 32) & 0xFFFu) + 1) / magh, height = display_height(disp, r.smode2);
     if (!width || !height || width > 2048 || height > 2048) return true;
     const gpu::DisplaySource src{(static_cast<std::uint32_t>(fb) & 0x1FFu) * 32, static_cast<std::uint32_t>(fb >> 9) & 0x3Fu, static_cast<std::uint32_t>(fb >> 15) & 0x1Fu,
-                                 static_cast<std::uint32_t>(fb >> 32) & 0x7FFu, static_cast<std::uint32_t>(fb >> 43) & 0x7FFu, width, height, (r.smode2 & 3u) == 3u};
+                                 static_cast<std::uint32_t>(fb >> 32) & 0x7FFu, static_cast<std::uint32_t>(fb >> 43) & 0x7FFu, width, height, (r.smode2 & 3u) == 3u, display_overlay(r.pmode, r.smode2, r.dispfb[0], r.display[0], r.display[1])};
     return gpu::present(src);
 #else
     return false;
@@ -1115,7 +1305,7 @@ bool display(const DisplayRegs &r, std::vector<std::uint32_t> &rgba, std::uint32
     const bool halved = (r.smode2 & 3u) == 3u;
 #ifdef PS2_GPU
     if (gpu_on()) {
-        const gpu::DisplaySource src{fbp * 32, fbw, psm, dbx, dby, width, height, halved};
+        const gpu::DisplaySource src{fbp * 32, fbw, psm, dbx, dby, width, height, halved, display_overlay(r.pmode, r.smode2, r.dispfb[0], r.display[0], r.display[1])};
         if (!cpu_raster()) return gpu::display(src, rgba, width, height);
         static const bool compare = std::getenv("PS2_GS_COMPARE") != nullptr;
         std::uint32_t gw = 0, gh = 0;
@@ -1130,6 +1320,20 @@ bool display(const DisplayRegs &r, std::vector<std::uint32_t> &rgba, std::uint32
                 c = ((c & 0x1Fu) << 3) | ((c & 0x3E0u) << 6) | ((c & 0x7C00u) << 9) | 0xFF000000u;
             rgba[static_cast<std::size_t>(y) * width + x] = c | 0xFF000000u;
         }
+    if (const DisplayOverlay o = display_overlay(r.pmode, r.smode2, r.dispfb[0], r.display[0], r.display[1]); o.active) {
+        const std::uint32_t ofbp = o.fbp, ofbw = o.fbw, opsm = o.psm;
+        for (std::uint32_t y = 0; y < o.height; ++y) {
+            const std::int32_t py = o.y + static_cast<std::int32_t>(y);
+            if (py < 0 || py >= static_cast<std::int32_t>(height)) continue;
+            for (std::uint32_t x = 0; x < o.width; ++x) {
+                const std::int32_t px = o.x + static_cast<std::int32_t>(x);
+                if (px < 0 || px >= static_cast<std::int32_t>(width)) continue;
+                std::uint32_t c = read_pixel(opsm, ofbp, ofbw, o.dbx + x, o.dby + (halved ? y / 2 : y));
+                if (opsm == PSMCT16 || opsm == PSMCT16S) c = ((c & 0x1Fu) << 3) | ((c & 0x3E0u) << 6) | ((c & 0x7C00u) << 9);
+                rgba[static_cast<std::size_t>(py) * width + static_cast<std::uint32_t>(px)] = c | 0xFF000000u;
+            }
+        }
+    }
 #ifdef PS2_GPU
     if (!g_gpu_frame.empty() && g_gpu_frame.size() == rgba.size()) {
         std::size_t differ = 0;
@@ -1162,7 +1366,7 @@ bool copy_frame(const DisplayRegs &r, std::vector<std::uint32_t> &rgba, std::uin
         const std::uint32_t w = ((static_cast<std::uint32_t>(disp >> 32) & 0xFFFu) + 1) / magh, h = display_height(disp, r.smode2);
         if (!w || !h || w > 2048 || h > 2048) return false;
         const gpu::DisplaySource src{(static_cast<std::uint32_t>(fb) & 0x1FFu) * 32, static_cast<std::uint32_t>(fb >> 9) & 0x3Fu, static_cast<std::uint32_t>(fb >> 15) & 0x1Fu,
-                                     static_cast<std::uint32_t>(fb >> 32) & 0x7FFu, static_cast<std::uint32_t>(fb >> 43) & 0x7FFu, w, h, (r.smode2 & 3u) == 3u};
+                                     static_cast<std::uint32_t>(fb >> 32) & 0x7FFu, static_cast<std::uint32_t>(fb >> 43) & 0x7FFu, w, h, (r.smode2 & 3u) == 3u, display_overlay(r.pmode, r.smode2, r.dispfb[0], r.display[0], r.display[1])};
         got = gpu::display_async(src, rgba, width, height);
     } else
 #endif
@@ -1191,7 +1395,13 @@ void flush_and_wait() {
 #endif
 }
 
-void start_thread() { queue::render().start(32u << 20); }
+// The drawing thread's ring, 8 MiB: the largest message seen in nine games is 256 KiB, anything over
+// 2 MiB goes through a heap copy (queue.cpp), and a smaller ring keeps the copy in the cache (Silent Hill 2 6 % faster than with 32 MiB).
+// PS2_GS_RING_MB=<n> sets another size (a power of two is taken).
+void start_thread() {
+    const char *mb = std::getenv("PS2_GS_RING_MB");
+    queue::render().start((mb && std::atoi(mb) > 0 ? static_cast<std::size_t>(std::atoi(mb)) : 8u) << 20);
+}
 
 std::uint32_t g_present_frame = 0;
 
@@ -1369,8 +1579,23 @@ void dump_region(const char *spec) {
     std::fclose(f);
 }
 
+// PS2_DUMP_VRAM_RAW=<path>: the 4 MB of graphics memory as the program ends, and its hash on the log.
+void dump_raw(const char *path) {
+#ifdef PS2_GPU
+    if (gpu_on() && !cpu_raster()) gpu::download(g_memory);
+#endif
+    std::uint64_t h = 1469598103934665603ull;
+    for (std::uint32_t i = 0; i < kMemorySize; ++i) h = (h ^ g_memory[i]) * 1099511628211ull;
+    std::fprintf(stderr, "[gs] graphics memory hash %016llx\n", static_cast<unsigned long long>(h));
+    if (std::FILE *f = os::open(path, "wb")) {
+        std::fwrite(g_memory, 1, kMemorySize, f);
+        std::fclose(f);
+    }
+}
+
 void stats() {
     if (const std::string spec = os::env("PS2_DUMP_VRAM"); !spec.empty()) dump_region(spec.c_str());
+    if (const std::string raw = os::env("PS2_DUMP_VRAM_RAW"); !raw.empty()) dump_raw(raw.c_str());
 #ifdef PS2_GPU
     gpu::stats();
 #endif
@@ -1423,6 +1648,9 @@ void render_state(ps2::state::Stream &s) {
     s.pod(g_imr);
     s.pod(g_busdir);
     s.pod(g_siglblid);
+    if (s.version() >= 9) s.pod(g_finish_pending);
+    else g_finish_pending = 0;
+    if (s.loading()) g_finish_queued = 0;   // a state keeps the event that is on its way, not the ones queued behind it
     s.pod(g_primitives);
     s.pod(g_odd_field);
     s.pod(g_transfer);

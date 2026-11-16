@@ -25,8 +25,9 @@ HW_WGSL = ROOT / "runtime" / "src" / "gs" / "gpu" / "hw.wgsl"
 BLIT_WGSL = ROOT / "runtime" / "src" / "gs" / "gpu" / "blit.wgsl"
 OUT = ROOT / "runtime" / "src" / "gs" / "gpu" / "vk" / "spirv_table.cpp"
 
-# (SCALE, TILE, EXPLICIT_FMA): the tile sizes gpu.cpp takes (PS2_TILE=4, 8 or 16), with and without the sums spelled out as fma()
-VARIANTS = [(1, tile, fma) for tile in (4, 8, 16) for fma in (False, True)]
+# (SCALE, TILE, EXPLICIT_FMA, HAS_MIP): the tile sizes gpu.cpp takes (PS2_TILE=4, 8 or 16), with and without the sums spelled out as fma(),
+# and the draw program without and with mipmap levels (gpu.cpp builds the HAS_MIP one for batches that carry a mipmap table)
+VARIANTS = [(1, tile, fma, mip) for tile in (4, 8, 16) for fma in (False, True) for mip in (False, True)]
 
 
 def wgsl_hash(text: str) -> int:
@@ -37,8 +38,9 @@ def wgsl_hash(text: str) -> int:
     return h
 
 
-def specialise(text: str, scale: int, tile: int, fma: bool) -> str:
-    values = {"SCALE": f"{scale}u", "TILE": f"{tile}u", "EXPLICIT_FMA": "true" if fma else "false"}
+def specialise(text: str, scale: int, tile: int, fma: bool, mip: bool) -> str:
+    # SHARP (the filter of upscaled 2D art) only acts when SCALE > 1, and every variant here is SCALE 1: it is fixed at its default
+    values = {"SCALE": f"{scale}u", "TILE": f"{tile}u", "EXPLICIT_FMA": "true" if fma else "false", "HAS_MIP": "true" if mip else "false", "SHARP": "0u"}
     seen = set()
 
     def repl(m):
@@ -82,18 +84,18 @@ def main():
     h = wgsl_hash(text)
     hw_h = wgsl_hash(hw_text)
     blit_h = wgsl_hash(blit_text)
-    modules = []  # (hash, scale, tile, fma, words); tile 0: a program without overrides, any constants
+    modules = []  # (hash, scale, tile, fma, mip, words); tile 0: a program without overrides, any constants
     with tempfile.TemporaryDirectory() as tmp:
-        for scale, tile, fma in VARIANTS:
-            words = compile_wgsl(naga, specialise(text, scale, tile, fma), f"gs_{scale}_{tile}_{int(fma)}", tmp)
-            modules.append((h, scale, tile, fma, words))
-            print(f"gs.wgsl SCALE={scale} TILE={tile} EXPLICIT_FMA={int(fma)}: {len(words)} words")
+        for scale, tile, fma, mip in VARIANTS:
+            words = compile_wgsl(naga, specialise(text, scale, tile, fma, mip), f"gs_{scale}_{tile}_{int(fma)}_{int(mip)}", tmp)
+            modules.append((h, scale, tile, fma, mip, words))
+            print(f"gs.wgsl SCALE={scale} TILE={tile} EXPLICIT_FMA={int(fma)} HAS_MIP={int(mip)}: {len(words)} words")
         words = compile_wgsl(naga, hw_text, "hw", tmp, ("--capabilities", "dual_source_blending"))
-        modules.append((hw_h, 0, 0, False, words))
+        modules.append((hw_h, 0, 0, False, False, words))
         print(f"hw.wgsl: {len(words)} words")
         # the blit that draws into the window's swap chain (PS2_VK_PRESENT=1): a program without overrides, like hw.wgsl
         words = compile_wgsl(naga, blit_text, "blit", tmp)
-        modules.append((blit_h, 0, 0, False, words))
+        modules.append((blit_h, 0, 0, False, False, words))
         print(f"blit.wgsl: {len(words)} words")
 
     sha = lambda t: hashlib.sha256(t.replace(chr(13), '').encode('utf-8')).hexdigest()
@@ -109,14 +111,14 @@ def main():
         "",
         "namespace {",
     ]
-    for n, (_, scale, tile, fma, words) in enumerate(modules):
+    for n, (_, scale, tile, fma, mip, words) in enumerate(modules):
         lines.append(f"const std::uint32_t kWords{n}[] = {{")
         for i in range(0, len(words), 12):
             lines.append("    " + ", ".join(f"0x{w:08x}" for w in words[i:i + 12]) + ",")
         lines.append("};")
     lines += ["}  // namespace", "", "const SpirvVariant kSpirvVariants[] = {"]
-    for n, (mh, scale, tile, fma, words) in enumerate(modules):
-        lines.append(f"    {{0x{mh:016x}ull, {scale}, {tile}, {'true' if fma else 'false'}, kWords{n}, sizeof kWords{n} / 4}},")
+    for n, (mh, scale, tile, fma, mip, words) in enumerate(modules):
+        lines.append(f"    {{0x{mh:016x}ull, {scale}, {tile}, {'true' if fma else 'false'}, {'true' if mip else 'false'}, kWords{n}, sizeof kWords{n} / 4}},")
     lines += ["};", "const std::size_t kSpirvVariantCount = sizeof kSpirvVariants / sizeof kSpirvVariants[0];", "", "}  // namespace ps2::gs::gpu::vk", ""]
     OUT.write_text("\n".join(lines), encoding="utf-8", newline="\n")
     print(f"wrote {OUT.relative_to(ROOT)}")

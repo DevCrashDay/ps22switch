@@ -45,7 +45,11 @@ void fault(const char *reason);
 std::uint32_t fetch_special(std::uint32_t pc);
 void syscall(Cpu &c, std::uint32_t pc);
 void set_status(Cpu &c, std::uint32_t value);
-bool switch_pending();
+extern bool g_switch;
+extern int g_nesting;
+extern bool g_nested_done;
+// asked after every IOP instruction, so inline
+inline bool switch_pending() { return g_switch || (g_nesting && g_nested_done); }
 
 std::uint64_t now();
 std::uint64_t usec_to_cycles(std::uint64_t usec);
@@ -77,6 +81,8 @@ void schedule(std::uint64_t at, const Job &job);
 
 Thread *current();
 Thread *thread(int id);
+std::vector<int> thread_ids();      // every thread id, ascending
+std::uint64_t switch_count();      // how often the scheduler changed the running thread
 int create_thread(std::uint32_t entry, std::uint32_t stack_size, int priority, std::uint32_t gp, std::uint32_t attr, std::uint32_t option);
 void start_thread(int id, std::uint32_t a0, std::uint32_t a1 = 0);
 bool delete_thread(int id);
@@ -93,6 +99,8 @@ std::uint32_t free_total();
 std::uint32_t free_max();
 std::uint32_t kernel_alloc(std::uint32_t size);
 std::uint32_t hle_stub(const HleFunction &function);
+void move_hle_stubs(const std::vector<std::pair<std::uint32_t, std::uint32_t>> &moves);  // state loading only: see sif.cpp
+void plan_io_stubs(std::vector<std::pair<std::uint32_t, std::uint32_t>> &moves, std::uint32_t first);  // ditto: see io.cpp
 
 void register_library(const std::string &name, std::uint32_t table);
 void register_hle_library(const std::string &name, std::uint32_t version);
@@ -104,6 +112,7 @@ struct Module {
     std::uint32_t base, size, entry, gp;
 };
 const std::map<int, Module> &modules();
+std::string wait_words(const Thread &t);  // what a thread does or waits for, in words (libs.cpp)
 using HleModuleStart = std::function<void()>;
 void register_hle_module(const std::string &name, HleModuleStart start);
 
@@ -120,6 +129,7 @@ void install_sif();
 void install_cdvdfsv();
 void install_cdvd();
 void install_io();
+void install_io_stubs();  // after every other install_*: see io.cpp
 
 void trace_hle(const char *library, const char *function, const Cpu &c);
 extern bool g_trace_hle;

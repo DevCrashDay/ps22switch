@@ -175,11 +175,18 @@ std::uint64_t gs_imr() { return gs::read_privileged(0x12001010u); }
 std::uint64_t gs_csr() { return gs::read_privileged(0x12001000u); }
 void gs_set_imr(std::uint64_t value) { gs::write_privileged(0x12001010u, value); }
 
+std::uint32_t crt_mode() { return __atomic_load_n(&g_crt[1], __ATOMIC_RELAXED); }
+
 void gs_set_crt(std::uint32_t interlace, std::uint32_t mode, std::uint32_t field) {
     g_crt[0] = interlace;
-    g_crt[1] = mode;
+    __atomic_store_n(&g_crt[1], mode, __ATOMIC_RELAXED); // the window or render thread reads it (crt_mode)
     g_crt[2] = field;
     std::fprintf(stderr, "[gs] SetGsCrt interlace %u mode 0x%X field %u\n", interlace, mode, field);
+    // The BIOS call programs the video output: SMODE2 gets INT (bit 0, interlace) and FFMD (bit 1, 1 = frame mode: both fields read the
+    // same lines, so a 224 line buffer fills a 448 line picture), and the game cannot read it back (the GS registers are write-only).
+    // Games made with Sony's libgraph write SMODE2 themselves with the same value after the call (checked in Devil May Cry, Gran Turismo 4,
+    // Resident Evil 4 and Silent Hill 2); Zone of the Enders does not, it relies on the call, and showed two buffers stacked without this.
+    gs::write_privileged(0x12000020u, (interlace & 1u) | ((field & 1u) << 1));
     if (!g_options.rate_forced) g_options.pal = mode == 3u;
 }
 
@@ -318,6 +325,7 @@ void write32(std::uint32_t a, std::uint32_t v) {
         return;
     }
     if (dmac::owns(a)) { dmac::write(a, v); return; }
+    if (a == 0x1000F590u) dmac::enable_write(v);  // D_ENABLEW: stored below, read back through 0x1000F520
     if (a >= 0x10003000u && a < 0x10003800u) { gif::write(a, v); return; }
     if (a >= 0x10003800u && a < 0x10003C00u) { vif::write(0, a & 0x3FFu, v); return; }
     if (a >= 0x10003C00u && a < 0x10004000u) { vif::write(1, a & 0x3FFu, v); return; }

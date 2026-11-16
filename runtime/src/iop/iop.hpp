@@ -58,6 +58,8 @@ void write8(std::uint32_t a, std::uint8_t v);
 void write16(std::uint32_t a, std::uint16_t v);
 void write32(std::uint32_t a, std::uint32_t v);
 // PS2_WATCH_IOP (hw.cpp): the library functions that write memory on the IOP's behalf say so here
+// PS2_WATCH_IOP's range (0 and 0 when off); the interpreter's inline stores go the slow way while it is set
+extern std::uint32_t g_watch_lo, g_watch_hi;
 void watch_copy(const char *what, std::uint32_t dst, std::uint32_t src, std::uint32_t bytes, std::uint32_t caller);
 
 using HleFunction = std::function<void(Cpu &)>;
@@ -65,16 +67,25 @@ std::uint32_t register_hle(const std::string &library, std::uint32_t index, HleF
 void call_hle(Cpu &c, std::uint32_t id);
 
 void reset();
+// The IOP starts again with only its own (native) modules, as after SIF command 0x80000003 with no image: every module, thread,
+// semaphore, timer, interrupt handler, file and RPC server of the game is gone and the SIF state is new. The clock goes on.
+void soft_reset();
 void run(std::uint64_t ee_cycles);
 std::uint64_t cycles();
 void raise_interrupt(unsigned line);
 void vblank(bool start);
 bool idle();
 void dump();
+// The F9 report's thread list, the same words as the end-of-run list. Only on the emulation thread.
+std::string thread_summary();  // one plain line
+std::string thread_report();   // one line per started thread
 
 std::int32_t load_module(const std::string &path, const std::string &args, std::function<void(int, int)> done = {});
 std::int32_t load_module_buffer(const std::vector<std::uint8_t> &data, const std::string &path, const std::string &args,
                                 std::function<void(int, int)> done = {});
+// modload's LoadModuleBuffer and StartModule: link a module without running it, then run its start routine later
+std::int32_t link_module(const std::vector<std::uint8_t> &data, const std::string &path);
+bool start_module(int id, const std::string &args, std::function<void(int, int)> done);
 void set_trace(bool modules, bool hle);
 
 }

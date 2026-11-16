@@ -7,7 +7,8 @@
 *.rar
 
 /generated/
-/tools/
+/tools/*
+!/tools/ps2_disc_toolkit/
 /build/
 /build-switch/
 
@@ -16,6 +17,8 @@
 __pycache__/
 
 /third_party/wgpu-native/
+/third_party/wgpu-native-win/
+/third_party/llvm-mingw/
 /third_party/sdl2/
 /third_party/dxc/
 
@@ -68,3 +71,9 @@ __pycache__/
 /.claude/settings.local.json
 /CLAUDE.local.md
 /scratch/
+
+# Files saved by hand when a download fails (docs/fetch-retry.md); the app's Update keeps them.
+/downloads/
+
+# Games packed into one file (scripts/extract_disc.py bundle).
+/dist/

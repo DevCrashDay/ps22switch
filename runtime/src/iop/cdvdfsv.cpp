@@ -11,9 +11,41 @@
 #include <ctime>
 #include <vector>
 
+namespace ps2::iop {
+// libs.cpp: a guest size that reaches past the end of memory is said there (rate-limited).
+void bad_span(const char *what, std::uint32_t address, std::uint64_t size, const char *outcome);
+}
+
 namespace ps2::iop::kernel {
 
 namespace {
+
+// A read the EE asks for is cut to the sectors that reach the end of the memory it goes to (the last one may be partial, as before),
+// so a bad count does not ask the host for a buffer of up to 8 TB: up to the end of EE memory, or 2 MiB for the IOP (mirrored).
+std::uint32_t ee_sectors(std::uint32_t dst, std::uint32_t count) {
+    const std::uint32_t most = (ps2::kRamSize - (dst & (ps2::kRamSize - 1)) + disc::kSector - 1) / disc::kSector;
+    if (count <= most) return count;
+    bad_span("cdvdfsv read to EE", dst, std::uint64_t{count} * disc::kSector, "cut at the end of EE memory");
+    return most;
+}
+
+std::uint32_t iop_sectors(std::uint32_t dst, std::uint32_t count) {
+    constexpr std::uint32_t kMost = kRamSize / disc::kSector;
+    if (count <= kMost) return count;
+    bad_span("cdvdfsv read to IOP", dst, std::uint64_t{count} * disc::kSector, "cut to 2 MiB");
+    return kMost;
+}
+
+// A name in EE memory, read byte by byte round the 32 MiB and at most `limit` long, so one without its 0 cannot run past g_ram.
+std::string ee_text(std::uint32_t a, std::size_t limit) {
+    std::string s;
+    for (std::size_t i = 0; i < limit; ++i) {
+        const char ch = static_cast<char>(ps2::g_ram[(a + i) & (ps2::kRamSize - 1)]);
+        if (!ch) break;
+        s += ch;
+    }
+    return s;
+}
 
 std::uint32_t ee32(std::uint32_t a) { return load<std::uint32_t>(ps2::g_ram + (a & (ps2::kRamSize - 1))); }
 void set_ee32(std::uint32_t a, std::uint32_t v) { store<std::uint32_t>(ps2::g_ram + (a & (ps2::kRamSize - 1)), v); }
@@ -22,6 +54,19 @@ std::uint8_t bcd(int v) { return static_cast<std::uint8_t>(((v / 10) << 4) | (v 
 
 bool g_streaming = false;
 std::uint32_t g_stream_pos = 0;
+// The stream buffer the game set up with sceCdStInit (ps2sdk cdvdstm.c, command 5: the buffer's size in sectors and its number of banks);
+// not part of a save state (0 after loading one: sceCdStStat then answers kStreamBufferDefault until the game sets the stream up again).
+std::uint32_t g_stream_buffer = 0;
+std::uint32_t g_stream_banks = 0;
+constexpr std::uint32_t kStreamBufferDefault = 16;
+
+// sceCdStStat of a full buffer. cdvdstm.c fills one bank after the other and never the bank the reader is in, so a full buffer holds all
+// banks but one: (banks - 1) times the sectors of a bank.
+std::uint32_t stream_full() {
+    if (!g_stream_buffer) return kStreamBufferDefault;
+    if (g_stream_banks < 2) return g_stream_buffer;
+    return (g_stream_banks - 1) * (g_stream_buffer / g_stream_banks);
+}
 
 std::uint64_t delay(std::uint32_t sectors) { return usec_to_cycles(400) + static_cast<std::uint64_t>(sectors) * usec_to_cycles(200); }
 
@@ -38,6 +83,8 @@ void read_to_ee(std::uint32_t sector, std::uint32_t count, std::uint32_t dst) {
 void install_cdvdfsv() {
     g_streaming = false;
     g_stream_pos = 0;
+    g_stream_buffer = 0;
+    g_stream_banks = 0;
     register_job(kJobFsvRead, [](const Job &j) {
         if (g_trace_hle) std::fprintf(stderr, "[cdvdfsv] stream write lsn %u count %u to 0x%08X\n", j.a, j.b, j.c);
         if (!disc::ready(j.a, j.b)) {
@@ -65,14 +112,15 @@ void install_cdvdfsv() {
     sif::register_hle_server(0x80000593u, [](std::uint32_t method, std::uint32_t args, std::uint32_t, std::uint32_t ret, std::uint32_t ret_size) {
         switch (method) {
         case 0x01: {
-            const std::time_t t = static_cast<std::time_t>(rtc_seconds());
+            // in Japan time (UTC+9) as the console's clock chip keeps it, the whole date shifted (cdvd.cpp write_clock)
+            const std::time_t t = static_cast<std::time_t>(rtc_seconds() + 9 * 3600);
             const std::tm *tm = std::gmtime(&t);
             set_ee32(ret, 1);
             std::uint8_t *clock = ps2::g_ram + ret + 4;
             clock[0] = 0;
             clock[1] = bcd(tm->tm_sec);
             clock[2] = bcd(tm->tm_min);
-            clock[3] = bcd((tm->tm_hour + 9) % 24);
+            clock[3] = bcd(tm->tm_hour);
             clock[4] = 0;
             clock[5] = bcd(tm->tm_mday);
             clock[6] = bcd(tm->tm_mon + 1);
@@ -99,11 +147,13 @@ void install_cdvdfsv() {
         return true;
     });
     sif::register_hle_server(0x80000595u, [](std::uint32_t method, std::uint32_t args, std::uint32_t, std::uint32_t ret, std::uint32_t ret_size) {
-        const std::uint32_t sector = ee32(args), count = ee32(args + 4), dst = ee32(args + 8);
+        const std::uint32_t sector = ee32(args), dst = ee32(args + 8);
+        std::uint32_t count = ee32(args + 4);
         if (g_trace_hle) std::fprintf(stderr, "[cdvdfsv] N 0x%X sector %u count %u to 0x%08X\n", method, sector, count, dst);
         switch (method) {
         case 0x01:
             if (ret_size >= 4) set_ee32(ret, 0);
+            count = ee_sectors(dst, count);
             disc::ready(sector, count);
             schedule(now() + delay(count), Job{kJobFsvRead, sector, count, dst});
             return false;
@@ -118,6 +168,7 @@ void install_cdvdfsv() {
             switch (cmd) {
             case 1: g_stream_pos = sector; g_streaming = true; set_ee32(ret, 1); return true;
             case 2: {
+                count = ee_sectors(dst, count);
                 const std::uint32_t pos = g_stream_pos;
                 g_stream_pos += count;
                 set_ee32(ret, count);
@@ -127,13 +178,17 @@ void install_cdvdfsv() {
             }
             case 3: g_streaming = false; set_ee32(ret, 1); return true;
             case 4: case 9: g_stream_pos = sector; set_ee32(ret, 1); return true;
-            case 5: set_ee32(ret, 1); return true;
-            case 6: set_ee32(ret, sector); return true;
+            case 5: g_stream_buffer = sector; g_stream_banks = count; set_ee32(ret, 1); return true;
+            // sceCdStStat: how many sectors the stream buffer holds now (ps2sdk cdvdstm.c, command 6: the filled banks times the sectors
+            // per bank). The disc is always ahead here, so a started stream has its buffer full, a stopped one nothing.
+            // This used to answer the lbn field of the call, which is 0, so a game waiting for data in the buffer waited for ever.
+            case 6: set_ee32(ret, g_streaming ? stream_full() : 0u); return true;
             default: set_ee32(ret, 1); return true;
             }
         }
         case 0x0D:
             if (ret_size >= 4) set_ee32(ret, 0);
+            count = iop_sectors(dst, count);
             disc::ready(sector, count);
             schedule(now() + delay(count), Job{kJobFsvIopRead, sector, count, dst});
             return false;
@@ -149,13 +204,16 @@ void install_cdvdfsv() {
     });
     sif::register_hle_server(0x80000597u, [](std::uint32_t, std::uint32_t args, std::uint32_t size, std::uint32_t ret, std::uint32_t) {
         const std::uint32_t offset = size == 0x124 ? 0x20u : 0x24u;
-        const std::string path(reinterpret_cast<const char *>(ps2::g_ram + (args & (ps2::kRamSize - 1)) + offset));
-        const auto entry = disc::find(path);
+        const std::string path = ee_text((args & (ps2::kRamSize - 1)) + offset, 1024);
+        // The 0x12C packet (ps2sdk libcdvd-rpc.h cdvdfsv_rpc4_sz12c_inpacket_t: file, attributes, path, EE address, layer) is
+        // sceCdLayerSearchFile; the newer EE library's sceCdSearchFile sends it too, with layer 0. The smaller packets have no layer.
+        const int layer = size == 0x12C ? static_cast<int>(ee32(args + 0x128)) : 0;
+        const auto entry = disc::find(path, layer);
         if (entry) {
             set_ee32(args, entry->sector);
             set_ee32(args + 4, entry->size);
         }
-        std::fprintf(stderr, "[cdvdfsv] search %s -> %s\n", path.c_str(), entry ? "found" : "missing");
+        std::fprintf(stderr, "[cdvdfsv] search %s%s -> %s\n", path.c_str(), layer ? " (layer 1)" : "", entry ? "found" : "missing");
         set_ee32(ret, entry ? 1u : 0u);
         return true;
     });

@@ -100,11 +100,14 @@ def main():
     ap.add_argument("recording", help="a quick save (.state) or a recording (.inputs)")
     ap.add_argument("--state", help="the state to start from, when it is not next to the recording")
     ap.add_argument("--game", help="game folder name under games/ (default: guessed from the program path)")
+    ap.add_argument("--game-dir", type=Path, help="game folder for caches and build inputs (default: from the recording)")
     ap.add_argument("--program", help="the game's program (default: from the recording)")
     ap.add_argument("--disc", help="the disc image (default: from the recording)")
     ap.add_argument("--exe", help="ps2run (default: build/native-<game>/ps2run)")
     ap.add_argument("--card", help="the memory card the recording began with: none, new (an empty new card) or a file (default: from the recording)")
     ap.add_argument("--log", help="keep the full log in this file")
+    ap.add_argument("--keep-card", help="copy the memory card as the game left it at the end of the replay to this file (to look at a save "
+                                        "the recording makes)")
     ap.add_argument("--continue", dest="go_on", action="store_true",
                     help="after a checkpoint that differs, play on to the end of the recording (for a recording that cannot replay exactly, "
                          "like the ones made before 2026-10-28, which left the game's clock to the host)")
@@ -115,10 +118,24 @@ def main():
     inputs, state, head = find_inputs_and_state(args.recording, args.state)
     program_text = args.program or head.get("program", "")
     game = args.game
+    game_dir = args.game_dir
+    if game_dir is None:
+        recorded_dir = head.get("game-dir", "")
+        candidates = [ROOT / "games" / game] if game else []
+        if recorded_dir:
+            candidates += [Path(recorded_dir), ROOT / recorded_dir]
+        game_dir = next((p.resolve() for p in candidates if p.is_dir()), None)
+    elif not game_dir.is_dir():
+        sys.exit(f"replay: game folder is not a directory: {game_dir}")
+    else:
+        game_dir = game_dir.resolve()
     if not game:
         m = re.search(r"(?:games|program)[/\\]([^/\\]+)[/\\]", program_text)  # games\gow2\disc\... (the repo) or program\gow2\... (a game folder made for a player)
         game = m.group(1) if m else None
-    program = Path(args.program) if args.program else resolve(program_text, game, "program")
+        if not game and game_dir and game_dir.parent.name == "games":
+            game = game_dir.name
+    disc_boot = not args.program and head.get("disc-program") == "1"
+    program = None if disc_boot else (Path(args.program) if args.program else resolve(program_text, game, "program"))
     disc = Path(args.disc) if args.disc else resolve(head.get("disc", ""), game, "disc")
     exe = Path(args.exe) if args.exe else None
     if exe is None:
@@ -134,7 +151,9 @@ def main():
 
     work = Path(tempfile.mkdtemp(prefix="replay_"))
     try:
-        cmd = [str(exe), str(program), "--disc", str(disc), "--replay", str(inputs), "--quick-dir", str(work)]
+        cmd = [str(exe), *([] if disc_boot else [str(program)]), "--disc", str(disc), "--replay", str(inputs), "--quick-dir", str(work)]
+        if game_dir:
+            cmd += ["--game-dir", str(game_dir)]
         if args.go_on:
             cmd += ["--replay-continue"]
         if args.rtc:
@@ -173,6 +192,12 @@ def main():
         with open(log_path, "wb") as log:
             code = subprocess.run(cmd, cwd=ROOT, stdout=log, stderr=subprocess.STDOUT, env=env).returncode
         text = log_path.read_text(encoding="utf-8", errors="replace")
+        if args.keep_card:
+            if (work / "card.ps2").exists():
+                shutil.copyfile(work / "card.ps2", args.keep_card)
+                print(f"the card after the replay: {args.keep_card}")
+            else:
+                print("replay: the run had no card, nothing to keep")
     finally:
         shutil.rmtree(work, ignore_errors=True)
 

@@ -3,6 +3,7 @@
 #include "ps2/os.hpp"
 
 #include <bit>
+#include <cstdlib>
 #include <filesystem>
 #include <format>
 #include <fstream>
@@ -13,6 +14,7 @@
 #include <set>
 #include <sstream>
 #include <stdexcept>
+#include <string_view>
 #include <vector>
 
 namespace recomp {
@@ -90,6 +92,9 @@ public:
                 write_unit(u);
                 rows.push_back({layout_.base_of(u), layout_.size(), unit_name(u), table_name(u)});
             }
+        if (unserved_ && !options_.quiet)
+            std::fprintf(stderr, "eerecomp: note: %zu branch targets of %s had no label in their unit and leave through the dispatcher\n", unserved_,
+                         prefix_.empty() ? "the program" : prefix_.c_str());
         return rows;
     }
 
@@ -208,6 +213,7 @@ private:
             }
             if (has_delay_slot(i.op) && labels_.count(a + 4) && in_unit(a + 8)) labels_.insert(a + 8);
         }
+        label_after_slots();
 
         out_.str({});
         out_ << "#include \"units.hpp\"\n\nnamespace gen {\n\nusing namespace ps2;\n\n";
@@ -244,8 +250,13 @@ private:
             const Insn i = at(a);
             const Flow fl = flow(i.op);
             if (fl == Flow::None) {
-                if (const auto t = options_.toggles.find(a); t != options_.toggles.end()) toggled(i, t->second);
-                else simple(i);
+                if (const auto t = options_.toggles.find(a); t != options_.toggles.end()) {
+                    toggled(i, t->second);
+                } else {
+                    flags_dead_ = vu0_flags_unseen(i);
+                    simple(i);
+                    flags_dead_ = false;
+                }
                 ++pending_;
                 falls = true;
             } else if (i.op == Eret) {
@@ -262,7 +273,8 @@ private:
                 falls = !complex_slot(ds) && fl != Flow::Jump && fl != Flow::JumpRegister;
                 skip = true;
                 if (falls && (labels_.count(a + 4) || !in_unit(a + 4))) {
-                    if (in_unit(a + 8) && p_.is_code(a + 8)) line("goto " + label(a + 8) + ";");
+                    if (in_unit(a + 8) && p_.is_code(a + 8) && have_label(a + 8)) line("goto " + label(a + 8) + ";");
+                    else if (in_unit(a + 8) && p_.is_code(a + 8)) leave_by_dispatch(a + 8);
                     else exit_to(a + 8);
                     falls = false;
                 }
@@ -271,6 +283,25 @@ private:
         if (falls) exit_to(end);
         out_ << "}\n\n}\n";
         write_if_changed(ps2::os::path(options_.output) / std::format("{}.cpp", unit_name(u)), out_.str());
+    }
+
+    // A labelled delay slot is something the code can be entered at, so the branch in front of it skips it with a goto to the
+    // instruction after it (see write_unit). That instruction needs its label even when the slot only got its label later in the
+    // scan, from a branch further down that goes back to the slot: the first pass over the unit has passed the branch by then.
+    // A label that is new here can be the label of another delay slot, so the pass runs until nothing is added.
+    void label_after_slots() {
+        const std::uint32_t end = base_ + layout_.size();
+        for (bool added = true; added;) {
+            added = false;
+            for (std::uint32_t a = base_; a < end; a += 4) {
+                if (!p_.is_code(a) || !p_.is_code(a + 4) || !labels_.count(a + 4) || labels_.count(a + 8) || !in_unit(a + 8) || !p_.is_code(a + 8)) continue;
+                const Insn i = at(a);
+                const Flow fl = flow(i.op);
+                if (!has_delay_slot(i.op) || fl == Flow::Jump || fl == Flow::JumpRegister || complex_slot(at(a + 4))) continue;
+                labels_.insert(a + 8);
+                added = true;
+            }
+        }
     }
 
     // Both versions of a switched instruction, chosen by the game variable when it runs. Only plain instructions can be
@@ -305,9 +336,27 @@ private:
         }
     }
 
+    // The last line of defence against a goto to a label that the unit does not have, which the C++ compiler rejects and so
+    // stops the build of the whole game (issue #55): code of this unit that no scan of write_unit labelled leaves through the
+    // dispatcher, like any address the translation does not serve. Which one does shows in the note generate() prints.
+    bool have_label(std::uint32_t a) const { return labels_.count(a) != 0; }
+
+    std::string unserved(std::uint32_t t) {
+        ++unserved_;
+        return std::format("c.pc = {}; [[clang::musttail]] return dispatch(c, 0u, depth);", pc(t));
+    }
+
+    void leave_by_dispatch(std::uint32_t t) {
+        flush();
+        line(unserved(t));
+    }
+
     std::string jump(std::uint32_t t, std::uint32_t from) {
         std::string check = t <= from ? std::format("if (c.budget < 0 && preempt(c)) {{ c.pc = {} | kUnwind; return; }} ", pc(t)) : "";
-        if (in_unit(t) && p_.is_code(t)) return check + "goto " + label(t) + ";";
+        if (in_unit(t) && p_.is_code(t)) {
+            if (have_label(t)) return check + "goto " + label(t) + ";";
+            return check + unserved(t);
+        }
         if (p_.is_code(t))
             return check + std::format("{}[[clang::musttail]] return {}(c, {}u, depth);", rebase(), unit_name(layout_.unit_of(t)), id_of(t));
         return std::format("c.pc = {}; [[clang::musttail]] return dispatch(c, 0u, depth);", pc(t));
@@ -488,9 +537,38 @@ private:
         line("}");
     }
 
+    // A delay loop: the branch at i goes back to t over nothing but one `addiu rX, rX, -1` and nops, its delay slot is a nop,
+    // and it loops while rX is not zero. Returns X, or 0 when the branch is anything else. Such a loop only counts down and
+    // uses up cycles; games wait in them (God of War: 2000 turns between two looks at a counter that an interrupt raises).
+    std::uint32_t countdown_register(const Insn &i, const Insn &ds) {
+        if (countdown_off_ || i.op != Bne || ds.word != 0u) return 0;
+        const std::uint32_t x = i.rt() == 0 ? i.rs() : i.rs() == 0 ? i.rt() : 0u;
+        const std::uint32_t t = i.branch_target(), a = i.pc;
+        if (x == 0 || t >= a || !in_unit(t) || !have_label(t)) return 0;
+        if (options_.probes.count(a) || options_.toggles.count(a) || options_.probes.count(a + 4) || options_.toggles.count(a + 4)) return 0;
+        int counts = 0;
+        for (std::uint32_t p = t; p < a; p += 4) {
+            if (!p_.is_code(p) || (p != t && labels_.count(p)) || options_.probes.count(p) || options_.toggles.count(p)) return 0;
+            const Insn s = at(p);
+            if (s.word == 0u) continue;
+            if ((s.op != Addiu && s.op != Addi) || s.rs() != x || s.rt() != x || s.simm() != -1) return 0;
+            ++counts;
+        }
+        return counts == 1 ? x : 0u;
+    }
+
     void control(const Insn &i, const Insn &ds) {
         const std::uint32_t a = i.pc, ret = a + 8;
-        line(std::format("c.budget -= {};", pending_ + 2));
+        const std::uint32_t cost = pending_ + 2;
+        line(std::format("c.budget -= {};", cost));
+        // Turns of a delay loop (countdown_register) that end before the budget runs out are done at once: the loop takes
+        // rX down by one and the budget by `cost` every turn and asks preempt() only once the budget is below zero, so
+        // running s turns here, as long as rX does not reach zero and the budget stays at zero or above, leaves rX and the
+        // budget as the turns would, and the loop goes on from there as before (the last turn, or the one that preempts).
+        if (const std::uint32_t x = countdown_register(i, ds))
+            line(std::format("{{ const std::uint32_t n = c.r[{0}].w[0]; if (n > 1u && c.budget >= {1}) {{ const std::uint32_t q = static_cast<std::uint32_t>(c.budget) / {1}u, "
+                             "s = n - 1u < q ? n - 1u : q; set32(c.r[{0}], n - s); c.budget -= static_cast<std::int32_t>(s * {1}u); }} }}",
+                             x, cost));
         pending_ = 0;
         if (complex_slot(ds)) {
             slot_flow(a, Next{Next::Jump, a + 4, 0, {}}, 0);
@@ -567,20 +645,48 @@ private:
 
     std::string dest_reg(const Insn &i) { return i.rd() ? reg(i.rd()) : "scratch"; }
 
+    // True when nothing can see the MAC register and the low status bits that this instruction of the first vector unit
+    // sets: on the straight line after it, inside this unit, another instruction sets them again before anything that
+    // could read them (recomp::vu0_flags_dead). The line ends at everything the code can be entered at or leaves through,
+    // at a probe and at a switched instruction. Only write_unit asks, for an instruction it writes in its place: a delay
+    // slot keeps its flags, the branch it belongs to comes between it and whatever follows.
+    bool vu0_flags_unseen(const Insn &i) {
+        if (vu0_old_ || vu0_flag_effect(i) != Vu0Flags::Sets) return false;
+        return vu0_flags_dead(i.pc, [&](std::uint32_t a, Insn &next) {
+            if (!in_unit(a) || !p_.is_code(a) || labels_.count(a) || options_.probes.count(a) || options_.toggles.count(a)) return false;
+            next = at(a);
+            return flow(next.op) == Flow::None;
+        });
+    }
+
+    // The name of a helper of the first vector unit (runtime/include/ps2/vu.hpp). The four-lane forms end in 4; the ones
+    // that set flags take whether the flags are wanted as a template argument. PS2_VU0_HELPERS=old in the environment
+    // writes the calls of the one-lane helpers as before (to compare the two, or to rule the new ones out).
+    std::string vu_name(const char *op, bool sets_flags = true) const {
+        if (vu0_old_) return op;
+        const std::string_view o = op;
+        const std::string name = o == "mr32" ? "mr32_4" : std::string(o) + "4";
+        return sets_flags ? name + (flags_dead_ ? "<0>" : "<1>") : name;
+    }
+    static bool vu_sets_flags(const char *op) {
+        const std::string_view o = op;
+        return !o.starts_with("max") && !o.starts_with("mini");
+    }
+
     void vec(const char *op, const Insn &i) {
-        line(std::format("vu::{}(c.vu0, {}u, {}u, {}u, {}u);", op, i.dest(), i.fd(), i.fs(), i.ft()));
+        line(std::format("vu::{}(c.vu0, {}u, {}u, {}u, {}u);", vu_name(op, vu_sets_flags(op)), i.dest(), i.fd(), i.fs(), i.ft()));
     }
 
     void vecbc(const char *op, const Insn &i, const std::string &t) {
-        line(std::format("vu::{}(c.vu0, {}u, {}u, {}u, {});", op, i.dest(), i.fd(), i.fs(), t));
+        line(std::format("vu::{}(c.vu0, {}u, {}u, {}u, {});", vu_name(op, vu_sets_flags(op)), i.dest(), i.fd(), i.fs(), t));
     }
 
     void vacc(const char *op, const Insn &i) {
-        line(std::format("vu::{}(c.vu0, {}u, {}u, {}u);", op, i.dest(), i.fs(), i.ft()));
+        line(std::format("vu::{}(c.vu0, {}u, {}u, {}u);", vu_name(op), i.dest(), i.fs(), i.ft()));
     }
 
     void vaccbc(const char *op, const Insn &i, const std::string &t) {
-        line(std::format("vu::{}(c.vu0, {}u, {}u, {});", op, i.dest(), i.fs(), t));
+        line(std::format("vu::{}(c.vu0, {}u, {}u, {});", vu_name(op), i.dest(), i.fs(), t));
     }
 
     std::string bcv(const Insn &i) { return std::format("{}.w[{}]", vf(i.ft()), i.bc()); }
@@ -880,7 +986,7 @@ private:
         case Vsub: vec("sub", i); break;
         case Vmsub: vec("msub", i); break;
         case Vmini: vec("mini", i); break;
-        case Vopmsub: line(std::format("vu::opmsub(c.vu0, {}u, {}u, {}u);", i.fd(), i.fs(), i.ft())); break;
+        case Vopmsub: line(std::format("vu::{}(c.vu0, {}u, {}u, {}u);", vu_name("opmsub"), i.fd(), i.fs(), i.ft())); break;
         case Viadd: line(std::format("vu::set_vi(c.vu0, {}u, {} + {});", i.fd(), vi(i.fs()), vi(i.ft()))); break;
         case Visub: line(std::format("vu::set_vi(c.vu0, {}u, {} - {});", i.fd(), vi(i.fs()), vi(i.ft()))); break;
         case Viaddi: line(std::format("vu::set_vi(c.vu0, {}u, {} + {});", i.ft(), vi(i.fs()), i.imm5())); break;
@@ -908,7 +1014,7 @@ private:
         case Vmula: vacc("mula", i); break;
         case Vsuba: vacc("suba", i); break;
         case Vmsuba: vacc("msuba", i); break;
-        case Vopmula: line(std::format("vu::opmula(c.vu0, {}u, {}u);", i.fs(), i.ft())); break;
+        case Vopmula: line(std::format("vu::{}(c.vu0, {}u, {}u);", vu_name("opmula"), i.fs(), i.ft())); break;
         case Vitof0: case Vitof4: case Vitof12: case Vitof15: {
             const int frac = i.op == Vitof0 ? 0 : i.op == Vitof4 ? 4 : i.op == Vitof12 ? 12 : 15;
             line(std::format("vu::itof(c.vu0, {}u, {}u, {}u, {});", i.dest(), i.ft(), i.fs(), frac));
@@ -916,12 +1022,12 @@ private:
         }
         case Vftoi0: case Vftoi4: case Vftoi12: case Vftoi15: {
             const int frac = i.op == Vftoi0 ? 0 : i.op == Vftoi4 ? 4 : i.op == Vftoi12 ? 12 : 15;
-            line(std::format("vu::ftoi(c.vu0, {}u, {}u, {}u, {});", i.dest(), i.ft(), i.fs(), frac));
+            line(std::format("vu::{}(c.vu0, {}u, {}u, {}u, {});", vu0_old_ ? "ftoi" : "ftoi4", i.dest(), i.ft(), i.fs(), frac));
             break;
         }
-        case Vabs: line(std::format("vu::abs(c.vu0, {}u, {}u, {}u);", i.dest(), i.ft(), i.fs())); break;
-        case Vmove: line(std::format("vu::move(c.vu0, {}u, {}u, {}u);", i.dest(), i.ft(), i.fs())); break;
-        case Vmr32: line(std::format("vu::mr32(c.vu0, {}u, {}u, {}u);", i.dest(), i.ft(), i.fs())); break;
+        case Vabs: line(std::format("vu::{}(c.vu0, {}u, {}u, {}u);", vu_name("abs", false), i.dest(), i.ft(), i.fs())); break;
+        case Vmove: line(std::format("vu::{}(c.vu0, {}u, {}u, {}u);", vu_name("move", false), i.dest(), i.ft(), i.fs())); break;
+        case Vmr32: line(std::format("vu::{}(c.vu0, {}u, {}u, {}u);", vu_name("mr32", false), i.dest(), i.ft(), i.fs())); break;
         case Vclip: line(std::format("vu::clip(c.vu0, {}u, {}u);", i.fs(), i.ft())); break;
         case Vnop: case Vwaitq: break;
         case Vlqi: line(std::format("lqc2_vu(c, {}u, {}u, {}); vu::set_vi(c.vu0, {}u, {} + 1u);", i.dest(), i.ft(), vi(i.fs()), i.fs(), vi(i.fs()))); break;
@@ -965,6 +1071,10 @@ private:
     std::vector<bool> has_code_;
     std::uint32_t base_{};
     std::set<std::uint32_t> labels_;
+    bool flags_dead_{};  // the instruction simple() is writing sets vector-unit flags that nothing can see (vu0_flags_unseen)
+    const bool vu0_old_ = [] { const char *e = std::getenv("PS2_VU0_HELPERS"); return e && std::string_view(e) == "old"; }();
+    const bool countdown_off_ = [] { const char *e = std::getenv("PS2_EE_COUNTDOWN"); return e && std::string_view(e) == "0"; }();
+    std::size_t unserved_{};  // branch targets without a label that left through the dispatcher (see unserved())
     std::string *capture_{};
     bool collecting_{};
     std::set<std::uint32_t> reached_, called_, resumes_;
@@ -976,7 +1086,7 @@ private:
 
 void generate(const std::vector<Translation> &translations, const CodegenOptions &options) {
     fs::create_directories(ps2::os::path(options.output));
-    std::ostringstream header, table, modules;
+    std::ostringstream header, table, modules, soft_cases;
     // A live library (options.live_stamp, runtime/src/ee_live.cpp) is compiled against the live variant of the runtime headers: the
     // runner's functions are reached through a table (ps2/ee_live_abi.hpp), defined once in table.cpp.
     const bool live = options.live_stamp != 0;
@@ -1005,6 +1115,12 @@ void generate(const std::vector<Translation> &translations, const CodegenOptions
         for (const auto &[at, value] : t.checks) table << std::format("{}, {}, ", hex(at), hex(value));
         table << "};\n\n";
         modules << std::format("    {{\"{}\", {}, {}, {}checks, {}u, {}units, {}u}},\n", t.name, hex(t.fixed_base), hex(t.size), t.prefix, t.checks.size(), t.prefix, rows.size());
+        if (live && !t.soft.empty()) {
+            table << "const std::uint32_t " << t.prefix << "soft[] = {";
+            for (const std::uint32_t word : t.soft) table << hex(word) << ", ";
+            table << "};\n\n";
+            soft_cases << std::format("    case {}u: *count = {}u; return gen::{}soft;\n", module_count, t.soft.size(), t.prefix);
+        }
         ++module_count;
     }
     header << "}\n";
@@ -1023,7 +1139,9 @@ void generate(const std::vector<Translation> &translations, const CodegenOptions
                  "    ps2::g_watch_on = host->watch_on;\n"
                  "    ps2::g_watch_base = host->watch_base;\n"
                  "    ps2::g_watch_end = host->watch_end;\n";
-        table << "    *count = " << module_count << "u;\n    return gen::kModules;\n}\n";
+        table << "    *count = " << module_count << "u;\n    return gen::kModules;\n}\n\n";
+        table << "PS2_LIVE_EXPORT const std::uint32_t *ps2_ee_live_soft(std::uint32_t module, std::uint32_t *count) {\n    *count = 0;\n    switch (module) {\n"
+              << soft_cases.str() << "    default: break;\n    }\n    return nullptr;\n}\n";
     } else {
         table << "}\n\nvoid register_generated_code() { ps2::register_units(gen::kUnits, " << main_units << "u);";
         if (module_count) table << " ps2::register_modules(gen::kModules, " << module_count << "u);";

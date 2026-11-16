@@ -11,6 +11,7 @@
 #include "iop/sio2.hpp"
 #include "iop/spu2.hpp"
 #include "ipu/ipu.hpp"
+#include "ps2/crash.hpp"
 #include "ps2/disc.hpp"
 #include "ps2/ee_live.hpp"
 #include "kernel.hpp"
@@ -18,6 +19,7 @@
 #include "ps2/generated.hpp"
 #include "ps2/memory.hpp"
 #include "ps2/os.hpp"
+#include "ps2/pace.hpp"
 #include "ps2/state.hpp"
 #include "ps2/state_request.hpp"
 #include "ps2/system.hpp"
@@ -28,6 +30,12 @@
 #endif
 
 #include <algorithm>
+#if !defined(_WIN32) && !defined(__EMSCRIPTEN__)
+#if !defined(__SWITCH__)  // libnx has no dynamic loader
+#include <dlfcn.h>
+#endif
+#include <pthread.h>
+#endif
 #include <atomic>
 #include <cctype>
 #include <chrono>
@@ -55,6 +63,11 @@ namespace ps2 {
 
 Cpu g_cpu;
 Options g_options;
+
+bool frame_capture_requested(std::uint64_t frame) {
+    if (g_options.frame_every && frame % g_options.frame_every == 0) return true;
+    return std::binary_search(g_options.frame_capture_frames.begin(), g_options.frame_capture_frames.end(), frame);
+}
 
 // What the game's controller port gets: the pad state of one port as the host tells it. The host (window thread) writes g_pad_in at any
 // time; the emulation takes it over once per frame (latch_pads), so a run is the same however the host's timing falls. The recording
@@ -289,6 +302,92 @@ void report_load() {
 
 void vblank() {
     ++g_frames;
+    crash::test_poll(crash::Thread::Game);
+    // Offline EE cache preparation: capture only explicitly requested frames.
+    // Disabled for normal runs; the filenames retain the frame and address so
+    // a headless preparer can associate each image with the scripted input.
+    static const auto aot_capture = [] {
+        struct Config {
+            std::string dir;
+            std::vector<std::uint64_t> frames;
+            std::vector<std::uint32_t> bases;
+        } config;
+        config.dir = os::env("PS2_CAPTURE_AOT_DIR");
+        const std::string list = os::env("PS2_CAPTURE_AOT_FRAMES");
+        const std::string base_list = os::env("PS2_CAPTURE_AOT_BASES");
+        if (config.dir.empty() || list.empty() || base_list.empty()) return config;
+        const auto parse_list = [](const std::string &text, bool addresses, auto &output) {
+            std::size_t at = 0;
+            while (at < text.size()) {
+                const std::size_t next = text.find(',', at);
+                const std::string token = text.substr(at, next == std::string::npos ? next : next - at);
+                const char *digits = token.c_str();
+                int radix = 10;
+                if (addresses && token.size() > 2 && token[0] == '0' &&
+                    (token[1] == 'x' || token[1] == 'X')) {
+                    digits += 2;
+                    radix = 16;
+                }
+                char *end = nullptr;
+                const auto value = std::strtoull(digits, &end, radix);
+                if (end == digits || *end) { output.clear(); return false; }
+                output.push_back(value);
+                if (next == std::string::npos) break;
+                at = next + 1;
+            }
+            return !output.empty();
+        };
+        if (!parse_list(list, false, config.frames)) {
+            std::fprintf(stderr, "[aot-capture] invalid PS2_CAPTURE_AOT_FRAMES list\n");
+            return config;
+        }
+        std::vector<std::uint64_t> parsed_bases;
+        if (!parse_list(base_list, true, parsed_bases)) {
+            std::fprintf(stderr, "[aot-capture] invalid PS2_CAPTURE_AOT_BASES list\n");
+            config.frames.clear();
+            return config;
+        }
+        for (const auto base : parsed_bases) {
+            constexpr std::uint32_t unit = 0x4000u;
+            if (base == 0 || base > kRamSize - unit || base % unit != 0) {
+                std::fprintf(stderr, "[aot-capture] invalid EE RAM base: %llX\n",
+                             static_cast<unsigned long long>(base));
+                config.frames.clear();
+                config.bases.clear();
+                return config;
+            }
+            config.bases.push_back(static_cast<std::uint32_t>(base));
+        }
+        std::sort(config.frames.begin(), config.frames.end());
+        config.frames.erase(std::unique(config.frames.begin(), config.frames.end()), config.frames.end());
+        std::sort(config.bases.begin(), config.bases.end());
+        config.bases.erase(std::unique(config.bases.begin(), config.bases.end()), config.bases.end());
+        return config;
+    }();
+    if (!aot_capture.frames.empty() &&
+        std::binary_search(aot_capture.frames.begin(), aot_capture.frames.end(), g_frames)) {
+        std::error_code error;
+        std::filesystem::create_directories(aot_capture.dir, error);
+        if (error) std::fprintf(stderr, "[aot-capture] cannot create directory: %s\n", error.message().c_str());
+        else for (const std::uint32_t base : aot_capture.bases) {
+            constexpr std::uint32_t unit = 0x4000u, cap = 0x400000u;
+            std::uint32_t size = 0;
+            while (size < cap && base + size + unit <= kRamSize &&
+                   std::any_of(g_ram + base + size, g_ram + base + size + unit,
+                               [](std::uint8_t byte) { return byte != 0; })) size += unit;
+            if (!size) continue;
+            char filename[80];
+            std::snprintf(filename, sizeof filename, "frame_%010llu_%08X.bin",
+                          static_cast<unsigned long long>(g_frames), base);
+            const auto path = (std::filesystem::path(aot_capture.dir) / filename).string();
+            if (std::FILE *file = os::open(path, "wb")) {
+                const auto written = std::fwrite(g_ram + base, 1, size, file);
+                std::fclose(file);
+                std::fprintf(stderr, "[aot-capture] frame %llu base %08X bytes %u written %zu\n",
+                             static_cast<unsigned long long>(g_frames), base, size, written);
+            } else std::fprintf(stderr, "[aot-capture] cannot write %s\n", path.c_str());
+        }
+    }
     report_load();
     time_frames();
     apply_presses();
@@ -300,7 +399,7 @@ void vblank() {
     if (g_options.on_vblank) g_options.on_vblank();
     iop::sio2::flush_cards();
     if (g_options.trace_iop_modules && g_frames % 25 == 0) std::fprintf(stderr, "[frame] %llu prims %llu\n", static_cast<unsigned long long>(g_frames), static_cast<unsigned long long>(gs::primitives_drawn()));
-    if (!g_options.frames_dir.empty() && g_options.frame_every && g_frames % g_options.frame_every == 0) dump_frame();
+    if (!g_options.frames_dir.empty() && frame_capture_requested(g_frames)) dump_frame();
     hw::vblank_start();
     iop::vblank(true);
     schedule(hw::kEventVblankEnd + 100, now() + hblank_cycles() * 22u, [] { iop::vblank(false); });
@@ -404,7 +503,7 @@ std::uint32_t video_options() { return g_video_options.load(std::memory_order_re
 namespace {
 
 constexpr char kStateMagic[8] = {'P', 'S', '2', 'S', 'T', 'A', 'T', 'E'};
-constexpr std::uint32_t kStateVersion = 6;
+constexpr std::uint32_t kStateVersion = 10;
 
 std::function<void()> event_action(int id, std::uint64_t at) {
     if (id == hw::kEventVblank) return vblank;
@@ -430,8 +529,12 @@ void machine_state(state::Stream &s) {
     s.pod(version);
     if (std::memcmp(magic, kStateMagic, sizeof magic) != 0) throw std::runtime_error("not a state file");
     // Our version 4 differs from upstream's 4 (Cpu and thread layouts); 5 adds upstream's waiting HLE RPC replies; 6 adds the disc stream
-    // of the IOP (sceCdSt*, where it is and whether it runs), so a state saved while a film or a music stream plays goes on streaming.
-    if (version != kStateVersion && !(s.loading() && (version == 4 || version == 5))) throw std::runtime_error("state file from another version");
+    // of the IOP (sceCdSt*, where it is and whether it runs), so a state saved while a film or a music stream plays goes on streaming;
+    // 7 adds the SIF RPC endpoints kept per server (guest servers, their order) and the IOP-to-EE request packet ring (SIF RPC rework, PR #27);
+    // 8 adds the IOP's low-level hardware timers (AllocHardTimer, SetTimerCompare, SetTimerMode) that raise an interrupt;
+    // 9 adds the count of GS FINISH events that wait until the game has cleared CSR.FINISH;
+    // 10 adds the picture pace's last picture and a hold that is due (kernel.cpp, ps2/pace.hpp).
+    if (version != kStateVersion && !(s.loading() && (version >= 4 && version <= 9))) throw std::runtime_error("state file from another version");
     s.set_version(version);
     s.tag("ee");
     s.pod(g_cpu);
@@ -469,9 +572,9 @@ bool save_state(const std::string &path) {
     try {
         state::Writer w;
         machine_state(w);
-        std::ofstream out(os::path(path), std::ios::binary);
-        out.write(reinterpret_cast<const char *>(w.out.data()), static_cast<std::streamsize>(w.out.size()));
-        if (!out) throw std::runtime_error("cannot write " + path);
+        // temp file + rename: a crash, a kill or a full disk during the write keeps the state that was there before
+        std::string why;
+        if (!os::replace_file(path, w.out.data(), w.out.size(), &why)) throw std::runtime_error(why);
         std::fprintf(stderr, "[state] saved frame %llu to %s (%zu KB)\n", static_cast<unsigned long long>(g_frames), path.c_str(), w.out.size() >> 10);
         return true;
     } catch (const std::exception &e) {
@@ -534,6 +637,10 @@ bool load_elf(const std::string &path, std::uint32_t &entry) {
     std::ifstream file(os::path(path), std::ios::binary);
     if (!file) return false;
     const std::vector<std::uint8_t> data{std::istreambuf_iterator<char>(file), {}};
+    return load_elf(data, entry);
+}
+
+bool load_elf(std::span<const std::uint8_t> data, std::uint32_t &entry) {
     if (data.size() < 52 || std::memcmp(data.data(), "\x7f" "ELF", 4) != 0) return false;
     const auto u32 = [&](std::size_t o) { std::uint32_t v; std::memcpy(&v, data.data() + o, 4); return v; };
     const auto u16 = [&](std::size_t o) { std::uint16_t v; std::memcpy(&v, data.data() + o, 2); return v; };
@@ -544,10 +651,40 @@ bool load_elf(const std::string &path, std::uint32_t &entry) {
     // earlier one. Memory is zero at power-on, so this is what a loader that only copies the file contents gives.
     for (const bool copy : {false, true}) {
         for (std::uint32_t i = 0; i < u16(44); ++i) {
-            const std::size_t ph = phoff + i * u16(42);
+            const std::uint64_t ph = phoff + std::uint64_t{i} * u16(42);
+            // The ELF comes from the disc: a program header past the end of the file, or a segment whose sums wrap round 4 GiB,
+            // would read past the file or write past the 32 MiB of memory. ELF spec: p_offset + p_filesz lies inside the file and
+            // the segment (p_vaddr up to p_memsz, and the p_filesz bytes copied) inside memory.
+            if (ph > data.size() || data.size() - ph < 24) {
+                std::fprintf(stderr, "[elf] damaged ELF: program header %u lies past the end of the file\n", i);
+                return false;
+            }
             if (u32(ph) != 1) continue;
+            // A segment placed in the scratchpad (0x70000000..0x70003FFF) loads there instead of into main memory
+            // (follows upstream 8ebb09b); the same checks apply, against the 16 KiB.
+            if (const std::uint32_t at = u32(ph + 8); (at >> 14) == (kScratchpadBase >> 14)) {
+                const std::uint32_t offset = u32(ph + 4), filesz = u32(ph + 16), memsz = u32(ph + 20);
+                const std::uint32_t start = at & (kScratchpadSize - 1);
+                if (std::uint64_t{start} + std::max(memsz, filesz) > kScratchpadSize || std::uint64_t{offset} + filesz > data.size()) {
+                    std::fprintf(stderr, "[elf] damaged ELF: segment %u does not fit in the file or in the scratchpad\n", i);
+                    return false;
+                }
+                if (copy) std::memcpy(g_spr + start, data.data() + offset, filesz);
+                else if (memsz > filesz) std::memset(g_spr + start + filesz, 0, memsz - filesz);
+                continue;
+            }
             const std::uint32_t offset = u32(ph + 4), vaddr = physical(u32(ph + 8)), filesz = u32(ph + 16), memsz = u32(ph + 20);
-            if (vaddr + memsz > kRamSize || offset + filesz > data.size()) return false;
+            // A segment with no file contents that starts wholly outside main memory has nothing to load and nothing to clear
+            // (Pro Evolution Soccer's boot ELFs end with an empty 0x800 byte entry at 0x03000000 or 0x04000000): it is left out,
+            // before any write. One that has contents, or one that starts inside memory and runs past its end, stays refused.
+            if (filesz == 0 && vaddr >= kRamSize) {
+                if (!copy) std::fprintf(stderr, "[elf] segment %u (empty, %u bytes at 0x%08X) lies outside main memory: ignored\n", i, memsz, vaddr);
+                continue;
+            }
+            if (std::uint64_t{vaddr} + std::max(memsz, filesz) > kRamSize || std::uint64_t{offset} + filesz > data.size()) {
+                std::fprintf(stderr, "[elf] damaged ELF: segment %u does not fit in the file or in memory\n", i);
+                return false;
+            }
             if (copy) {
                 std::memcpy(g_ram + vaddr, data.data() + offset, filesz);
                 watch_span(vaddr, filesz, "boot:load_exec");
@@ -574,11 +711,30 @@ void request_iop_sync() {
     if (g_cpu.budget > 64) set_budget(g_cpu, 64);
 }
 
+// The picture pace (ps2/pace.hpp): PS2_PACE (a window run sets it from the game's keys.ini, PS2_PACE_FROM names the
+// file) wins over the built-in list of serials. A replay takes it from the recording instead (quick_keys.inc).
+static void setup_pace() {
+    const std::string serial = pace::serial_of(g_options.program_path);
+    if (const std::string setting = os::env("PS2_PACE"); !setting.empty()) {
+        if (const int every = pace::parse(setting)) {
+            const std::string from = os::env("PS2_PACE_FROM");
+            kernel::pace_setup(every, (from.empty() ? "PS2_PACE=" + setting : from + ": pace = " + setting).c_str());
+            return;
+        }
+        std::fprintf(stderr, "[pace] PS2_PACE=%s is not 30, 20, 15, 60 or off: ignored\n", setting.c_str());
+    }
+    if (const pace::Listed *l = pace::listed(serial)) {
+        kernel::pace_setup(l->every, ("built-in list for " + serial + ", " + l->why).c_str());
+        return;
+    }
+    kernel::pace_setup(1, "");
+}
+
 void boot(std::uint32_t entry, const std::vector<std::string> &args) {
     init_watch();
     hw::reset();
     kernel::reset();
-    if (!g_options.disc_path.empty() && !disc::open(g_options.disc_path))
+    if (!g_options.disc_path.empty() && (!g_options.disc_program || !disc::is_open()) && !disc::open(g_options.disc_path))
         std::fprintf(stderr, "[ee] cannot open disc image %s\n", g_options.disc_path.c_str());
     iop::set_trace(g_options.trace_iop_modules, g_options.trace_iop_hle);
     iop::reset();
@@ -600,6 +756,7 @@ void boot(std::uint32_t entry, const std::vector<std::string> &args) {
     }
     store<std::uint32_t>(g_ram + argv + 4 * guest_args.size(), 0);
     kernel::start_main_thread(entry, 0, static_cast<std::uint32_t>(guest_args.size()), argv);
+    setup_pace();
     apply_patches(true);
     schedule(hw::kEventVblank, frame_cycles(), vblank);
 }
@@ -722,6 +879,7 @@ void core_sample(Who who) {
 }
 
 int run() {
+    crash::enter_thread(crash::Thread::Game);
     thread_tune(Who::Emulation);
     part::start();
     Cpu &c = g_cpu;
@@ -786,6 +944,7 @@ int run() {
         }
     }
     gs::stats();
+    kernel::pace_report();
     ipu::stats();
     if (const std::string path = os::env("PS2_DUMP_AUDIO"); !path.empty()) iop::spu2::dump_audio(path.c_str());
     if (std::getenv("PS2_TRACE_SPU2")) iop::spu2::dump_voices();
@@ -821,16 +980,24 @@ std::uint64_t vu1_interpreted_calls() { return vu::interpreted_calls(); }
 void run_vu_thread() {
     gs::queue::role() = gs::queue::Role::Vu;
     gs::queue::Ring &in = gs::queue::vu();
+    crash::enter_thread(crash::Thread::VectorUnit);
     thread_tune(Who::Vu);
     // PS2_VU_SPIN=<microseconds>: look for new work this long before going to sleep (a sleep and a wake-up cost a system call each)
     static const long spin_us = std::atol(os::env("PS2_VU_SPIN").c_str());
+    // What this thread hands to the drawing thread goes in batches: the packets of the vector programs and of
+    // PATH2/3 are published together when the batch reaches Ring::kBatchBytes or this thread runs out of work, every other message
+    // (present, download, state, reset, ...) at once with what came before it. The order of the messages stays as it was.
+    gs::queue::Ring &out = gs::queue::render();
+    static const int batch = [] { const std::string v = os::env("PS2_HANDOVER_BATCH"); return v.empty() ? 2 : std::atoi(v.c_str()); }();
     for (;;) {
         gs::queue::Header h;
         const std::uint8_t *payload = nullptr;
         core_sample(Who::Vu);
+        crash::test_poll(crash::Thread::VectorUnit);
+        if (batch) out.hold();
         while (in.peek(h, payload)) {
             switch (h.type) {
-            case gs::queue::kVif1: vif::transfer(1, payload, h.arg0); break;
+            case gs::queue::kVif1: vif::transfer_words(1, reinterpret_cast<const std::uint32_t *>(payload), h.arg0); break;
             case gs::queue::kVif1Write: vif::write(1, h.arg0, h.arg1); break;
             case gs::queue::kGif: gif::transfer(static_cast<int>(h.arg0), payload, h.arg1); break;
             case gs::queue::kPath3Idle: gif::vif1_idle(); break;
@@ -849,7 +1016,12 @@ void run_vu_thread() {
             default: gs::queue::render().post(static_cast<gs::queue::Type>(h.type), h.arg0, h.arg1, payload, h.bytes); break;
             }
             in.pop(h);
+            if (batch == 1 || (h.type != gs::queue::kVif1 && h.type != gs::queue::kVif1Write && h.type != gs::queue::kGif && h.type != gs::queue::kPath3Idle)) {
+                out.flush();
+                if (batch) out.hold();
+            }
         }
+        out.flush();
         const auto start = std::chrono::steady_clock::now();
         bool found = false;
         if (spin_us > 0) {
@@ -873,9 +1045,11 @@ Rendered render_pending(bool surface, const std::function<void(const std::uint32
     static thread_local bool tuned = false;
     if (!tuned) {
         tuned = true;
+        crash::enter_thread(crash::Thread::Gpu);
         thread_tune(Who::Render);
     }
     core_sample(Who::Render);
+    crash::test_poll(crash::Thread::Gpu);
     return gs::render_pending([&](const gs::DisplayRegs &regs) {
         quick::on_present(regs);  // the picture for an F9 report is taken here, on the thread that may read the GPU
         if (before_present) before_present();
@@ -1013,7 +1187,213 @@ void set_pad_connected(int pad, bool connected) {
     if (g_pad_in[pad].connected != connected) g_pad_dirty |= 1u << pad;
     g_pad_in[pad].connected = connected;
 }
+// For tests without a running emulation (host/pad_test.cpp): take over the host's pad state now, as the next frame boundary would.
+void latch_pads_now() { latch_pads(); }
 std::uint16_t pad_rumble(int pad) { return iop::sio2::rumble(pad); }
 void set_audio_sink(std::function<void(const std::int16_t *, std::size_t)> sink) { iop::spu2::set_sink(std::move(sink)); }
+
+
+// ---------------------------------------------------------------------------------------------------------------- crash information
+
+#ifdef _WIN32
+extern "C" {
+void *__stdcall GetModuleHandleW(const wchar_t *);
+void *__stdcall GetProcAddress(void *, const char *);
+void *__stdcall GetCurrentThread();
+int __cdecl _close(int);
+}
+#endif
+namespace crash {
+
+namespace {
+
+// the name for the crash report and the shorter one the system shows (Linux keeps 15 characters)
+struct ThreadInfo {
+    const char *report;
+    const char *system;
+    const char *test;  // the name PS2_CRASH_TEST uses
+};
+constexpr ThreadInfo kThreads[] = {
+    {"main (window)", "ps2 main", "main"},
+    {"emulation (EE)", "ps2 emulation", "game"},
+    {"vector unit (VU1)", "ps2 vu1", "vu"},
+    {"window and drawing (GPU)", "ps2 gpu", "gpu"},
+    {"sound", "ps2 sound", "sound"},
+    {"live compiler (EE code)", "ps2 live-ee", "live-ee"},
+    {"live compiler (VU programs)", "ps2 live-vu", "live-vu"},
+    {"log copy", "ps2 log", "tee"},
+    {"watchdog", "ps2 watchdog", "watchdog"},
+    {"drawing helper (tiles)", "ps2 tiles", "tiles"},
+};
+static_assert(sizeof kThreads / sizeof kThreads[0] == static_cast<std::size_t>(Thread::Count));
+
+thread_local const char *t_name = nullptr;
+void (*g_hook)() = nullptr;
+
+enum class Kind { access, read, stack, divide, illegal, abort, thrown, param, live };
+std::uint64_t g_test_frame = 0;
+Kind g_test_kind = Kind::access;
+std::string g_test_here;  // main, emu or tee: PS2_CRASH_TEST's thread when it is one of the fixed places
+
+constexpr int kMaxLive = 1024;
+LiveLibrary g_live[kMaxLive];
+std::atomic<int> g_live_count{0};
+std::mutex g_live_mutex;  // only between two loaders; the report reads without it
+
+[[gnu::noinline]] int recurse(int depth) {
+    // A frame this big is probed from the top down, so the overflow is found while most of a page is still left (under Wine the
+    // handler has no room at all when the last bytes are used up one small frame after the other).
+    volatile char pad[1000000];  // not a power of two: the last level then ends well above the limit
+    pad[0] = static_cast<char>(depth);
+    return recurse(depth + 1) + pad[0];
+}
+
+[[noreturn]] void fail(Kind kind) {
+    switch (kind) {
+    case Kind::access: *reinterpret_cast<volatile int *>(static_cast<std::uintptr_t>(g_test_frame & 0)) = 1; break;
+    case Kind::read: {
+        volatile int value = *reinterpret_cast<volatile int *>(static_cast<std::uintptr_t>(g_test_frame & 0));
+        (void)value;
+        break;
+    }
+    case Kind::stack: std::exit(recurse(0)); break;
+    case Kind::divide: {
+        volatile int zero = 0, some = 7;  // both unknown: 1 / x alone is turned into a comparison by the compiler, without a division
+        std::exit(some / zero);
+        break;
+    }
+    case Kind::illegal: __builtin_trap();
+    case Kind::abort: std::abort();
+    case Kind::thrown: throw std::runtime_error("PS2_CRASH_TEST");
+    case Kind::live: {
+        // a fault inside live-compiled code: the newest live library's init function (ps2_ee_live_init / ps2_vu_live_init) is called
+        // with null pointers, which it writes through (test_fire waits until a library is loaded)
+        int count = 0;
+        const LiveLibrary *libraries = live_libraries(count);
+        if (count > 0) {
+            using InitFn = const void *(*)(const void *, std::uint32_t *);
+            std::fprintf(stderr, "%p\n", reinterpret_cast<InitFn>(const_cast<void *>(libraries[count - 1].inside))(nullptr, nullptr));
+        }
+        break;
+    }
+    case Kind::param:
+#ifdef _WIN32
+        _close(12345);  // the C runtime calls its invalid-parameter handler for a file number that is not open
+#endif
+        break;
+    }
+    std::abort();  // a kind that did not end the program here (param outside Windows)
+}
+
+}  // namespace
+
+int g_test_thread = -1;
+std::atomic<std::uint64_t> g_last_syscall{0};
+
+void set_thread_hook(void (*hook)()) { g_hook = hook; }
+
+const char *thread_name() { return t_name; }
+
+void enter_thread(Thread thread) {
+    const ThreadInfo &info = kThreads[static_cast<std::size_t>(thread)];
+    t_name = info.report;
+#ifdef _WIN32
+    // SetThreadDescription (Windows 10 1607 on) names the thread for debuggers and profilers; looked up so older systems still start
+    using SetDescription = long(__stdcall *)(void *, const wchar_t *);
+    if (void *kernel = GetModuleHandleW(L"kernel32.dll"))
+        if (const auto set = reinterpret_cast<SetDescription>(GetProcAddress(kernel, "SetThreadDescription"))) {
+            wchar_t wide[32];
+            std::size_t i = 0;
+            for (; info.system[i] && i < 31; ++i) wide[i] = static_cast<unsigned char>(info.system[i]);
+            wide[i] = 0;
+            set(GetCurrentThread(), wide);
+        }
+#elif !defined(__EMSCRIPTEN__) && defined(__linux__)
+    pthread_setname_np(pthread_self(), info.system);
+#elif defined(__APPLE__)
+    pthread_setname_np(info.system);  // macOS names only the calling thread
+#endif
+    if (g_hook) g_hook();
+}
+
+Where where() {
+    const std::uint64_t call = g_last_syscall.load(std::memory_order_relaxed);
+    return Where{g_frames, g_cpu.pc, g_cpu.r[31].w[0], g_cpu.r[29].w[0], kernel::current_thread(), static_cast<std::uint32_t>(call >> 32),
+                 static_cast<std::uint32_t>(call), call != 0};
+}
+
+void note_live_library(Thread kind, const void *inside) {
+    std::lock_guard lock(g_live_mutex);
+    const int n = g_live_count.load(std::memory_order_relaxed);
+    if (n >= kMaxLive) return;
+    std::uint64_t base = 0;
+#if !defined(_WIN32) && !defined(__EMSCRIPTEN__) && !defined(__SWITCH__)
+    Dl_info info{};
+    if (dladdr(inside, &info) && info.dli_fbase) base = reinterpret_cast<std::uint64_t>(info.dli_fbase);
+#endif
+    g_live[n] = LiveLibrary{base, inside, kind};
+    g_live_count.store(n + 1, std::memory_order_release);
+}
+
+const LiveLibrary *live_libraries(int &count) {
+    count = g_live_count.load(std::memory_order_acquire);
+    return g_live;
+}
+
+void test_parse(const char *spec) {
+    if (!spec || !*spec) return;
+    const char *colon = std::strchr(spec, ':');
+    const std::string key = colon ? std::string(spec, colon) : std::string(spec);
+    const char *second = colon ? std::strchr(colon + 1, ':') : nullptr;
+    const std::string what = colon ? (second ? std::string(colon + 1, second) : std::string(colon + 1)) : std::string();
+    g_test_frame = second ? std::strtoull(second + 1, nullptr, 10) : 0;
+    static const std::pair<const char *, Kind> kinds[] = {{"access", Kind::access}, {"write", Kind::access}, {"read", Kind::read},
+                                                          {"stack", Kind::stack},   {"divide", Kind::divide}, {"illegal", Kind::illegal},
+                                                          {"abort", Kind::abort},   {"throw", Kind::thrown},  {"param", Kind::param},
+                                                          {"live", Kind::live}};
+    bool known_kind = what.empty();
+    for (const auto &[name, kind] : kinds)
+        if (what == name) {
+            g_test_kind = kind;
+            known_kind = true;
+        }
+    int which = -1;
+    if (key == "main" || key == "emu" || key == "tee") g_test_here = key;
+    else if (key == "window") which = static_cast<int>(Thread::Gpu);
+    else
+        for (std::size_t i = 0; i < sizeof kThreads / sizeof kThreads[0]; ++i)
+            if (key == kThreads[i].test) which = static_cast<int>(i);
+    if ((which < 0 && g_test_here.empty()) || !known_kind) {
+        g_test_here.clear();
+        std::fprintf(stderr, "[crash-test] PS2_CRASH_TEST=%s not understood: <thread>:<kind>[:<frame>], thread main, emu, game, vu, gpu, sound, live-ee, "
+                             "live-vu, tee; kind access, read, stack, divide, illegal, abort, throw, param, live\n", spec);
+        return;
+    }
+    g_test_thread = which;
+    if (which >= 0)
+        std::fprintf(stderr, "[crash-test] the %s thread will fail on purpose at frame %llu or later (PS2_CRASH_TEST=%s)\n", kThreads[which].report,
+                     static_cast<unsigned long long>(g_test_frame), spec);
+}
+
+void test_fire(Thread thread) {
+    if (g_frames < g_test_frame) return;
+    if (g_test_kind == Kind::live && g_live_count.load(std::memory_order_acquire) == 0) return;  // no live library yet
+    g_test_thread = -1;  // once
+    std::fprintf(stderr, "[crash-test] the %s thread fails on purpose now, frame %llu\n", kThreads[static_cast<std::size_t>(thread)].report,
+                 static_cast<unsigned long long>(g_frames));
+    std::fflush(stderr);
+    fail(g_test_kind);
+}
+
+void test_here(const char *where) {
+    if (g_test_here.empty() || g_test_here != where) return;
+    g_test_here.clear();
+    std::fprintf(stderr, "[crash-test] fails on purpose now at %s\n", where);
+    std::fflush(stderr);
+    fail(g_test_kind);
+}
+
+}
+
 
 }

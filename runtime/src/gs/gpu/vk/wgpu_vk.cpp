@@ -763,10 +763,11 @@ WGPUDevice g_device = nullptr;  // the one device (gpu.cpp makes one); wgpuInsta
 
 const ps2::gs::gpu::vk::SpirvVariant *find_variant(std::uint64_t hash, const WGPUConstantEntry *constants, std::size_t count) {
     std::uint32_t scale = 1, tile = 16;
-    bool fma = false;
+    bool fma = false, mip = false;
     for (std::size_t i = 0; i < count; ++i) {
         const std::string key = str(constants[i].key);
-        if (key == "SCALE") scale = static_cast<std::uint32_t>(constants[i].value);
+        if (key == "HAS_MIP") mip = constants[i].value != 0.0;
+        else if (key == "SCALE") scale = static_cast<std::uint32_t>(constants[i].value);
         else if (key == "TILE") tile = static_cast<std::uint32_t>(constants[i].value);
         else if (key == "EXPLICIT_FMA") fma = constants[i].value != 0.0;
     }
@@ -777,10 +778,10 @@ const ps2::gs::gpu::vk::SpirvVariant *find_variant(std::uint64_t hash, const WGP
     for (std::size_t i = 0; i < ps2::gs::gpu::vk::kSpirvVariantCount; ++i) {
         const ps2::gs::gpu::vk::SpirvVariant &v = ps2::gs::gpu::vk::kSpirvVariants[i];
         if (v.wgsl_hash == hash && v.tile == 0) return &v;  // a program without override constants (hw.wgsl)
-        if (v.wgsl_hash == hash && v.scale == scale && v.tile == tile && v.explicit_fma == fma) return &v;
+        if (v.wgsl_hash == hash && v.scale == scale && v.tile == tile && v.explicit_fma == fma && v.has_mip == mip) return &v;
     }
-    std::fprintf(stderr, "[vulkan] no SPIR-V built for this shader with SCALE=%u TILE=%u EXPLICIT_FMA=%d (scripts/wgsl_spirv.py makes them)\n", scale, tile,
-                 fma ? 1 : 0);
+    std::fprintf(stderr, "[vulkan] no SPIR-V built for this shader with SCALE=%u TILE=%u EXPLICIT_FMA=%d HAS_MIP=%d (scripts/wgsl_spirv.py makes them)\n", scale, tile,
+                 fma ? 1 : 0, mip ? 1 : 0);
     return nullptr;
 }
 
@@ -2194,6 +2195,44 @@ WGPUStatus wgpuSurfacePresent(WGPUSurface s) {
 #else
     return WGPUStatus_Error;
 #endif
+}
+
+// ---------------------------------------------------------------------------------------------------------------------------------
+// The calls of upstream's card path (hwdraw.cpp, hwcache.cpp: PS2_GPU_HW=1, off by default) and of wgpu-native's extras that gpu.cpp
+// makes. This layer does not do the card path: what it needs is answered so that the program links, and the card path finds no
+// feature it wants and stays off. CreateShaderModuleTrusted is the ordinary module (nothing here adds bounds checks anyway).
+WGPUShaderModule wgpuDeviceCreateShaderModuleTrusted(WGPUDevice d, WGPUShaderModuleDescriptor const *descriptor, WGPUShaderRuntimeChecks) {
+    return wgpuDeviceCreateShaderModule(d, descriptor);
+}
+
+void *wgpuBufferGetMappedRange(WGPUBuffer b, std::size_t offset, std::size_t size) {
+    return const_cast<void *>(wgpuBufferGetConstMappedRange(b, offset, size));
+}
+
+WGPUBool wgpuDeviceHasFeature(WGPUDevice, WGPUFeatureName) { return 0; }
+
+void wgpuDevicePushErrorScope(WGPUDevice, WGPUErrorFilter) {}
+
+WGPUFuture wgpuDevicePopErrorScope(WGPUDevice, WGPUPopErrorScopeCallbackInfo info) {
+    if (info.callback) info.callback(WGPUPopErrorScopeStatus_Success, WGPUErrorType_NoError, WGPUStringView{nullptr, 0}, info.userdata1, info.userdata2);
+    return WGPUFuture{1};
+}
+
+void wgpuGenerateReport(WGPUInstance, WGPUGlobalReport *report) {
+    if (report) std::memset(report, 0, sizeof *report);
+}
+
+WGPUBindGroupLayout wgpuComputePipelineGetBindGroupLayout(WGPUComputePipeline, std::uint32_t) {
+    std::fprintf(stderr, "[vulkan] wgpuComputePipelineGetBindGroupLayout is not supported here (the card path, PS2_GPU_HW)\n");
+    return nullptr;
+}
+
+void wgpuCommandEncoderCopyTextureToTexture(WGPUCommandEncoder, WGPUTexelCopyTextureInfo const *, WGPUTexelCopyTextureInfo const *, WGPUExtent3D const *) {
+    std::fprintf(stderr, "[vulkan] wgpuCommandEncoderCopyTextureToTexture is not supported here (the card path, PS2_GPU_HW)\n");
+}
+
+void wgpuRenderPassEncoderSetVertexBuffer(WGPURenderPassEncoder, std::uint32_t, WGPUBuffer, std::uint64_t, std::uint64_t) {
+    std::fprintf(stderr, "[vulkan] wgpuRenderPassEncoderSetVertexBuffer is not supported here (the card path, PS2_GPU_HW)\n");
 }
 
 }  // extern "C"

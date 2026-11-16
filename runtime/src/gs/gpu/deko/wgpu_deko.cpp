@@ -1339,4 +1339,42 @@ WGPUStatus wgpuSurfacePresent(WGPUSurface s) {
     return WGPUStatus_Success;
 }
 
+// ---------------------------------------------------------------------------------------------------------------------------------
+// The calls of upstream's card path (hwdraw.cpp, hwcache.cpp: PS2_GPU_HW=1, off by default) and of wgpu-native's extras that gpu.cpp
+// makes. This layer does not do the card path: what it needs is answered so that the program links, and the card path finds no
+// feature it wants and stays off. CreateShaderModuleTrusted is the ordinary module (nothing here adds bounds checks anyway).
+WGPUShaderModule wgpuDeviceCreateShaderModuleTrusted(WGPUDevice d, WGPUShaderModuleDescriptor const *descriptor, WGPUShaderRuntimeChecks) {
+    return wgpuDeviceCreateShaderModule(d, descriptor);
+}
+
+void *wgpuBufferGetMappedRange(WGPUBuffer b, std::size_t offset, std::size_t size) {
+    return const_cast<void *>(wgpuBufferGetConstMappedRange(b, offset, size));
+}
+
+WGPUBool wgpuDeviceHasFeature(WGPUDevice, WGPUFeatureName) { return 0; }
+
+void wgpuDevicePushErrorScope(WGPUDevice, WGPUErrorFilter) {}
+
+WGPUFuture wgpuDevicePopErrorScope(WGPUDevice, WGPUPopErrorScopeCallbackInfo info) {
+    if (info.callback) info.callback(WGPUPopErrorScopeStatus_Success, WGPUErrorType_NoError, WGPUStringView{nullptr, 0}, info.userdata1, info.userdata2);
+    return WGPUFuture{1};
+}
+
+void wgpuGenerateReport(WGPUInstance, WGPUGlobalReport *report) {
+    if (report) std::memset(report, 0, sizeof *report);
+}
+
+WGPUBindGroupLayout wgpuComputePipelineGetBindGroupLayout(WGPUComputePipeline, std::uint32_t) {
+    std::fprintf(stderr, "[deko] wgpuComputePipelineGetBindGroupLayout is not supported here (the card path, PS2_GPU_HW)\n");
+    return nullptr;
+}
+
+void wgpuCommandEncoderCopyTextureToTexture(WGPUCommandEncoder, WGPUTexelCopyTextureInfo const *, WGPUTexelCopyTextureInfo const *, WGPUExtent3D const *) {
+    std::fprintf(stderr, "[deko] wgpuCommandEncoderCopyTextureToTexture is not supported here (the card path, PS2_GPU_HW)\n");
+}
+
+void wgpuRenderPassEncoderSetVertexBuffer(WGPURenderPassEncoder, std::uint32_t, WGPUBuffer, std::uint64_t, std::uint64_t) {
+    std::fprintf(stderr, "[deko] wgpuRenderPassEncoderSetVertexBuffer is not supported here (the card path, PS2_GPU_HW)\n");
+}
+
 }

@@ -12,10 +12,11 @@ enum class Mode { off, mirror, primary };
 struct DisplaySource {
     std::uint32_t fbp, fbw, psm, dbx, dby, width, height;
     bool halved;
+    DisplayOverlay overlay;
 };
 
 struct SurfaceTarget {
-    enum Kind { X11, Wayland, Canvas, Win32, Vi } kind;
+    enum Kind { X11, Wayland, Canvas, Win32, Metal, Vi } kind;
     void *display;
     std::uint64_t window;
     void *surface;
@@ -23,7 +24,8 @@ struct SurfaceTarget {
     std::uint32_t width, height;
 };
 
-Mode mode();
+extern Mode g_current_mode;  // set by init(); read through mode() on every shape, so it is not a call
+inline Mode mode() { return g_current_mode; }
 bool init(Mode m);
 void draw(const State &s, const Vertex *v, int count);
 void image_begin(const State &s);

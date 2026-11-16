@@ -1,5 +1,10 @@
 upstream 2026-11: the part that merges cleanly, and what is left
 
+**Superseded (2026-11-16):** upstream is now merged with git (`git merge` of github.com/exoteric33/ps2-native-recomp main, up to
+a50471a "Merge pull request #109 from Stilgear/pr/hd-textures"), so its history is part of this fork's and the next update is an ordinary
+`git merge upstream/main`. 20 files conflicted; how each was settled is in the merge commit's message. The notes below describe the
+earlier file-by-file attempt (branch upstream-2026-11) and are kept for its reasoning.
+
 The upstream project (C:\ps2-native-recomp-main) is not a git repository: it is a folder that is replaced when it updates. This fork
 started from a snapshot of it (0660c5e "Import ps2-native-recomp"), so the update is a three-way merge: base = that snapshot, ours =
 this branch, theirs = the folder.
