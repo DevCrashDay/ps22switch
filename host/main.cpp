@@ -1,3 +1,7 @@
+#include "crash.hpp"
+#include "ps2/crash.hpp"
+#include "ps2/disc.hpp"
+#include "ps2/disc_bundle.hpp"
 #include "ps2/os.hpp"
 #include "ps2/system.hpp"
 #include "ps2/ee_live.hpp"
@@ -7,6 +11,7 @@
 #include "switch_clock.hpp"
 #include "switch_crash.hpp"
 
+#include "big_stack_thread.hpp"
 #ifdef PS2_WINDOW
 #include "window.hpp"
 #endif
@@ -17,11 +22,14 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
+#include <csignal>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <filesystem>
 #include <string>
+#include <stdexcept>
 #include <string_view>
 #include <system_error>
 #include <vector>
@@ -42,9 +50,10 @@
 #include <fcntl.h>
 #include <io.h>
 #include <windows.h>
+#include <timeapi.h>
 #include <shellapi.h>
 #else
-#include <csignal>
+#include <cerrno>
 #include <unistd.h>
 #ifdef __GLIBC__
 #include <execinfo.h>
@@ -62,14 +71,52 @@ void register_generated_vu();
 
 namespace {
 
+// The game folder port.sh made (games/<name>): --game-dir when given, else the first of the program's folder, its parent and the
+// disc image's folder that holds vu1/ or entries.txt. Empty when none does. The log starts before the arguments are read in full
+// and needs the answer too, so this is one function used in both places.
+std::filesystem::path find_game_dir(const std::string &program_location, const std::string &disc_path, const std::string &explicit_dir) {
+    std::error_code error;
+    if (!explicit_dir.empty()) return std::filesystem::absolute(ps2::os::path(explicit_dir), error);
+    const std::filesystem::path program_file = std::filesystem::absolute(ps2::os::path(program_location), error);
+    std::vector<std::filesystem::path> places{program_file.parent_path(), program_file.parent_path().parent_path()};
+    if (!disc_path.empty()) {
+        const std::filesystem::path disc = std::filesystem::absolute(ps2::os::path(disc_path), error);
+        if (!error) places.push_back(disc.parent_path());
+    }
+    for (const auto &place : places)
+        if (std::filesystem::is_directory(place / "vu1", error) || std::filesystem::is_regular_file(place / "entries.txt", error)) return place;
+    return {};
+}
+
+// --language: a two-letter code or the console's own number (1 to 7); 0 for anything else
+unsigned language_number(const std::string &text) {
+    static const char *const kCodes[] = {"ja", "en", "fr", "es", "de", "it", "nl", "pt"};
+    for (unsigned n = 1; n < 8; ++n)
+        if (text == kCodes[n]) return n;
+    const unsigned n = static_cast<unsigned>(std::strtoul(text.c_str(), nullptr, 10));
+    return n >= 1 && n <= 7 ? n : 0;
+}
+
+// The disc's serial from the name of its boot program (SCES_536.88 -> SCES-53688), or "" when the name is not one.
+std::string disc_serial(const std::string &path) {
+    std::string name = path.substr(path.find_last_of("/\\:") + 1);
+    name = name.substr(0, name.find(';'));
+    if (name.size() != 11 || name[4] != '_' || name[8] != '.') return {};
+    for (int i : {0, 1, 2, 3})
+        if (name[i] < 'A' || name[i] > 'Z') return {};
+    for (int i : {5, 6, 7, 9, 10})
+        if (name[i] < '0' || name[i] > '9') return {};
+    return name.substr(0, 4) + "-" + name.substr(5, 3) + name.substr(9, 2);
+}
+
 int usage() {
     std::fprintf(stderr,
-                 "usage: ps2run <elf> [--arg text]... [--frames n] [--ntsc] [--misses file]\n"
+                 "usage: ps2run [elf] [--arg text]... [--frames n] [--ntsc] [--misses file]\n"
                  "              [--disc image.iso] [--memcard card.ps2] [--pal | --ntsc] [--trace-syscalls] [--trace-io] [--trace-threads]\n"
-                 "              [--trace-iop] [--trace-iop-hle] [--frames-dir dir] [--frame-every n]\n"
+                 "              [--trace-iop] [--trace-iop-hle] [--frames-dir dir] [--frame-every n] [--frame-at n]...\n"
                  "              [--press frame:button[+button][:frames]]... [--window] [--fullscreen]\n"
                  "              [--save-state frame:file] [--load-state file|newest] [--quick-dir dir] [--widescreen] [--patches file]\n"
-                 "              [--record file] [--no-record] [--replay file [--replay-continue]] [--rtc seconds]\n");
+                 "              [--record file] [--no-record] [--replay file [--replay-continue]] [--rtc seconds] [--game-dir dir]\n");
     return 2;
 }
 
@@ -120,31 +167,41 @@ class LogTee {
 public:
     ~LogTee() { stop(); }
 
+    // The log goes into `folder`; if no file can be made there (a folder that cannot be created or written), into a folder of the
+    // system's temporary files instead, and the first lines say so. The pipe and the thread start either way.
     bool start(const std::filesystem::path &folder) {
         if (active_) return true;
         std::error_code error;
-        std::filesystem::create_directories(folder, error);
-        std::vector<std::filesystem::path> old;
-        for (std::filesystem::directory_iterator it(folder, error), end; !error && it != end; it.increment(error)) {
-            const std::string name = ps2::os::utf8(it->path().filename());
-            if (name.rfind("ps2run_", 0) == 0 && name.size() > 4 && name.compare(name.size() - 4, 4, ".log") == 0) old.push_back(it->path());
-        }
-        std::sort(old.begin(), old.end());
-        for (std::size_t i = 0; i + 9 < old.size(); ++i) std::filesystem::remove(old[i], error);
-        const std::time_t t = std::time(nullptr);
-        std::tm local{};
+        std::filesystem::path place = folder;
+        for (int attempt = 0; attempt < 2 && !file_; ++attempt) {
+            if (attempt) {
+                place = std::filesystem::temp_directory_path(error) / "ps2run-logs";
+                if (error) break;
+            }
+            std::filesystem::create_directories(place, error);
+            std::vector<std::filesystem::path> old;
+            for (std::filesystem::directory_iterator it(place, error), end; !error && it != end; it.increment(error)) {
+                const std::string name = ps2::os::utf8(it->path().filename());
+                if (name.rfind("ps2run_", 0) == 0 && name.size() > 4 && name.compare(name.size() - 4, 4, ".log") == 0) old.push_back(it->path());
+            }
+            std::sort(old.begin(), old.end());
+            for (std::size_t i = 0; i + 9 < old.size(); ++i) std::filesystem::remove(old[i], error);
+            const std::time_t t = std::time(nullptr);
+            std::tm local{};
 #ifdef _WIN32
-        localtime_s(&local, &t);
+            localtime_s(&local, &t);
 #else
-        localtime_r(&t, &local);
+            localtime_r(&t, &local);
 #endif
-        char stamp[32];
-        std::strftime(stamp, sizeof stamp, "%Y-%m-%d_%H-%M-%S", &local);
-        // two runs that start in the same second must not share a file
-        std::filesystem::path file = folder / (std::string("ps2run_") + stamp + ".log");
-        for (int n = 2; std::filesystem::exists(file, error) && n < 100; ++n) file = folder / (std::string("ps2run_") + stamp + "_" + std::to_string(n) + ".log");
-        path_ = ps2::os::utf8(file);
-        file_ = ps2::os::open(path_, "wb");
+            char stamp[32];
+            std::strftime(stamp, sizeof stamp, "%Y-%m-%d_%H-%M-%S", &local);
+            // two runs that start in the same second must not share a file
+            std::filesystem::path file = place / (std::string("ps2run_") + stamp + ".log");
+            for (int n = 2; std::filesystem::exists(file, error) && n < 100; ++n) file = place / (std::string("ps2run_") + stamp + "_" + std::to_string(n) + ".log");
+            path_ = ps2::os::utf8(file);
+            // "ab": every write goes to the end of the file, so a line written beside the copy thread (write_direct) is never written over
+            file_ = ps2::os::open(path_, "ab");
+        }
         int fds[2];
 #ifdef _WIN32
         // The descriptor the stderr stream really writes to. It is 2 when the parent passed a stderr, but not when the program
@@ -175,17 +232,41 @@ public:
         write_fd_ = fds[1];
         active_ = true;
         thread_ = std::thread([this] { pump(); });
-        std::fprintf(stderr, "[log] this log is also written to %s\n", path_.c_str());
+        if (!file_) std::fprintf(stderr, "[log] no log file could be made in %s or in the temporary folder: this log is not written to disk\n", ps2::os::utf8(folder).c_str());
+        else if (place != folder) std::fprintf(stderr, "[log] %s cannot be written to; this log is written to %s instead\n", ps2::os::utf8(folder).c_str(), path_.c_str());
+        else std::fprintf(stderr, "[log] this log is also written to %s\n", path_.c_str());
         return true;
+    }
+
+    // Like flush(), and when the copy thread has not got to the line in time (it is slow or stuck, for example while a virus scanner
+    // holds the file), `last` is appended to the log file from here, so a crash line is in the file even then. Used by the crash handlers.
+    void flush_or_write(int wait_ms, const char *last, std::size_t size) {
+        if (!active_) return;
+        if (flush(wait_ms)) return;
+        if (path_.empty() || !size) return;
+#ifdef _WIN32
+        const HANDLE h = CreateFileW(ps2::os::path(path_).c_str(), FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, 0, nullptr);
+        if (h == INVALID_HANDLE_VALUE) return;
+        DWORD written = 0;
+        WriteFile(h, last, static_cast<DWORD>(size), &written, nullptr);
+        CloseHandle(h);
+#else
+        const int fd = open(path_.c_str(), O_WRONLY | O_APPEND);
+        if (fd < 0) return;
+        const ssize_t ignored = write(fd, last, size);
+        (void)ignored;
+        close(fd);
+#endif
     }
 
     // Everything written so far has been passed on and recorded when this returns (or wait_ms has passed). It takes no lock, so it
     // is safe in a crash handler even when the thread that crashed was holding one.
-    void flush(int wait_ms) {
-        if (!active_) return;
+    bool flush(int wait_ms) {
+        if (!active_) return true;
         const std::uint64_t want = ++sent_;
         put(write_fd_, kMarker, sizeof kMarker - 1);
         for (int waited = 0; seen_.load() < want && waited < wait_ms; ++waited) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        return seen_.load() >= want;
     }
 
     // stderr goes straight to where it went before; the file is closed. Safe to call twice.
@@ -248,7 +329,9 @@ private:
     }
 
     void pump() {
+        ps2::crash::enter_thread(ps2::crash::Thread::Log);
         char buffer[8192];
+        ps2::crash::test_here("tee");
         for (;;) {
 #ifdef _WIN32
             const int n = _read(read_fd_, buffer, sizeof buffer);
@@ -306,91 +389,109 @@ private:
 LogTee g_log;
 #endif
 
+// After a crash the card is never written over the card file (the card in memory may be half of a save, or damaged): the newest
+// card, if it changed since the file was last written, goes to "<card>.crash.ps2" beside it. This saves it and puts the line about
+// it into `line` (snprintf only: no allocation, no stream lock), returning the line's length, 0 for none.
+int crash_card_line(char *line, std::size_t size) {
+    const char *where = nullptr;
+    int length = 0;
+    switch (ps2::save_memory_card_after_crash(&where)) {
+    case 1:
+        length = std::snprintf(line, size, "[mc] the card changed less than a second before the crash; that newest card is kept in %s (the card file keeps the last card written normally)\n", where);
+        break;
+    case 2: length = std::snprintf(line, size, "[mc] the card was being changed when the program crashed; the card file keeps the last card written normally\n"); break;
+    case 3: length = std::snprintf(line, size, "[mc] the card changed before the crash, but no copy could be written; the card file keeps the last card written normally\n"); break;
+    default: break;
+    }
+    return length < 0 ? 0 : std::min<int>(length, static_cast<int>(size) - 1);
+}
+
 #ifdef _WIN32
 // The memory card file is written when the game saves (50 frames after its last write) and again whenever the game ends. These
-// two cover the ways a Windows program can be ended from outside while it is running, so a save made a moment ago is not lost:
-//   - Ctrl+C, Ctrl+Break or closing the console window the program was started from (it is told, then given a few seconds);
-//   - a crash (an unhandled exception in the program itself).
-// Both write the card in a hurry (they do not wait long for the thread that may be the one that crashed) and then let the
-// system do what it would have done anyway: the program ends.
+// two cover the ways a Windows program can be ended from outside while it is running:
+//   - Ctrl+C, Ctrl+Break or closing the console window the program was started from (it is told, then given a few seconds):
+//     the card file is written, as when the window is closed (unless a card command is in the middle of a page right then);
+//   - a crash (an unhandled exception in the program itself): the newest card goes beside the card file, never over it
+//     (crash_card_line, from after_crash).
+// Both then let the system do what it would have done anyway: the program ends.
 BOOL WINAPI on_console_event(DWORD) {
     ps2::flush_memory_card(true);
     return FALSE;
 }
-
-LONG WINAPI on_crash(EXCEPTION_POINTERS *info) {
-    static volatile LONG running = 0;
-    if (InterlockedExchange(&running, 1) == 0) {  // not twice if the writing itself crashes
-#ifdef PS2_WINDOW
-        // the last thing in the log file, so a player who sends it shows what happened
-        // written to the handle directly: another thread may hold the lock of the C stream
-        char line[160];
-        const int length = std::snprintf(line, sizeof line, "[crash] the program crashed: exception %08lX at address %p\n", static_cast<unsigned long>(info->ExceptionRecord->ExceptionCode),
-                                         info->ExceptionRecord->ExceptionAddress);
-        DWORD written = 0;
-        if (length > 0) WriteFile(GetStdHandle(STD_ERROR_HANDLE), line, static_cast<DWORD>(length), &written, nullptr);
-        g_log.flush(300);
 #else
-        (void)info;
-#endif
-        ps2::flush_memory_card(true);
+// Linux and macOS: the memory card is not written inside the signal handler: almost nothing is safe there (an abort from a damaged heap
+// comes while the allocator's lock is held, and the first allocation would hang the program instead of ending it). A helper thread,
+// started with the handlers, waits on a pipe; after_crash wakes it with one byte (write() is safe in a handler) and waits up to two
+// seconds for it. After SIGHUP (the terminal was closed, as Ctrl+C) the helper writes the card file as usual; after a crash or an abort
+// it puts the newest card beside the card file, never over it (crash_card_line). SIGINT and SIGTERM are SDL's: it turns them into
+// "window closed". SIGKILL (the compositor's "not responding" window, `hyprctl kill`) cannot be caught; a run that ends with neither
+// "[ee] stopped after ..." nor a [crash] line has had one.
+int g_card_wake[2] = {-1, -1};
+std::atomic<int> g_card_done{0};  // lock-free, so the handler may read it
+
+void card_helper() {
+    char what = 0;
+    for (;;) {
+        const ssize_t got = read(g_card_wake[0], &what, 1);
+        if (got == 1) break;
+        if (got < 0 && errno == EINTR) continue;
+        return;
     }
-    return EXCEPTION_CONTINUE_SEARCH;
+    if (what == 'h') ps2::flush_memory_card(true);
+    else {
+        char line[640];
+        const int length = crash_card_line(line, sizeof line);
+        if (length > 0) {
+            ssize_t ignored = write(2, line, static_cast<std::size_t>(length));
+            (void)ignored;
+        }
+    }
+    g_card_done.store(1);
+}
+
+void start_card_helper() {
+#ifdef __SWITCH__
+    g_card_wake[0] = g_card_wake[1] = -1;  // libnx has no pipe(): a crash leaves the memory card as it was written last
+    return;
+#endif
+    if (pipe(g_card_wake) == 0) std::thread(card_helper).detach();
+    else g_card_wake[0] = g_card_wake[1] = -1;
 }
 #endif
 
-#if !defined(_WIN32) && !defined(__SWITCH__)
-// The same for Linux. A run that ended without its closing lines ("[ee] stopped after ..." and the audio summary) used to leave no trace
-// of why: a crash (SIGSEGV), an abort (a failed allocation or an exception nobody caught: SIGABRT) and the terminal closing (SIGHUP) each
-// ended the process at once, and a core dump says nothing in the log. This writes one line and the stack of the thread that got the
-// signal, gives the log copy and the memory card a moment to reach the disk, and then lets the signal do what it would have done (a core
-// dump, if the system makes one). SIGINT and SIGTERM are SDL's: it turns them into "window closed" (window/poll). SIGKILL, which the
-// compositor's "not responding" window and `hyprctl kill` send, cannot be caught; a run that ends with neither line has had one.
-void on_fatal_signal(int sig) {
-    static volatile std::sig_atomic_t running = 0;
-    if (!running) {
-        running = 1;
-        const char *name = sig == SIGSEGV ? "SIGSEGV (a crash)" : sig == SIGBUS ? "SIGBUS (a crash)" : sig == SIGILL ? "SIGILL (a crash)" : sig == SIGFPE ? "SIGFPE (a crash)"
-                           : sig == SIGABRT ? "SIGABRT (an abort)" : sig == SIGHUP ? "SIGHUP (the terminal was closed)" : "a signal";
-        const char *head = "\n[crash] the program was ended by ";
-        ssize_t ignored = write(2, head, std::strlen(head));
-        ignored = write(2, name, std::strlen(name));
-        ignored = write(2, "; its stack:\n", 14);
-        (void)ignored;
-#ifdef __GLIBC__
-        void *frames[64];
-        const int count = backtrace(frames, 64);
-        backtrace_symbols_fd(frames, count, 2);
+// What a crash does after host/crash.cpp has written its lines: the newest memory card is kept beside the card file
+// (a closed terminal writes the card file as usual), and the log copy gets everything; if the copy thread is stuck (or is the thread
+// that crashed), the report's lines go into the log file from here. Only file handles and fixed buffers: another thread may hold a lock.
+void after_crash([[maybe_unused]] bool crashed, [[maybe_unused]] const char *report, [[maybe_unused]] std::size_t size) {
+    static char all[8192 + 640];
+    std::size_t length = 0;
+#ifdef _WIN32
+    char card[640];
+    const int card_length = crash_card_line(card, sizeof card);
+    if (card_length > 0) {
+        DWORD written = 0;
+        WriteFile(GetStdHandle(STD_ERROR_HANDLE), card, static_cast<DWORD>(card_length), &written, nullptr);
+    }
+#else
+    const char what = crashed ? 'c' : 'h';
+    if (g_card_wake[1] >= 0 && write(g_card_wake[1], &what, 1) == 1)
+        for (int i = 0; i < 200 && !g_card_done.load(); ++i) {
+            struct timespec pause = {0, 10 * 1000 * 1000};
+            nanosleep(&pause, nullptr);
+        }
+    const int card_length = 0;  // the helper wrote its line itself
+    const char *card = "";
 #endif
 #ifdef PS2_WINDOW
-        g_log.flush(300);
-#endif
-        ps2::flush_memory_card(true);
+    length = std::min(size, sizeof all - 640);
+    std::memcpy(all, report, length);
+    if (card_length > 0) {
+        std::memcpy(all + length, card, static_cast<std::size_t>(card_length));
+        length += static_cast<std::size_t>(card_length);
     }
-    std::signal(sig, SIG_DFL);
-    std::raise(sig);
-}
-
-void install_signal_handlers() {
-#ifdef __GLIBC__
-    void *warm[2];
-    backtrace(warm, 2);  // the first call loads the unwinder (and may allocate): not in the handler
-#endif
-    for (const int sig : {SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT, SIGHUP}) std::signal(sig, on_fatal_signal);
-    std::signal(SIGPIPE, SIG_IGN);  // a log pipe whose reader went away makes a write fail instead of ending the run without a word
-}
-#elif defined(__SWITCH__)
-void install_signal_handlers() {}
-#endif
-
-// A name for the calling thread that Windows tools show (Process Explorer, a debugger, a profiler), so the CPU time of the
-// emulation thread can be told from the window thread. SetThreadDescription exists from Windows 10 1607 on,
-// so it is looked up instead of linked. Elsewhere this does nothing.
-[[maybe_unused]] void name_thread([[maybe_unused]] const wchar_t *name) {
-#ifdef _WIN32
-    using SetDescription = HRESULT(WINAPI *)(HANDLE, PCWSTR);
-    if (const HMODULE kernel = GetModuleHandleW(L"kernel32.dll"))
-        if (const auto set = reinterpret_cast<SetDescription>(reinterpret_cast<void *>(GetProcAddress(kernel, "SetThreadDescription")))) set(GetCurrentThread(), name);
+    g_log.flush_or_write(1500, all, length);
+#else
+    (void)all, (void)length, (void)card;
 #endif
 }
 
@@ -473,7 +574,6 @@ static int run_threads_headless(const std::function<int()> &emulate) {
     ps2::init_graphics();
     ps2::g_options.on_vblank = [] { ps2::post_present(); };
     const std::string pictures = ps2::g_options.frames_dir;
-    const std::uint32_t every = ps2::g_options.frame_every ? ps2::g_options.frame_every : 1;
     ps2::g_options.frames_dir.clear();  // the emulation thread must not read the picture back itself
     ps2::g_options.sync_pictures = true;
     ps2::start_render_thread();
@@ -483,13 +583,13 @@ static int run_threads_headless(const std::function<int()> &emulate) {
     }
     std::atomic<bool> done{false};
     int result = 0;
-    HostThread emulation([&] {
+    ps2::host::BigStackThread emulation([&] {
         result = emulate();
         done.store(true);
         ps2::wake_render_thread();
     });
     const std::function<void(const std::uint32_t *, std::uint32_t, std::uint32_t)> none, save = [&](const std::uint32_t *rgba, std::uint32_t width, std::uint32_t height) {
-        if (ps2::picture_frame() % every) return;
+        if (!ps2::frame_capture_requested(ps2::picture_frame())) return;
         char name[48];
         std::snprintf(name, sizeof name, "/frame_%05u.ppm", ps2::picture_frame());
         if (std::FILE *f = ps2::os::open(pictures + name, "wb")) {
@@ -657,11 +757,24 @@ int switch_error(const char *text) {
 #endif
 
 int main(int argc, char **argv) {
+    // first: what can go wrong from here on is reported (crash::install), and this thread keeps stack for the report
 #ifdef __SWITCH__
     romfsInit();
     std::atexit([] { romfsExit(); });
 #endif
 #ifdef _WIN32
+    ps2::host::reserve_crash_stack();
+#endif
+    crash::install(after_crash);
+#ifndef _WIN32
+    start_card_helper();
+#endif
+    ps2::crash::enter_thread(ps2::crash::Thread::Main);
+    // PS2_CRASH_TEST=<thread>:<kind>[:<frame>]: a failure on purpose to look at the crash lines, off unless set (ps2/crash.hpp)
+    ps2::crash::test_parse(ps2::os::env("PS2_CRASH_TEST").c_str());
+#ifdef _WIN32
+    // The runtime uses short SDL/condition-variable waits; request 1 ms timer granularity for Windows pacing.
+    timeBeginPeriod(1);
     connect_output();
     // argv is in the ANSI code page and loses every character outside it: take the UTF-16 command line and use it as UTF-8
     std::vector<std::string> utf8_args;
@@ -705,31 +818,83 @@ int main(int argc, char **argv) {
         argv = switch_argv.data();
     }
 #endif
-    if (argc < 2) return usage();
+    // A game packed into this very file (tools/ps2_disc_toolkit bundle) starts with no program: the disc comes from
+    // the file itself and the saves go beside it. Any option after the name still works (--frames, --window, ...).
+    ps2::disc::SelfBundleInfo bundle_info;
+    const bool use_self_bundle = (argc < 2 || argv[1][0] == '-') && ps2::disc::detect_self_bundle(&bundle_info);
+    if (argc < 2 && !use_self_bundle) return usage();
+    const bool from_disc = use_self_bundle || argv[1][0] == '-';
+    std::string program = from_disc ? std::string() : argv[1];
+    if (use_self_bundle) {
+        const std::string saves_dir = ps2::disc::bundle_writable_data_dir();
+        ps2::g_options.disc_path = ps2::disc::kBundleSentinel;
+        if (!saves_dir.empty()) {
+            ps2::g_options.memcard_path = saves_dir + "/memcard.ps2";
+            ps2::g_options.quick_dir = saves_dir;
+        }
+    }
+    std::vector<std::uint8_t> disc_elf;
+#ifdef PS2_WINDOW
+    // The log copy starts before anything else that can fail (the arguments, the window, the translation set-up, the disc), so
+    // whatever ends the run later leaves a log file behind: the app points a player at it ("Logs are not being created", public
+    // issue 42). Only the arguments that say where it goes are read here; main reads them all again below.
+    {
+        // PS2_LOG_COPY=1 (a test aid): a headless run keeps the log copy too, so the log file can be tested without a window
+        bool window_run = ps2::os::env("PS2_LOG_COPY") == "1";
+        bool has_max_frames = false;
+        std::string early_disc, early_game_dir;
+        for (int i = from_disc ? 1 : 2; i < argc; ++i) {
+            const std::string a = argv[i];
+            if (a == "--window" || a == "--fullscreen") window_run = true;
+            else if (a == "--frames" && i + 1 < argc) { has_max_frames = true; ++i; }
+            else if (a == "--memcard" && i + 1 < argc) ps2::g_options.memcard_path = argv[++i];
+            else if (a == "--quick-dir" && i + 1 < argc) ps2::g_options.quick_dir = argv[++i];
+            else if (a == "--disc" && i + 1 < argc) early_disc = argv[++i];
+            else if (a == "--game-dir" && i + 1 < argc) early_game_dir = argv[++i];
+        }
+        // A packed game started without --frames plays in a window (below), so it keeps a log file like one: a double-click leaves one
+        // in saves/logs (contributed with the single-file pack)
+        if (use_self_bundle && !has_max_frames) window_run = true;
+        if (!from_disc) ps2::g_options.program_path = argv[1];
+        // The log goes where the quick saves go (the memory card's folder, else the game folder), so the game folder must be known
+        // by now, as it is later. An image-only start has no program path yet: its folder stands in for it, as below.
+        ps2::g_options.game_dir = use_self_bundle ? ps2::g_options.quick_dir
+                                                  : ps2::os::utf8(find_game_dir(from_disc ? early_disc : argv[1], early_disc, early_game_dir).lexically_normal());
+        // PS2_NO_LOG_COPY=1 leaves the log alone (no memory copy, no file): the way back if the pipe is ever in the way
+        if (window_run && ps2::os::env("PS2_NO_LOG_COPY").empty() && g_log.start(ps2::os::path(ps2::quick_folder("logs")))) {
+            ps2::g_options.recent_log = [](std::size_t lines) { return g_log.tail(lines); };
+            ps2::g_options.first_log = [](std::size_t lines) { return g_log.head(lines); };
+            ps2::g_options.on_exit = [] { g_log.stop(); };
+            std::atexit([] { g_log.stop(); });  // the window run that returns from main
+        }
+    }
+#endif
+    ps2::crash::test_here("main");
 #ifdef __SWITCH__
     switch_clock_start();
 #endif
 #ifdef _WIN32
     SetConsoleCtrlHandler(on_console_event, TRUE);
-    SetUnhandledExceptionFilter(on_crash);
-#else
-    install_signal_handlers();
 #endif
-    std::atexit([] { ps2::flush_memory_card(); });  // whatever way the program ends through exit()
-    std::vector<std::string> args{argv[1]};
+#ifdef _WIN32
+    std::atexit([] { timeEndPeriod(1); ps2::flush_memory_card(); });
+#else
+    std::atexit([] { ps2::flush_memory_card(); });
+#endif
+    std::vector<std::string> args{from_disc ? std::string() : std::string(argv[1])};
     [[maybe_unused]] bool window = false, fullscreen = false;
 #ifdef __SWITCH__
     window = true;
     fullscreen = true;
 #endif
-    std::string load_path;
+    std::string load_path, given_game_dir;
     bool no_record = false;
-    ps2::g_options.program_path = argv[1];
+    ps2::g_options.disc_program = from_disc;
     for (int i = 0; i < argc; ++i) {
         const std::string a = argv[i];
         ps2::g_options.command_line += (i ? " " : "") + (a.find_first_of(" \t") == std::string::npos ? a : "\"" + a + "\"");
     }
-    for (int i = 2; i < argc; ++i) {
+    for (int i = from_disc ? 1 : 2; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--arg" && i + 1 < argc) args.push_back(argv[++i]);
         else if (a == "--frames" && i + 1 < argc) ps2::g_options.max_frames = std::strtoull(argv[++i], nullptr, 10);
@@ -740,16 +905,23 @@ int main(int argc, char **argv) {
         else if (a == "--misses" && i + 1 < argc) ps2::g_options.misses_path = argv[++i];
         else if (a == "--trace-syscalls") ps2::g_options.trace_syscalls = true;
         else if (a == "--widescreen") ps2::g_options.widescreen = true;
+        else if (a == "--language" && i + 1 < argc) {
+            // the language the console is set to, which multi-language discs (Urban Reign PAL: en fr de es it) show their text in
+            ps2::g_options.language = language_number(argv[++i]);
+            if (!ps2::g_options.language) return usage();
+        }
         else if (a == "--patches" && i + 1 < argc) {
             if (!ps2::load_patches(argv[++i])) return usage();
         }
         else if (a == "--trace-io") ps2::g_options.trace_io = true;
         else if (a == "--trace-threads") ps2::g_options.trace_threads = true;
         else if (a == "--disc" && i + 1 < argc) ps2::g_options.disc_path = argv[++i];
+        else if (a == "--game-dir" && i + 1 < argc) given_game_dir = argv[++i];
         else if (a == "--memcard" && i + 1 < argc) ps2::g_options.memcard_path = argv[++i];
         else if (a == "--trace-iop") ps2::g_options.trace_iop_modules = true;
         else if (a == "--trace-iop-hle") ps2::g_options.trace_iop_hle = true;
         else if (a == "--frames-dir" && i + 1 < argc) ps2::g_options.frames_dir = argv[++i];
+        else if (a == "--frame-at" && i + 1 < argc) ps2::g_options.frame_capture_frames.push_back(std::strtoull(argv[++i], nullptr, 10));
         else if (a == "--press" && i + 1 < argc) {
             ps2::Press press;
             if (!ps2::parse_press(argv[++i], press)) return usage();
@@ -790,62 +962,87 @@ int main(int argc, char **argv) {
 #endif
 
 #ifdef PS2_WINDOW
-    // PS2_NO_LOG_COPY=1 leaves the log alone (no memory copy, no file): the way back if the pipe is ever in the way
-    if (window && ps2::os::env("PS2_NO_LOG_COPY").empty() && g_log.start(ps2::os::path(ps2::quick_folder("logs")))) {
-        ps2::g_options.recent_log = [](std::size_t lines) { return g_log.tail(lines); };
-        ps2::g_options.first_log = [](std::size_t lines) { return g_log.head(lines); };
-        ps2::g_options.on_exit = [] { g_log.stop(); };
-        std::atexit([] { g_log.stop(); });  // the window run that returns from main
-    }
+    if (use_self_bundle && !window && ps2::g_options.max_frames == 0) window = true;  // a double-click plays
 #endif
+    std::sort(ps2::g_options.frame_capture_frames.begin(), ps2::g_options.frame_capture_frames.end());
+    ps2::g_options.frame_capture_frames.erase(
+        std::unique(ps2::g_options.frame_capture_frames.begin(), ps2::g_options.frame_capture_frames.end()),
+        ps2::g_options.frame_capture_frames.end());
+
+    std::string program_location = program;
+    if (from_disc) {
+        if (ps2::g_options.disc_path.empty()) return usage();
+        if (!ps2::disc::open(ps2::g_options.disc_path)) {
+            std::fprintf(stderr, "[elf] cannot open disc image %s\n", ps2::g_options.disc_path.c_str());
+            return 1;
+        }
+        std::string why;
+        if (!ps2::disc::read_boot_elf(program, disc_elf, why)) {
+            std::fprintf(stderr, "[elf] %s\n", why.c_str());
+            return 1;
+        }
+        args[0] = program;
+        // A location anchor for caches/reports; this path is never opened for disc boot.
+        std::string name = program;
+        std::replace(name.begin(), name.end(), '\\', '/');
+        name = name.substr(name.find_last_of("/:") + 1);
+        name = name.substr(0, name.find(';'));
+        program_location = use_self_bundle ? bundle_info.exe_path
+                                           : ps2::os::utf8(ps2::os::path(ps2::g_options.disc_path).parent_path() / ps2::os::path(name));
+        std::fprintf(stderr, "[elf] read %s from disc (%zu bytes)\n", program.c_str(), disc_elf.size());
+    }
+    ps2::g_options.program_path = program_location;
+
+    // The image can be on another drive, and a portable runner need not be in the build tree. --game-dir names the folder
+    // port.sh made independently of both paths. Otherwise keep looking around the ELF, then beside the image, as before.
+    std::error_code error;
+    const std::filesystem::path program_file = std::filesystem::absolute(ps2::os::path(program_location), error);
+    std::filesystem::path game_dir;
+    if (!given_game_dir.empty()) {
+        game_dir = std::filesystem::absolute(ps2::os::path(given_game_dir), error);
+        if (error || !std::filesystem::is_directory(game_dir, error)) {
+            std::fprintf(stderr, "[game] not a directory: %s\n", given_game_dir.c_str());
+            return 1;
+        }
+    } else if (use_self_bundle) {
+        game_dir = ps2::os::path(ps2::g_options.quick_dir);  // the saves folder beside the packed file, else the user's data folder
+    } else {
+        game_dir = find_game_dir(program_location, ps2::g_options.disc_path, {});
+    }
+    game_dir = game_dir.lexically_normal();
+    ps2::g_options.game_dir = ps2::os::utf8(game_dir);
+    const std::filesystem::path data_dir = game_dir.empty() ? program_file.parent_path() : game_dir;
 
 #ifdef PS2_WINDOW
-    // Playing records the vector programs that are not compiled into this build into the vu1 folder of the game that port.sh
-    // made, games/<name>/vu1, so `port.sh <name> <image> --no-explore` can compile them afterwards (docs/gow2.md). Without that, a
-    // game is slow wherever the exploring runs did not go: unknown programs run in the interpreter. A PS2_VU_RECORD the user set
-    // wins. This runs before anything reads the variable (the vector unit code reads it on its first program, long after main).
-    // The game folder is found from the program first: port.sh always extracts it into the game folder (disc/<program>,
-    // patched/<program>, or core.elf at the top), so the folder is the program's own or the one above it. The disc image is no
-    // guide on its own: port.sh hard-links it into the game folder, but a hard link cannot reach another drive, and an image on
-    // another drive is played from where it is, with no vu1 folder next to it. Next to the disc image is still looked at last.
-    if (window && ps2::os::env("PS2_VU_RECORD").empty()) {
-        std::error_code error;
-        std::vector<std::filesystem::path> places;
-        const std::filesystem::path program = std::filesystem::absolute(ps2::os::path(argv[1]), error);
-        if (!error) places = {program.parent_path(), program.parent_path().parent_path()};
-        if (!ps2::g_options.disc_path.empty()) {
-            const std::filesystem::path disc = std::filesystem::absolute(ps2::os::path(ps2::g_options.disc_path), error);
-            if (!error) places.push_back(disc.parent_path());
-        }
-        for (const std::filesystem::path &place : places) {
-            const std::filesystem::path vu1 = (place / "vu1").lexically_normal();
-            if (std::filesystem::is_directory(vu1, error) && ps2::os::set_env("PS2_VU_RECORD", ps2::os::utf8(vu1))) {
-                std::fprintf(stderr, "[vu1] recording vector programs that are not compiled yet into %s\n", ps2::os::env("PS2_VU_RECORD").c_str());
-                break;
-            }
+    // Playing records the vector programs that are not compiled into this build into the vu1 and vu0 folders of the game that
+    // port.sh made, games/<name>/{vu1,vu0}, so `port.sh <name> <image> --no-explore` can compile them afterwards (docs/gow2.md,
+    // docs/vu0-native.md). Without that, a game is slow wherever the exploring runs did not go: unknown programs run in the
+    // interpreter. A PS2_VU_RECORD or PS2_VU0_RECORD the user set wins, each on its own. This runs before anything reads the
+    // variables (the vector unit code reads them on its first program, long after main).
+    if (window) {
+        for (int unit : {1, 0}) {
+            const char *setting = unit ? "PS2_VU_RECORD" : "PS2_VU0_RECORD";
+            if (!ps2::os::env(setting).empty()) continue;
+            const std::filesystem::path directory = (data_dir / (unit ? "vu1" : "vu0")).lexically_normal();
+            if (std::filesystem::is_directory(directory, error) && ps2::os::set_env(setting, ps2::os::utf8(directory)))
+                std::fprintf(stderr, "[vu%d] recording vector programs that are not compiled yet into %s\n", unit, ps2::os::env(setting).c_str());
         }
     }
+    // The window says which game runs: PS2_WINDOW_TITLE when a launcher sets it, else the disc's serial.
+    if (window && ps2::os::env("PS2_WINDOW_TITLE").empty())
+        if (const std::string serial = disc_serial(program_location); !serial.empty()) ps2::os::set_env("PS2_WINDOW_TITLE", serial);
     if (window && !open_window(fullscreen)) return 1;
-    if (window) name_thread(L"ps2 window");
+    if (window) ps2::crash::enter_thread(ps2::crash::Thread::Gpu);  // this thread shows the pictures from now on
 #endif
     // Vector programs the build does not know are compiled in the background while the game runs (docs/vu-live.md). On in a window,
     // off in headless runs unless PS2_VU_LIVE asks: PS2_VU_LIVE=1 (or a folder for the compiled libraries), PS2_VU_LIVE=0 switches it off.
     // The libraries go next to the game: the game folder that port.sh made (the one with the vu1 folder), else the program's own folder.
     {
         const std::string setting = ps2::os::env("PS2_VU_LIVE");
-        if (setting != "0" && setting != "off" && (window || !setting.empty())) {
+        if (setting != "0" && setting != "off" && (window || !setting.empty() || use_self_bundle)) {
             std::string cache = setting == "1" || setting == "on" ? std::string() : setting;
-            if (cache.empty()) {
-                std::error_code error;
-                const std::filesystem::path program = std::filesystem::absolute(ps2::os::path(argv[1]), error);
-                std::filesystem::path place = program.parent_path();
-                for (const std::filesystem::path &candidate : {program.parent_path(), program.parent_path().parent_path()})
-                    if (std::filesystem::is_directory(candidate / "vu1", error)) {
-                        place = candidate;
-                        break;
-                    }
-                cache = ps2::os::utf8((place / "vu1-live").lexically_normal());
-            }
+            if (cache.empty() && use_self_bundle) cache = ps2::disc::ensure_bundle_live_cache("vu1-live");  // libraries packed with the game
+            if (cache.empty()) cache = ps2::os::utf8(data_dir / "vu1-live");
             ps2::vu::live::start(cache);
         }
     }
@@ -857,31 +1054,29 @@ int main(int argc, char **argv) {
     // The libraries go next to the game like the vector programs'; entries.txt and overlays\ of the game folder get what was found.
     {
         const std::string setting = ps2::os::env("PS2_EE_LIVE");
-        if (setting != "0" && setting != "off" && (window || !setting.empty())) {
-            std::error_code error;
-            const std::filesystem::path program = std::filesystem::absolute(ps2::os::path(argv[1]), error);
-            std::filesystem::path place = program.parent_path(), game_dir;
-            for (const std::filesystem::path &candidate : {program.parent_path(), program.parent_path().parent_path()})
-                if (std::filesystem::is_directory(candidate / "vu1", error) || std::filesystem::is_regular_file(candidate / "entries.txt", error)) {
-                    place = candidate;
-                    break;
-                }
-            for (const std::filesystem::path &candidate : {program.parent_path(), program.parent_path().parent_path()})
-                if (std::filesystem::is_regular_file(candidate / "entries.txt", error)) {
-                    game_dir = candidate;
-                    break;
-                }
-            const std::string cache = setting.empty() || setting == "1" || setting == "on" ? ps2::os::utf8((place / "ee-live").lexically_normal()) : setting;
-            ps2::ee::live::start(argv[1], cache, ps2::os::utf8(game_dir));
+        if (setting != "0" && setting != "off" && (window || !setting.empty() || use_self_bundle)) {
+            std::string cache = setting.empty() || setting == "1" || setting == "on" ? ps2::os::utf8(data_dir / "ee-live") : setting;
+            if (use_self_bundle && (setting.empty() || setting == "1" || setting == "on")) {
+                const std::string packed = ps2::disc::ensure_bundle_live_cache("ee-live");  // libraries packed with the game
+                if (!packed.empty()) cache = packed;
+            }
+            // A packed game has no game folder: nothing to write entries.txt and overlays into
+            if (use_self_bundle) ps2::ee::live::start(disc_elf, cache, std::string());
+            else if (from_disc) ps2::ee::live::start(disc_elf, cache, ps2::os::utf8(game_dir));
+            else ps2::ee::live::start(program_location, cache, ps2::os::utf8(game_dir));
         }
     }
     const auto emulate = [&]() -> int {
-        name_thread(L"ps2 emulation");
+        ps2::crash::enter_thread(ps2::crash::Thread::Game);  // the emulation thread (named again in ps2::run, the same name)
+        ps2::crash::test_here("emu");
         std::uint32_t entry = 0;
-        if (!ps2::load_elf(argv[1], entry)) {
-            std::fprintf(stderr, "cannot load %s\n", argv[1]);
+        const bool loaded = from_disc ? ps2::load_elf(disc_elf, entry) : ps2::load_elf(program, entry);
+        if (!loaded) {
+            std::fprintf(stderr, "cannot load %s\n", program.c_str());
             return 1;
         }
+        // Segments are in EE RAM and live analysis owns its ELF bytes; release the host boot buffer.
+        std::vector<std::uint8_t>().swap(disc_elf);
         ps2::boot(entry, args);
         if (load_path == "newest") {  // the newest quick save (F5) of this game
             load_path = ps2::quick_newest_state();

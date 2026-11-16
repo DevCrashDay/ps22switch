@@ -1,11 +1,15 @@
 #!/usr/bin/env bash
+# bash 4 or newer (${x,,} and more below); macOS ships bash 3.2 as /bin/bash
+if [ -z "${BASH_VERSION:-}" ] || [ "${BASH_VERSINFO:-0}" -lt 4 ]; then
+  echo "this script needs bash 4 or newer, this is ${BASH_VERSION:-not bash} (macOS: brew install bash, then run it again)" >&2; exit 1
+fi
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 here="$ROOT/scripts"
 
 usage() {
   cat <<'EOF'
-usage: scripts/port.sh <name> <game.iso | game.zip | game.7z> [options]
+usage: scripts/port.sh <name> <game.iso | game.bin | game.cue | game.zip | game.7z> [options]
 
 Turns a PS2 disc image you own into a browser build in build/web-<name> and a
 native one in build/native-<name>. It reads the boot program named in
@@ -34,6 +38,10 @@ EOF
 
 [ $# -ge 2 ] || { usage; exit 2; }
 name="$1"; source_path="$2"; shift 2
+# the name becomes folder names that are deleted and rebuilt (games/<name>/patched, build/native-<name>), so no / or ..
+if ! [[ "$name" =~ ^[A-Za-z0-9._-]+$ ]] || [[ "$name" == .* ]]; then
+  echo "game name '$name': use letters, digits, . _ and - only, not starting with a dot" >&2; exit 2
+fi
 frames=3600; rounds=8; explore=1; web=1; presses=(); pnach=(); wide=()
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -74,7 +82,12 @@ export EMSDK="${EMSDK:-$ROOT/tools/emsdk}"
 setup=()
 [ "$web" = 1 ] || setup=(--native-only)
 if { [ "$web" = 1 ] && [ ! -f "$EMSDK/emsdk_env.sh" ]; } || [ ! -x "$tools/eerecomp" ] || [ ! -x "$tools/vurecomp" ]; then "$here/setup.sh" "${setup[@]}"; fi
-mkdir -p "$game/disc" "$game/vu1" "$game/shots" "$generated"
+# An update can bring a newer translator (the app replaces recomp/ but keeps build/): ninja compiles the tools again when their
+# sources changed, about a second when nothing did. Without this, games built after an update would still use the old translator.
+if [ -f "$tools/build.ninja" ]; then
+  ninja -C "$tools" eerecomp vurecomp > "$tools/ninja-port.log" 2>&1 || { tail -n 30 "$tools/ninja-port.log" >&2; echo "building the translator tools failed" >&2; exit 1; }
+fi
+mkdir -p "$game/disc" "$game/vu1" "$game/vu0" "$game/shots" "$generated"
 
 echo "== [1/6] disc"
 iso="$game/disc.iso"
@@ -82,22 +95,29 @@ if [ -e "$iso" ]; then
   echo "already in place"
 else
   case "${source_path,,}" in
-    *.zip)
-      "${py[@]}" -I - "$source_path" "$iso" <<'EOF'
-import shutil, sys, zipfile
-with zipfile.ZipFile(sys.argv[1]) as archive:
-    images = [m for m in archive.infolist() if m.filename.lower().endswith('.iso')]
-    if not images:
-        sys.exit('no .iso inside the archive')
-    with archive.open(max(images, key=lambda m: m.file_size)) as src, open(sys.argv[2], 'wb') as dst:
-        shutil.copyfileobj(src, dst, 1 << 24)
-EOF
-      ;;
+    # an archive with an image in it, or a CD dumped as BIN (with a CUE sheet): disc.py writes the .iso, cutting the 2048-byte
+    # sectors out of a 2352-byte-sector dump (follows upstream 0d72093)
+    *.zip|*.bin|*.cue|*.img) "${py[@]}" -I "$here/disc.py" iso "$source_path" "$iso" ;;
     *.7z)
       sevenzip=7z
       [ "$windows" = 0 ] || command -v 7z > /dev/null || sevenzip="${PROGRAMFILES:-/c/Program Files}/7-Zip/7z.exe"
       command -v "$sevenzip" > /dev/null || { echo "7z not found: install 7-Zip" >&2; exit 1; }
-      "$sevenzip" e -so -r "$source_path" '*.iso' > "$iso" ;;
+      "$sevenzip" e -so -r "$source_path" '*.iso' > "$iso" || true
+      if [ ! -s "$iso" ]; then
+        # no .iso inside: a CD dumped as BIN (and CUE) is unpacked next to the game and converted
+        rm -f "$iso"
+        unpack="$game/unpack"
+        rm -rf "$unpack"; mkdir -p "$unpack"
+        "$sevenzip" e -r -y -o"$unpack" "$source_path" '*.cue' '*.bin' '*.img' > /dev/null || true
+        image=
+        for ending in cue bin img; do
+          image=$(find "$unpack" -type f -iname "*.$ending" | head -1)
+          [ -z "$image" ] || break
+        done
+        if [ -z "$image" ]; then rm -rf "$unpack"; echo "no .iso, .bin or .img inside the archive" >&2; exit 1; fi
+        "${py[@]}" -I "$here/disc.py" iso "$image" "$iso" || { rm -rf "$unpack"; exit 1; }
+        rm -rf "$unpack"
+      fi ;;
     *)
       # No realpath in MinGit or old macOS. On Windows pwd -W gives D:/...: Git's shell leaves /d/... as it is for native
       # programs (ln is BusyBox's, Python, ps2run) when the name has [ ] ' * or ? in it, as in "Game [NTSC].iso"
@@ -107,12 +127,21 @@ EOF
   esac
 fi
 "${py[@]}" -I "$here/disc.py" extract "$iso" "$game/disc" SYSTEM.CNF > /dev/null
-boot=$(sed -n 's/^BOOT2 *= *//p' "$game/disc/SYSTEM.CNF" | tr -d '\r')
-program=${boot#*\\}
-program=${program%;*}
+boot=$(tr '\r' '\n' < "$game/disc/SYSTEM.CNF" | awk -f "$here/boot2.awk")  # the same reading as pnach.py (tabs, any case, BOM)
+program=${boot#*:}      # without "cdrom0:"
+program=${program#"${program%%[!\\/]*}"}  # without leading \ or /
+program=${program%;*}   # without ";1"
 [ -n "$program" ] || { echo "SYSTEM.CNF names no BOOT2 program" >&2; exit 1; }
+# A real BOOT2 line is "cdrom0:\SLUS_212.00;1": the program is a file in the disc's top folder. Its name is used below as a
+# pattern for disc.py extract and as a file name, so a damaged or made-up SYSTEM.CNF must not bring wildcards or folders in.
+case "$program" in
+  *'*'* | *'?'* | *'['* | */* | *'\'*)
+    echo "SYSTEM.CNF names the boot program \"$boot\": a name with * ? [ / or \\ in it is not a program in the disc's top folder, so this image is not used (damaged or not a PS2 game disc?)" >&2
+    exit 1 ;;
+esac
 "${py[@]}" -I "$here/disc.py" extract "$iso" "$game/disc" "$program" > /dev/null
 echo "boots $boot"
+[ "${PS2_PORT_STOP:-}" != disc ] || exit 0  # tests/boot2_cases.py only checks this step
 crc=$("${py[@]}" -I "$here/pnach.py" crc "$game/disc/$program")
 echo "PCSX2 patch files for it end in _$crc.pnach"
 
@@ -120,7 +149,9 @@ echo "== [2/6] executable"
 elf="$game/disc/$program"
 if [ -f "$game/core.elf" ]; then
   elf="$game/core.elf"
-elif "${py[@]}" -I "$here/disc.py" list "$iso" | awk '{print $4}' | grep -qx CORE.GT4; then
+# awk reads the whole listing: "grep -q" would end the pipe at the first match, and under pipefail the writer's SIGPIPE
+# then made the test fail at random (GT4 translated without core.elf)
+elif "${py[@]}" -I "$here/disc.py" list "$iso" | awk '$4 == "CORE.GT4" { found = 1 } END { exit !found }'; then
   "${py[@]}" -I "$here/disc.py" extract "$iso" "$game/disc" CORE.GT4 > /dev/null
   "${py[@]}" -I "$here/gt4_core.py" "$game/disc/CORE.GT4" "$game/core.elf" > /dev/null
   elf="$game/core.elf"
@@ -164,6 +195,7 @@ if [ -n "${PS2_JOBS:-}" ]; then
   ninja_jobs="-j$PS2_JOBS"
 fi
 . "$here/runtime.sh"
+. "$here/build_units.sh"
 
 build_native() {
   . "$here/cxx.sh"
@@ -173,16 +205,18 @@ build_native() {
     cmake -S "$ROOT" -B "$native" -G Ninja -DCMAKE_BUILD_TYPE=$build_type "${cxx_flags[@]}" -DPS2_GENERATED="$generated" -DPS2_RUNTIME_LIB="$runtime_lib" > /dev/null
     echo "$config" > "$native/.port-config"
   fi
-  ninja -C "$native" $ninja_jobs ps2run > "$native/ninja.log" 2>&1 || { tail -30 "$native/ninja.log"; exit 1; }
+  # a unit that crashes the compiler is built again a step lower (scripts/build_units.sh); a real error stops here as before
+  ps2_ninja "$native" ps2run || exit 1
 }
 
 echo "== [4/6] exploring"
 if [ "$explore" = 1 ]; then
   for ((round = 1; round <= rounds; round++)); do
     build_native
+    echo "[port] testing round $round of at most $rounds"
     rm -f "$game/misses.txt" "$game/explore.ps2" "$game/explore_ram.bin"
     code=0
-    PS2_DUMP="$game/explore_ram.bin" PS2_GPU_LOW_POWER=1 PS2_VU_RECORD="$game/vu1" "$native/ps2run" "$elf" --disc "$iso" --misses "$game/misses.txt" --memcard "$game/explore.ps2" \
+    PS2_DUMP="$game/explore_ram.bin" PS2_GPU_LOW_POWER=1 PS2_VU0_RECORD="$game/vu0" PS2_VU_RECORD="$game/vu1" "$native/ps2run" "$elf" --disc "$iso" --misses "$game/misses.txt" --memcard "$game/explore.ps2" \
       "${wide[@]}" "${patches[@]}" --frames "$frames" "${presses[@]}" --frames-dir "$game/shots" --frame-every 300 > "$game/explore.log" 2>&1 || code=$?
     [ "$code" = 0 ] || echo "[port] ps2run exited with code $code" | tee -a "$game/explore.log"
     captured=0
@@ -216,9 +250,11 @@ else
 fi
 
 echo "== [5/6] vector unit programs"
-if compgen -G "$game/vu1/*.bin" > /dev/null; then
-  "$tools/vurecomp" "$game/vu1" "$generated" | tail -1
+if compgen -G "$game/vu1/*.bin" > /dev/null || compgen -G "$game/vu0/*.bin" > /dev/null; then
+  "$tools/vurecomp" "$game/vu1" "$generated" --vu0-dir "$game/vu0" | tail -1
 else
+  # vurecomp replaces the old files itself; with nothing recorded it never runs, so programs of an earlier run would stay in the build.
+  rm -f "$generated"/vu1_*.cpp
   echo "none recorded, the native runner interprets them and the page compiles them on the fly"
 fi
 
@@ -232,7 +268,12 @@ if [ "$web" = 1 ]; then
   printf 'Done. Serve it with:  %s scripts/serve.py %q %q\n' "$pyname" "build/web-$name" "games/$name/disc.iso"
   echo "and open http://localhost:8620/"
 fi
-play=$(printf '%q %q --disc %q --window' "build/native-$name/ps2run" "${elf#$ROOT/}" "${iso#$ROOT/}")
+if [ "$elf" = "$game/disc/$program" ]; then
+  play=$(printf '%q --disc %q --window' "build/native-$name/ps2run" "${iso#$ROOT/}")
+else
+  play=$(printf '%q %q --disc %q --window' "build/native-$name/ps2run" "${elf#$ROOT/}" "${iso#$ROOT/}")
+fi
+play="$play --game-dir $(printf '%q' "games/$name")"
 [ ${#wide[@]} -eq 0 ] || play="$play --widescreen"
 [ ${#patches[@]} -eq 0 ] || play="$play --patches $(printf '%q' "games/$name/patches.txt")"
 echo "Play it natively:  $play"

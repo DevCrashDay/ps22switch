@@ -18,6 +18,9 @@
 
 #include <switch.h>
 
+#include "crash.hpp"
+
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 
@@ -87,5 +90,9 @@ void switch_crash_report() {
     std::fprintf(stderr, "[crash] a fault in the CPU prints its registers and call chain here (crash_marker 0x%llx)\n",
                  static_cast<unsigned long long>(reinterpret_cast<std::uint64_t>(&crash_marker)));
 }
+
+// host/crash.cpp (the PC's crash report) needs POSIX signals and ucontext, which the console does not have, so it is not built here.
+// main() still installs it first thing: on the Switch the report is the exception handler above, and there is nothing else to install.
+void crash::install(crash::After) {}
 
 #endif

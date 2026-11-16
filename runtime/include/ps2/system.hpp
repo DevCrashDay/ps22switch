@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <functional>
 #include <string>
+#include <span>
 #include <vector>
 
 namespace ps2 {
@@ -42,6 +43,7 @@ struct Options {
     bool trace_threads = false;
     bool pal = true;
     bool widescreen = false;
+    unsigned language = 0;  // --language: the console's language the game reads (1 English ... 7 Portuguese); 0 leaves PS2_LANGUAGE in charge
     bool rate_forced = false;
     std::uint64_t max_frames = 0;
     std::string misses_path;
@@ -50,20 +52,27 @@ struct Options {
     bool trace_iop_hle = false;
     std::string frames_dir;
     std::uint32_t frame_every = 60;
+    std::vector<std::uint64_t> frame_capture_frames; // additional exact frames requested by --frame-at
     bool sync_pictures = false;  // render_pending reads each picture back at once instead of a picture or two later (headless runs with threads)
     std::vector<Press> presses;
     std::vector<AxisPress> axis_presses;
     std::vector<Patch> patches;
     std::function<void()> on_vblank;
+    // Called about every 20 ms by the game's own thread while it waits for something long (a live translation, ee_live.cpp). Set by a window run
+    // that has the game on the window thread (--frames-dir, PS2_ONE_THREAD): that thread must go on taking window messages, or Windows marks the
+    // window "not responding" after 5 s and ends the program when the player closes it (no crash line: nothing crashed). Empty when the window has a thread of its own.
+    std::function<void()> keep_alive;
     std::function<void(const std::string &name, const std::uint8_t *code, std::size_t size)> on_vu_program;
     std::string memcard_path;
     std::function<void()> on_memcard_saved;
     std::string save_state_path;
     std::uint64_t save_state_frame = 0;
     // for the keys of a window run (F5, F8, F9; docs/play-keys.md)
+    bool disc_program = false;                            // boots from SYSTEM.CNF in --disc; also written to input recordings
     std::string program_path;                                  // the game's program, set by the host
+    std::string game_dir;                                      // --game-dir or the game folder found by the host; caches and build inputs
     std::string command_line;                                  // what the runner was started with, for reports
-    std::string quick_dir;                                     // --quick-dir; default: the folder of the memory card, else of the program
+    std::string quick_dir;                                     // --quick-dir; default: memory card folder, game folder, then program folder
     std::function<std::string(std::size_t lines)> recent_log;  // the host's copy of the log: its last lines ...
     std::function<std::string(std::size_t lines)> first_log;   // ... and its first lines
     std::function<void()> on_exit;                             // the window run is about to end the process
@@ -92,6 +101,7 @@ void save_context(const Cpu &c, ThreadContext &t);
 void load_context(Cpu &c, const ThreadContext &t);
 
 std::uint64_t now();
+bool frame_capture_requested(std::uint64_t frame);
 std::uint64_t rtc_seconds();  // the clock the game reads, in seconds since 1970 (UTC), see Options::rtc_epoch
 std::uint64_t hblank_cycles();
 void set_budget(Cpu &c, std::int64_t cycles);
@@ -106,6 +116,7 @@ void request_iop_sync();
 void sync_iop();
 
 bool load_elf(const std::string &path, std::uint32_t &entry);
+bool load_elf(std::span<const std::uint8_t> data, std::uint32_t &entry);
 void boot(std::uint32_t entry, const std::vector<std::string> &args);
 int run();
 void halt(const std::string &reason);
@@ -119,7 +130,7 @@ std::uint64_t frame_count();
 bool display_frame(std::vector<std::uint32_t> &rgba, std::uint32_t &width, std::uint32_t &height);
 
 struct WindowTarget {
-    enum Kind { X11, Wayland, Canvas, Win32, Vi } kind = X11;
+    enum Kind { X11, Wayland, Canvas, Win32, Metal, Vi } kind = X11;
     void *display = nullptr;
     std::uint64_t window = 0;
     void *surface = nullptr;
@@ -161,6 +172,8 @@ void set_pad_axis(int axis, std::uint8_t value, int pad = 0);
 void set_pad_pressure(int button, std::uint8_t value, int pad = 0);
 void set_pad_connected(int pad, bool connected);
 std::uint16_t pad_rumble(int pad = 0);
+// The pad state set above goes on to the controller ports at a frame boundary; a test with no frames calls this to take it over now.
+void latch_pads_now();
 void set_audio_sink(std::function<void(const std::int16_t *samples, std::size_t frames)> sink);
 // Writes the memory card file if the game changed the card since the last write; call it wherever the game can end. hurry: do not wait
 // long for the card (Ctrl+C, a crash).
@@ -168,6 +181,10 @@ void flush_memory_card(bool hurry = false);
 // A copy of the memory card as the game sees it now (the file may be up to 50 frames behind). false when no card is in use. With
 // wait false the card is given up after a moment if a card command holds it.
 bool memory_card_image(std::vector<std::uint8_t> &out, bool wait);
+// For a crash handler (runtime/src/iop/sio2.cpp): the newest card goes to "<card>.crash.ps2" beside the card file, never over it.
+// Returns 0 when the card had not changed since it was last written, 1 when the copy was written (`where`, if not null, names it),
+// 2 when the card was busy, 3 when the copy could not be written. It prints nothing.
+int save_memory_card_after_crash(const char **where);
 
 // --- Keys of a window run (docs/play-keys.md): F5 quick save, F8 quick load, F9 problem report ---
 enum class QuickKey { save, load, report };

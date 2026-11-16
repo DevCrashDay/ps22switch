@@ -25,8 +25,14 @@ bool open(const std::string &name, std::uint64_t size, Reader reader, Probe prob
 bool is_open();
 bool read(std::uint32_t sector, std::uint32_t count, void *out);
 bool ready(std::uint32_t sector, std::uint32_t count);
-std::optional<Entry> find(const std::string &path);
+std::optional<Entry> find(const std::string &path);  // layer 0's file system first, as cdvdman's sceCdSearchFile
+std::optional<Entry> find(const std::string &path, int layer);  // sceCdLayerSearchFile: layer 1's entry when it has one
 std::uint32_t layer1_start();
 std::uint64_t sector_count();
+
+// Read SYSTEM.CNF's BOOT2 file from the open ISO without extracting it. Returns its guest path and exact ELF bytes.
+// Host allocation limits: 64 KiB for SYSTEM.CNF and 128 MiB for the ELF (including non-loadable/debug data).
+// On failure outputs are cleared and why explains the problem.
+bool read_boot_elf(std::string &program, std::vector<std::uint8_t> &elf, std::string &why);
 
 }

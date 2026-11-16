@@ -11,7 +11,7 @@ constexpr std::size_t kTentativeLimit = 16384;
 
 class Explorer {
 public:
-    Explorer(const Image &image, Program &program) : image_(image), p_(program) {}
+    Explorer(const Image &image, Program &program, const std::set<std::uint32_t> &served) : image_(image), p_(program), served_(served) {}
 
     bool valid_target(std::uint32_t address) const {
         return (address & 3u) == 0 && address >= p_.base && address < p_.end && image_.executable(address);
@@ -85,10 +85,16 @@ private:
                 local(insn.branch_target_of(), pc);
                 break;
             case Flow::Jump:
-                if (!p_.dynamic.count(pc)) local(insn.branch_target_of(), pc);
+                if (!p_.dynamic.count(pc)) {
+                    if (served(insn.branch_target_of())) leave(insn.branch_target_of());
+                    else local(insn.branch_target_of(), pc);
+                }
                 return;
             case Flow::Call:
-                if (!p_.dynamic.count(pc)) strong(insn.branch_target_of(), true);
+                if (!p_.dynamic.count(pc)) {
+                    if (served(insn.branch_target_of())) leave(insn.branch_target_of());
+                    else strong(insn.branch_target_of(), true);
+                }
                 p_.entries.insert(pc + 8);
                 break;
             case Flow::CallRegister:
@@ -103,6 +109,14 @@ private:
         }
     }
 
+    bool served(std::uint32_t target) const { return served_.count(target) != 0; }
+
+    // A call or jump to code that something else serves: not walked from here. It is still an entry, in case another path of this image
+    // walks that code anyway (a fall-through, a branch): the generated code calls an address of its own code through its entry.
+    void leave(std::uint32_t target) {
+        if (valid_target(target)) p_.entries.insert(target);
+    }
+
     void local(std::uint32_t target, std::uint32_t from) {
         if (!valid_target(target)) return;
         if (target <= from) p_.entries.insert(target);
@@ -113,6 +127,7 @@ private:
 
     const Image &image_;
     Program &p_;
+    const std::set<std::uint32_t> &served_;
     std::deque<std::uint32_t> queue_;
 };
 
@@ -228,7 +243,7 @@ Program analyse(const Image &image, const std::vector<std::uint32_t> &extra_entr
     p.end &= ~3u;
     p.code.assign((p.end - p.base) >> 2, 0);
 
-    Explorer explorer(image, p);
+    Explorer explorer(image, p, search.served);
     explorer.strong(image.entry(), true);
     for (const auto &[address, name] : image.symbols()) explorer.strong(address, true);
     for (std::uint32_t address : extra_entries) explorer.strong(address, true);
@@ -257,6 +272,8 @@ Program analyse(const Image &image, const std::vector<std::uint32_t> &extra_entr
                 for (std::size_t offset = 0; offset + 4 <= segment.bytes.size(); offset += 4)
                     candidates.push_back(*image.word(segment.address + static_cast<std::uint32_t>(offset)));
         }
+        for (const std::uint32_t pointed : search.candidates)
+            if (image.word(pointed).value_or(0)) candidates.push_back(pointed);   // a pointer at zeros is no function
         if (search.after_return) {
             const std::vector<std::uint32_t> leaves = return_starts(image, text_begin, text_end);
             candidates.insert(candidates.end(), leaves.begin(), leaves.end());
@@ -270,6 +287,7 @@ Program analyse(const Image &image, const std::vector<std::uint32_t> &extra_entr
             if (p.entries.count(target) || p.rejected.count(target)) continue;
             if (p.is_code(target) || explorer.tentative(target)) {
                 p.entries.insert(target);
+                p.weak.insert(target);
                 if (!p.is_code(target)) explorer.strong(target, false);
                 ++added;
             } else {
@@ -279,6 +297,7 @@ Program analyse(const Image &image, const std::vector<std::uint32_t> &extra_entr
         explorer.drain();
         if (!added) break;
     }
+    for (const std::uint32_t function : p.functions) p.weak.erase(function);
     return p;
 }
 

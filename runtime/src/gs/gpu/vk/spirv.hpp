@@ -12,6 +12,7 @@ struct SpirvVariant {
     std::uint64_t wgsl_hash;  // FNV-1a of the WGSL text without carriage returns: the text it was made from
     std::uint32_t scale, tile;
     bool explicit_fma;
+    bool has_mip;  // HAS_MIP: the draw program that reads mipmap levels
     const std::uint32_t *words;
     std::size_t word_count;
 };

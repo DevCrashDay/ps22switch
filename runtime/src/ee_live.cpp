@@ -5,6 +5,7 @@
 // The browser build has no compiler to call: code the build does not know still stops the game there.
 namespace ps2::ee::live {
 void start(const std::string &, const std::string &, const std::string &) {}
+void start(std::span<const std::uint8_t>, const std::string &, const std::string &) {}
 bool active() { return false; }
 bool translate_missing(std::uint32_t) { return false; }
 void frame_tick() {}
@@ -15,6 +16,7 @@ void frame_tick() {}
 #include "live_build.hpp"
 
 #include "eerecomp_gen.hpp"
+#include "ps2/crash.hpp"
 #include "ps2/ee_live_abi.hpp"
 #include "ps2/generated.hpp"
 #include "ps2/memory.hpp"
@@ -34,6 +36,7 @@ void frame_tick() {}
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <string>
 #include <thread>
@@ -52,7 +55,7 @@ namespace {
 
 // Bump when recomp/codegen.cpp or recomp/analysis.cpp change what they write for the same code in a way the headers do not show: an
 // old library would otherwise still be loaded (the cache also drops libraries of another runner version by the stamp).
-constexpr const char *kGeneratorVersion = "ee-live 2";
+constexpr const char *kGeneratorVersion = "ee-live 3";
 
 using Clock = lb::Clock;
 
@@ -71,6 +74,9 @@ struct BgJob {
     std::atomic<bool> cancel{false};      // the window changed under it: end the build, nobody wants the result
     bool quick = false;                   // built with little optimisation (State::quick_flags): the game may be about to wait for it
     bool upgrade = false;                 // the window has a quick library already: this one is the same code with the normal flags
+    bool sparse = false;                  // a loaded program (not a window): checked by the first words of its functions
+    std::vector<std::uint32_t> candidates;   // pointers into the image that were found in memory when the quick library was made
+    std::vector<std::uint32_t> entries;      // the entry points the quick library was made from
     // Filled in by the worker before the state turns kBuilt or kFailed.
     fs::path library;
     std::string error;
@@ -90,7 +96,7 @@ struct Watch {
 };
 
 struct State {
-    fs::path program;       // the game's executable
+    std::vector<std::uint8_t> program;  // ELF bytes, also available without an external boot file
     fs::path cache;         // ee-live: the libraries
     fs::path game_dir;      // the folder port.sh made, or empty (entries.txt, overlays\)
     fs::path compiler;
@@ -188,10 +194,17 @@ bool load_library(const fs::path &path, std::size_t &modules, int rank) {
     const auto stamp = reinterpret_cast<StampFn>(lb::find_symbol(library, "ps2_ee_live_stamp"));
     const auto init = reinterpret_cast<InitFn>(lb::find_symbol(library, "ps2_ee_live_init"));
     if (!stamp || !init || stamp() != g->stamp) return false;  // stays loaded: it cannot be unloaded safely, and it is rare
+    crash::note_live_library(crash::Thread::LiveEe, reinterpret_cast<const void *>(init));  // a crash in it is named as live game code
     std::uint32_t n = 0;
     const ModuleInfo *table = init(&host(), &n);
     if (!table || !n) return false;
-    ps2::add_modules_ranked(table, n, rank);
+    // Checks of the entries that only a guess found (recomp::HeadChecks): a library from before them has no such function.
+    using SoftFn = const std::uint32_t *(*)(std::uint32_t, std::uint32_t *);
+    const auto soft_of = reinterpret_cast<SoftFn>(lb::find_symbol(library, "ps2_ee_live_soft"));
+    std::vector<ps2::SoftChecks> soft(n);
+    if (soft_of)
+        for (std::uint32_t k = 0; k < n; ++k) soft[k].words = soft_of(k, &soft[k].count);
+    ps2::add_modules_ranked(table, n, rank, soft.data());
     modules += n;
     ++g->libraries;
     return true;
@@ -397,7 +410,7 @@ void ensure_analysis() {
     if (!g->game_dir.empty() && fs::is_regular_file(g->game_dir / "entries.txt", error))
         g->main_entries = recomp::read_entries(ps2::os::utf8(g->game_dir / "entries.txt")).main;
     try {
-        g->program_analysis = std::make_unique<recomp::StaticProgram>(ps2::os::utf8(g->program), g->main_entries);
+        g->program_analysis = std::make_unique<recomp::StaticProgram>(recomp::Image::load(g->program), g->main_entries);
     } catch (const std::exception &e) {
         say("cannot read the program for its calls into the window: %s", e.what());
     }
@@ -495,12 +508,14 @@ Built build_library(recomp::LiveRequest request, const std::string &what, bool b
 
 // The worker thread: one background build at a time, in the order the windows settled.
 void worker_main() {
+    crash::enter_thread(crash::Thread::LiveEe);
     for (;;) {
         std::shared_ptr<BgJob> job;
         {
             std::unique_lock lock(g->mutex);
             g->wake.wait(lock, [] { return !g->queue.empty() || g->quitting.load(); });
             if (g->quitting.load()) return;
+            crash::test_poll(crash::Thread::LiveEe);
             job = g->queue.front();
             g->queue.pop_front();
             job->state = kRunning;
@@ -512,6 +527,9 @@ void worker_main() {
         request.image = job->image;
         request.name = job->name;
         request.focused = false;   // a first translation: all of the window
+        request.sparse_checks = job->sparse;
+        request.candidates = job->candidates;
+        request.entries = job->entries;
         add_window_entries(request, job->static_calls, job->known_entries);
         const Built built = g->quitting.load() || job->cancel.load() ? Built{} : build_library(request, "the window " + job->name, true, &job->urgent, &job->cancel, job->quick, job->upgrade);
         job->timing = built.timing;
@@ -572,7 +590,7 @@ void enqueue(const std::shared_ptr<BgJob> &job) {
 
 // A window with a quick library: the same code again with the normal flags, in the background. The game goes on meanwhile; at a frame
 // boundary the better library is switched in, and it runs from then on (dispatch.cpp, ranks).
-void queue_upgrade(std::uint32_t base, const std::string &name, std::vector<std::uint8_t> image) {
+void queue_upgrade(std::uint32_t base, const std::string &name, std::vector<std::uint8_t> image, bool sparse = false, std::vector<std::uint32_t> candidates = {}, std::vector<std::uint32_t> entries = {}) {
     if (!g->two_step || !g->background || !g->fast.count(name) || g->bg_failures >= 2) return;
     for (const std::shared_ptr<BgJob> &j : g->active)
         if (j->upgrade && j->name == name) return;
@@ -582,6 +600,9 @@ void queue_upgrade(std::uint32_t base, const std::string &name, std::vector<std:
     job->name = name;
     job->frame = ps2::frame_count();
     job->upgrade = true;
+    job->sparse = sparse;
+    job->candidates = std::move(candidates);
+    job->entries = std::move(entries);
     if (g->verbose) say("window 0x%08X (image %s): the quick library is in use, making it again with the normal flags in the background", base, name.c_str());
     enqueue(job);
 }
@@ -667,6 +688,29 @@ void take_finished() {
 // The emulation thread: the game needs code at pc, in the window at `base` that holds the image `name`. When a background build of
 // exactly this image is under way the game waits for it (it goes to normal priority meanwhile); one that has not started is not worth
 // waiting for. True when code for pc is there afterwards.
+// A window run with the game on the window thread (ps2::g_options.keep_alive is set) must go on taking window messages while the game waits
+// for a build of 15 to 35 s: otherwise Windows shows "not responding" after 5 s and ends the program when the player clicks the window
+// (the end of a Metal Gear Solid 3 run with --frames-dir at the stage change: no crash line, exit code 127 in Git Bash; nothing crashed).
+// The build then runs on a helper thread and this thread calls keep_alive about every 20 ms. Without keep_alive (the window has a thread of
+// its own, headless runs) the work simply runs here.
+template <class Work>
+auto while_pumping(Work &&work) -> decltype(work()) {
+    if (!ps2::g_options.keep_alive) return work();
+    using Result = decltype(work());
+    std::optional<Result> result;
+    std::atomic<bool> finished{false};
+    std::thread helper([&] {
+        result.emplace(work());
+        finished.store(true);
+    });
+    while (!finished.load()) {
+        ps2::g_options.keep_alive();
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    helper.join();
+    return std::move(*result);
+}
+
 bool use_background(std::uint32_t pc, std::uint32_t base, const std::string &name) {
     std::shared_ptr<BgJob> job;
     for (const std::shared_ptr<BgJob> &candidate : g->active)
@@ -686,7 +730,10 @@ bool use_background(std::uint32_t pc, std::uint32_t base, const std::string &nam
     if (job->state == kRunning) {
         job->urgent = true;
         say("no translated code at 0x%08X: the background translation of window 0x%08X (image %s) is under way for %.1f s, the game waits for it", pc, base, name.c_str(), lb::seconds_since(job->queued));
-        while (job->state.load() == kRunning) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        while (job->state.load() == kRunning) {
+            if (ps2::g_options.keep_alive) ps2::g_options.keep_alive();
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
     }
     take_finished();
     return ps2::has_code(pc);
@@ -782,7 +829,11 @@ void drop_stale_jobs() {
     for (std::size_t i = 0; i < g->active.size();) {
         const std::shared_ptr<BgJob> job = g->active[i];
         const std::uint32_t size = static_cast<std::uint32_t>(job->image.size());
-        const bool state_ok = job->state == kQueued || job->state == kRunning;
+        // An upgrade (the quick library's code again with the normal flags) is never stale: it is made from its own copy of the image, its
+        // result is checked word by word against the window whenever it is entered, and it only replaces a library that already serves
+        // this code. A game that keeps data inside the code's 16 KiB units (Metal Gear Solid 3's stage images) changes the window all the time,
+        // and before this the build of 60 to 90 s was ended every time, so that code stayed on the slower -O0 build for good.
+        const bool state_ok = (job->state == kQueued || job->state == kRunning) && !job->upgrade;
         if (state_ok && !job->cancel.load() && (recomp::window_extent(g_ram, kRamSize, job->base) != size || std::memcmp(g_ram + job->base, job->image.data(), size) != 0)) {
             job->cancel = true;
             if (job->state == kQueued) {
@@ -806,7 +857,11 @@ void drop_stale_jobs() {
 void prepare_in_background() {
     if (g->prepare_started) return;
     g->prepare_started = true;
-    g->prepare = std::thread([] { ensure_analysis(); });
+    g->prepare = std::thread([] {
+        crash::enter_thread(crash::Thread::LiveEe);
+        crash::test_poll(crash::Thread::LiveEe);
+        ensure_analysis();
+    });
 }
 
 void watch_windows() {
@@ -856,12 +911,17 @@ void frame_tick() {
 }
 
 void start(const std::string &program, const std::string &cache, const std::string &game_dir) {
+    const auto elf = read_file(ps2::os::path(program));
+    start(elf, cache, game_dir);
+}
+
+void start(std::span<const std::uint8_t> program, const std::string &cache, const std::string &game_dir) {
     if (g || cache.empty()) return;
     g = new State;
-    g->program = ps2::os::path(program);
+    g->program.assign(program.begin(), program.end());
     g->cache = ps2::os::path(cache);
     g->game_dir = ps2::os::path(game_dir);
-    const std::vector<std::uint8_t> elf = read_file(g->program);
+    const auto &elf = g->program;
     g->windows = recomp::code_windows(elf);
     g->segments = recomp::code_segments(elf);
     g->file_segments = recomp::file_segments(elf);
@@ -948,10 +1008,11 @@ void start(const std::string &program, const std::string &cache, const std::stri
 
 bool active() { return g && g->ready; }
 
+constexpr std::uint32_t kLoadedCap = 0x400000;   // the longest run of memory taken as a loaded program (loaded_run) or as the image of a segment
+
 // Code the game read from the disc into memory that its executable never mentions (Tekken 5: the boot program is a small loader, the game
 // proper is read to 0x001EA000 and called from there). There is no window and no segment to go by, so the run of non-empty 16 KiB units
 // around the address is the image, as for a window, only longer: such a program is 1 to 2 MiB with data between its code.
-constexpr std::uint32_t kLoadedCap = 0x400000;
 bool loaded_run(std::uint32_t pc, std::uint32_t &base, std::uint32_t &size) {
     constexpr std::uint32_t kUnit = recomp::kWindowUnit, kLowest = 0x00100000u;
     if (pc < kLowest || pc >= kRamSize || (pc & 3u)) return false;
@@ -979,6 +1040,145 @@ bool loaded_run(std::uint32_t pc, std::uint32_t &base, std::uint32_t &size) {
     base = begin;
     size = end - begin;
     return true;
+}
+
+// Words of memory that point into the image [base, base + size) at something that is not zero: possible function starts. A jump table
+// a data file brought in, a table of callbacks the game filled in at start-up, a function pointer in an object: none of them is in the
+// image, so the search of the image does not see them, and each was one stop of its own (Tekken 5: 918 of 1350). Only those that nothing
+// translated serves yet are of use.
+std::vector<std::uint32_t> pointers_into(std::uint32_t base, std::uint32_t size) {
+    std::vector<std::uint32_t> found;
+    for (std::uint32_t at = 0; at + 4 <= kRamSize; at += 4) {
+        std::uint32_t word;
+        std::memcpy(&word, g_ram + at, 4);
+        if (word - base < size && !(word & 3u)) found.push_back(word);
+    }
+    std::sort(found.begin(), found.end());
+    found.erase(std::unique(found.begin(), found.end()), found.end());
+    found.erase(std::remove_if(found.begin(), found.end(), [&](std::uint32_t target) {
+        std::uint32_t word;
+        std::memcpy(&word, g_ram + target, 4);
+        return word == 0 || ps2::has_code(target);
+    }), found.end());
+    return found;
+}
+
+// Keeps of the pointers the ones that can be the start of a function: the instruction before it is the delay slot of a `jr ra` (zero
+// padding between skipped), the way the code of a program is packed, or the `jr ra` itself when its delay slot is a nop. A pointer into the
+// middle of a function (a jump table, a return address, a number that looks like an address) is no entry: for the program's own code the
+// build has found its functions already (it looks at every word of the file), and what such a pointer would add is a copy of a function
+// body from the middle on, with everything that body calls.
+std::vector<std::uint32_t> function_starts(std::vector<std::uint32_t> pointers) {
+    constexpr std::uint32_t kJrRa = 0x03E00008u;
+    const auto word = [](std::uint32_t at) {
+        std::uint32_t w;
+        std::memcpy(&w, g_ram + at, 4);
+        return w;
+    };
+    pointers.erase(std::remove_if(pointers.begin(), pointers.end(), [&](std::uint32_t target) {
+        std::uint32_t at = target;
+        for (int pad = 0; pad < 9; ++pad) {
+            if (at < 8) return true;
+            at -= 4;
+            if (word(at)) return word(at) != kJrRa && word(at - 4) != kJrRa;
+        }
+        return true;
+    }), pointers.end());
+    return pointers;
+}
+
+// The image for code of the executable's segment [address, address + bytes) around `at`: all of the segment, or the longest stretch kLoadedCap
+// allows around `at` when it is bigger than that. At least two units, so that a short segment still has room for a function's tail.
+void segment_image(std::uint32_t address, std::uint32_t bytes, std::uint32_t at, std::uint32_t &base, std::uint32_t &size) {
+    const std::uint32_t first = address & ~3u, last = first + (bytes & ~3u);
+    base = first;
+    if (last - first > kLoadedCap) base = std::max(first, std::min((at & ~3u) > kLoadedCap / 2 ? (at & ~3u) - kLoadedCap / 2 : first, last - kLoadedCap));
+    size = std::min<std::uint32_t>(std::min(kLoadedCap, last - base), kRamSize - base);
+    if (size < 2 * recomp::kWindowUnit) size = std::min<std::uint32_t>(2 * recomp::kWindowUnit, kRamSize - base);
+}
+
+// The targets of the calls and jumps (jal, j) of the image that point into the image and that something translated already serves
+// (the build, a library made earlier, in place now). A translation of a miss in the program's own code leaves them alone: they stay
+// calls through the dispatcher, and the library holds what is new, not the whole call tree below the one function that was missed.
+std::vector<std::uint32_t> served_calls(const std::vector<std::uint8_t> &image, std::uint32_t base) {
+    std::vector<std::uint32_t> targets;
+    for (std::size_t at = 0; at + 4 <= image.size(); at += 4) {
+        std::uint32_t word;
+        std::memcpy(&word, image.data() + at, 4);
+        if ((word >> 26) != 2u && (word >> 26) != 3u) continue;
+        const std::uint32_t target = ((base + static_cast<std::uint32_t>(at) + 4u) & 0xF0000000u) | ((word & 0x03FFFFFFu) << 2);
+        if (target - base < image.size()) targets.push_back(target);
+    }
+    std::sort(targets.begin(), targets.end());
+    targets.erase(std::unique(targets.begin(), targets.end()), targets.end());
+    targets.erase(std::remove_if(targets.begin(), targets.end(), [](std::uint32_t t) { return !ps2::has_code(t); }), targets.end());
+    return targets;
+}
+
+// A translation of the program's own segment: its code is the stretch the program's analysis reached, the rest of the segment is data
+// (tables, strings, the game's variables), and a word of memory that points into the data is a number, not a function. What is served
+// already is left alone (served_calls). The checks are the first words of the entries, as for any image with data between its code: a
+// guess that was data and is rewritten takes only its own entry out.
+void limit_to_new_code(recomp::LiveRequest &request) {
+    ensure_analysis();
+    if (g->program_analysis) {
+        const auto [begin, end] = g->program_analysis->code_range();
+        request.text_begin = begin;
+        request.text_end = end;
+    }
+    request.sparse_checks = true;
+    request.served = served_calls(request.image, request.base);
+}
+
+// Functions of the program itself that a translated image calls (jal, j) and nothing translated serves. The build never reached them,
+// because only this code calls them (Tekken 5: the loader program's library, called by the game it loads: 47 stops of 0.2 to 1 s).
+// They are translated right after the image, in one more library, instead of one stop each; their addresses go to entries.txt.
+void translate_program_calls(const std::vector<std::uint8_t> &image, std::uint32_t base) {
+    std::map<std::size_t, std::vector<std::uint32_t>> by_segment;
+    for (std::size_t at = 0; at + 4 <= image.size(); at += 4) {
+        std::uint32_t word;
+        std::memcpy(&word, image.data() + at, 4);
+        if ((word >> 26) != 2u && (word >> 26) != 3u) continue;
+        const std::uint32_t target = ((base + static_cast<std::uint32_t>(at) + 4u) & 0xF0000000u) | ((word & 0x03FFFFFFu) << 2);
+        if (target - base < image.size()) continue;
+        for (std::size_t k = 0; k < g->segments.size(); ++k)
+            if (target - g->segments[k].first < g->segments[k].second) {
+                by_segment[k].push_back(target);
+                break;
+            }
+    }
+    for (auto &[k, targets] : by_segment) {
+        std::sort(targets.begin(), targets.end());
+        targets.erase(std::unique(targets.begin(), targets.end()), targets.end());
+        targets.erase(std::remove_if(targets.begin(), targets.end(), [](std::uint32_t t) { return ps2::has_code(t); }), targets.end());
+        while (!targets.empty()) {
+        std::uint32_t seg_base = 0, seg_size = 0;
+        segment_image(g->segments[k].first, g->segments[k].second, targets.front(), seg_base, seg_size);
+        std::vector<std::uint32_t> mine;
+        for (const std::uint32_t t : targets)
+            if (t - seg_base < seg_size) mine.push_back(t);
+        if (mine.empty()) break;   // cannot happen: the first target is inside the image taken around it
+        targets.erase(std::remove_if(targets.begin(), targets.end(), [&](std::uint32_t t) { return t - seg_base < seg_size; }), targets.end());
+        recomp::LiveRequest request;
+        request.base = seg_base;
+        request.image.assign(g_ram + seg_base, g_ram + seg_base + seg_size);
+        request.name = "main_" + recomp::window_name(request.base, request.image.data(), request.image.size());
+        request.focused = true;
+        request.entries = mine;
+        request.candidates = function_starts(pointers_into(request.base, static_cast<std::uint32_t>(request.image.size())));
+        limit_to_new_code(request);
+        const auto began = Clock::now();
+        const Built built = while_pumping([&] { return build_library(request, "functions of the program that " + std::to_string(mine.size()) + " calls reach", false, nullptr, nullptr); });
+        std::size_t modules = 0;
+        if (!built.ok || !load_library(built.library, modules, 1)) {
+            if (!built.why.empty()) say("%s", built.why.c_str());
+            continue;
+        }
+        say("switched in %zu functions of the program that the image calls: %.1f s (translate %.1f, compile %.1f, link %.1f), %zu instructions, %zu files", mine.size(), lb::seconds_since(began), built.timing.generate, built.timing.compile,
+            built.timing.link, built.generated.code, built.files);
+        remember(request.name, request.base, request.image, mine, true);
+        }
+    }
 }
 
 bool translate_missing(std::uint32_t pc) {
@@ -1016,8 +1216,9 @@ bool translate_missing(std::uint32_t pc) {
     if (!found)
         for (const auto &[address, bytes] : g->segments)
             if (pc - address < bytes) {
-                base = pc & ~(recomp::kWindowUnit - 1);
-                size = std::min<std::uint32_t>(2 * recomp::kWindowUnit, kRamSize - base);
+                // The whole segment is the image: pointers found in memory (pointers_into) can name any function of it, and one stop then
+                // translates all that the game has pointed at so far, not just the missed one.
+                segment_image(address, bytes, pc, base, size);
                 found = region = true;
                 break;
             }
@@ -1025,7 +1226,18 @@ bool translate_missing(std::uint32_t pc) {
     if (!found && loaded_run(pc, base, size)) found = flat = true;
     if (!found) {
         g->failed.insert(pc);
-        say("no translated code at 0x%08X, and it is in none of the %zu code windows, not in the code of the program and not in memory the game loaded: the game stops", pc, g->windows.size());
+        // Say why loaded_run turned it down (a log of a tester is all that is known of such a stop: Tekken 5, issue 42) and which
+        // translated modules know the address, whether in place or not.
+        std::uint32_t words = 0;
+        const std::uint32_t unit = pc & ~(recomp::kWindowUnit - 1);
+        if (pc < kRamSize && unit + recomp::kWindowUnit <= kRamSize)
+            for (std::uint32_t i = 0; i < recomp::kWindowUnit; i += 4) {
+                std::uint32_t word;
+                std::memcpy(&word, g_ram + unit + i, 4);
+                words += word != 0;
+            }
+        say("no translated code at 0x%08X, and it is in none of the %zu code windows, not in the code of the program and not in memory the game loaded: the game stops (%u of %u words of memory in the 16 KiB at 0x%08X are not zero; %s)", pc,
+            g->windows.size(), words, recomp::kWindowUnit / 4u, unit, ps2::module_report(pc).c_str());
         return false;
     }
     std::vector<std::uint8_t> image(g_ram + base, g_ram + base + size);
@@ -1041,6 +1253,7 @@ bool translate_missing(std::uint32_t pc) {
     // translating all of it again for that costs seconds. One that was not (the build has a module of the same code, made from the
     // entry points it knew) is looked through completely this time.
     const bool whole_done = g->whole.count(name) != 0 || (flat && g->flat_started.count(base) != 0);
+    if (g->verbose) say("miss 0x%08X: %s", pc, ps2::module_report(pc).c_str());
     if (region) say("no translated code at 0x%08X (the program's own code, not reached by the build): translating it now, the game waits", pc);
     else say("no translated code at 0x%08X (%s 0x%08X, image %s, %u KiB): translating it now, the game waits", pc, flat ? "loaded code at" : "window", base, name.c_str(), size / 1024);
 
@@ -1051,6 +1264,12 @@ bool translate_missing(std::uint32_t pc) {
     static const bool force_focus = !ps2::os::env("PS2_EE_LIVE_FOCUS").empty();   // debugging: every miss translates only what it reaches
     request.focused = region || whole_done || force_focus;
     request.sparse_checks = flat;
+    if (region) limit_to_new_code(request);
+    const auto pointers_began = Clock::now();
+    request.candidates = pointers_into(base, size);
+    if (g->verbose && region) say("%zu pointers into the program's code, %zu of them follow a return", request.candidates.size(), function_starts(request.candidates).size());
+    if (region) request.candidates = function_starts(std::move(request.candidates));
+    const double pointers_s = lb::seconds_since(pointers_began);
     // The first translation of a whole window is the long one: it is compiled with little optimisation (the game waits for it), and the
     // same code is made again with the normal flags in the background afterwards. Single functions (the focused ones) are small: normal flags.
     const bool quick = !request.focused && g->two_step;
@@ -1073,7 +1292,7 @@ bool translate_missing(std::uint32_t pc) {
         return false;
     };
 
-    const Built built = build_library(request, "0x" + lb::hex(pc, 8), false, nullptr, nullptr, quick);
+    const Built built = while_pumping([&] { return build_library(request, "0x" + lb::hex(pc, 8), false, nullptr, nullptr, quick); });
     if (!built.ok) {
         if (!built.why.empty()) say("%s", built.why.c_str());
         return fail("the game stops");
@@ -1089,8 +1308,10 @@ bool translate_missing(std::uint32_t pc) {
         say("the stop in parts: program analysis %.2f s, analysis of the window %.2f s, writing C++ %.2f s, compile %.2f s (processor time %.1f s, the longest compiler %.2f s, %zu files), link %.2f s, load %.2f s, the rest %.2f s",
             entries_s, built.generated.analyse_s, built.generated.codegen_s, built.timing.compile, built.timing.cpu, built.timing.longest, built.files, built.timing.link, lb::seconds_since(load_began),
             lb::seconds_since(began) - entries_s - built.timing.generate - built.timing.compile - built.timing.link - lb::seconds_since(load_began));
-    say("switched in after %.1f s%s (translate %.1f, compile %.1f, link %.1f): %zu entry points%s%s, %zu instructions, %zu files", lb::seconds_since(began), quick ? " (quick)" : "", built.timing.generate, built.timing.compile, built.timing.link,
-        built.generated.accepted.size(), static_calls ? " (calls of the program included)" : "", known_entries ? " (entries.txt included)" : "", built.generated.code, built.files);
+    say("switched in after %.1f s%s (translate %.1f, compile %.1f, link %.1f): %zu entry points%s%s, %zu pointers found in memory, %zu instructions, %zu files", lb::seconds_since(began), quick ? " (quick)" : "", built.timing.generate, built.timing.compile, built.timing.link,
+        built.generated.accepted.size(), static_calls ? " (calls of the program included)" : "", known_entries ? " (entries.txt included)" : "", request.candidates.size(), built.generated.code, built.files);
+    if (g->verbose) say("looking for pointers in memory took %.3f s", pointers_s);
+    if (!region) translate_program_calls(image, base);
     if (flat) g->flat_started.insert(base);
     if (!request.focused) {
         g->whole.insert(name);
@@ -1098,7 +1319,7 @@ bool translate_missing(std::uint32_t pc) {
         write_marker(name, quick);
     }
     if (!flat) remember(name, base, image, {pc}, region);   // a loaded program is not an overlay of the build: eerecomp checks those word for word
-    if (quick) queue_upgrade(base, name, std::move(image));
+    if (quick) queue_upgrade(base, name, std::move(image), flat, std::move(request.candidates), std::move(request.entries));
     return true;
 }
 

@@ -72,11 +72,12 @@ double recent_fps(double seconds, double &last_frame_ago) {
 
 // One folder holds the three kinds of files: states\, reports\ and logs\. Next to the memory card file, since every way of
 // starting a game passes --memcard (the app's Play button, the desktop shortcut, play.py), so a card and its saves stay together
-// and each game has its own. Without a card: next to the program. --quick-dir names it explicitly.
+// and each game has its own. Without a card: in the game folder, else next to the program. --quick-dir names it explicitly.
 fs::path base_dir() {
     fs::path base;
     if (!g_options.quick_dir.empty()) base = os::path(g_options.quick_dir);
     else if (!g_options.memcard_path.empty()) base = os::path(g_options.memcard_path).parent_path();
+    else if (!g_options.game_dir.empty()) base = os::path(g_options.game_dir);
     else if (!g_options.program_path.empty()) base = os::path(g_options.program_path).parent_path();
     if (base.empty()) base = ".";
     std::error_code error;
@@ -113,29 +114,11 @@ fs::path with_suffix(fs::path p, const char *suffix) {
 
 // ---- files ----
 
-// The finished file appears in one step: the bytes go to "<file>.tmp", which replaces the target. A reader (F8, another program)
-// never sees half a file, and a crash in the middle leaves no broken state behind.
+// The finished file appears in one step (os::replace_file in ps2/os.hpp): the bytes go to "<file>.tmp", are forced to the disk, and
+// the finished file then replaces the target, with a few retries when a virus scanner holds it for a moment. A reader (F8, another
+// program) never sees half a file, and a crash in the middle leaves no broken state behind.
 bool write_whole(const fs::path &target, const void *data, std::size_t size, std::string &why) {
-    const fs::path temp = with_suffix(target, ".tmp");
-    std::error_code error;
-    {
-        std::ofstream out(temp, std::ios::binary | std::ios::trunc);
-        if (out) out.write(static_cast<const char *>(data), static_cast<std::streamsize>(size));
-        if (out) out.flush();
-        if (!out) {
-            why = "cannot write " + os::utf8(temp);
-            out.close();
-            fs::remove(temp, error);
-            return false;
-        }
-    }
-    fs::rename(temp, target, error);
-    if (error) {
-        why = "cannot replace " + os::utf8(target) + ": " + error.message();
-        fs::remove(temp, error);
-        return false;
-    }
-    return true;
+    return os::replace_file(os::utf8(target), data, size, &why);
 }
 
 bool read_whole(const fs::path &file, std::vector<std::uint8_t> &out) {
@@ -346,11 +329,14 @@ void record_start(const fs::path &file, const fs::path &state, CardAt card_at) {
     g_rec.buffer = "ps2-inputs 1\ncheck-every " + std::to_string(kCheckEvery) + " slices " + std::to_string(kSlices) + "\n";
     g_rec.buffer += std::string("pal ") + (g_options.pal ? "1" : "0") + "\n";
     if (!g_options.program_path.empty()) g_rec.buffer += "program " + g_options.program_path + "\n";
+    if (g_options.disc_program) g_rec.buffer += "disc-program 1\n";
+    if (!g_options.game_dir.empty()) g_rec.buffer += "game-dir " + g_options.game_dir + "\n";
     if (!g_options.disc_path.empty()) g_rec.buffer += "disc " + g_options.disc_path + "\n";
     if (state.empty()) g_rec.buffer += "start power-on frame 0\n";
     else g_rec.buffer += "start state " + os::utf8(state.filename()) + " frame " + std::to_string(g_frames) + "\n";
     g_rec.buffer += "recorded " + stamp() + "\n";
     if (g_options.rtc_epoch) g_rec.buffer += "rtc " + std::to_string(g_options.rtc_epoch) + "\n";
+    g_rec.buffer += "pace " + std::to_string(kernel::pace_every()) + "\n";  // refreshes per picture (ps2/pace.hpp); a replay holds the game the same way
     const char *card_line = "card none\n";
     if (!g_options.memcard_path.empty()) {
         if (card_at == CardAt::state) {
@@ -580,7 +566,8 @@ bool looks_like_state(const std::vector<std::uint8_t> &data) {
     std::uint32_t version = 0;
     std::memcpy(&version, data.data() + sizeof kStateMagic, sizeof version);
     static const char kEnd[8] = {'e', 'n', 'd', 0, 0, 0, 0, 0};
-    return (version == kStateVersion || version == 4) && std::memcmp(data.data() + data.size() - 8, kEnd, 8) == 0;  // 4: before the HLE replies
+    // 4: before the HLE replies; every version machine_state() can load is accepted, so quick saves made before an update still load
+    return version >= 4 && version <= kStateVersion && std::memcmp(data.data() + data.size() - 8, kEnd, 8) == 0;
 }
 
 // A state does not hold the memory card, so a quick save has a copy of the card beside it (<state>.ps2). Loading a state never
@@ -848,6 +835,19 @@ std::string report_info(bool emergency, const fs::path &dir, bool has_state, boo
     t += "    log.txt            the last lines of the runner's log\n";
     if (has_state) t += "\nsave state size: " + megabytes(state_bytes) + "\n";
     if (emergency) t += "\nThe emulation did not answer F9 within " + std::to_string(kGiveUpMs / 1000) + " seconds, so this report was written by the window.\nThe game is probably hanging inside the runner.\n";
+    t += "\nsound (what the sound chip did):\n" + iop::spu2::summary();
+    // The thread lists are read on this thread, between two instructions. An emergency report is written by the window while the
+    // emulation is stuck, where the maps could be half changed, so it gets none.
+    t += "\nthreads (what each game thread waits for):\n";
+    if (emergency) {
+        t += "    (not listed: the emulation did not answer, so the lists could not be read safely)\n";
+    } else {
+        t += "    reading: " + kernel::thread_summary() + "\n";
+        t += "    reading: " + iop::thread_summary() + "\n";
+        t += kernel::thread_report() + iop::thread_report();
+        const std::string calls = sif::open_calls_text();
+        t += calls.empty() ? std::string("    no RPC call the EE sent is waiting for a reply\n") : calls;
+    }
     const std::string first = g_options.first_log ? g_options.first_log(80) : std::string();
     const std::string startup = pick_lines(first, {"[gpu]", "[window]", "[audio] sound device", "[pad]"});
     t += "\nfrom the start of the log:\n" + (startup.empty() ? std::string("    (not captured)\n") : startup);
@@ -1017,6 +1017,7 @@ bool replay_begin() {
     quick::Replay &r = quick::g_rep;
     char line[256];
     bool magic = false;
+    unsigned pace_every = 1;  // a recording without a 'pace' line was made before the picture pace existed: off
     while (std::fgets(line, sizeof line, f)) {
         unsigned long long frame = 0, begin = 0;
         unsigned buttons, a0, a1, a2, a3, l2, r2, conn;
@@ -1042,6 +1043,8 @@ bool replay_begin() {
             r.end = std::max<std::uint64_t>(r.end, frame);
         } else if (std::sscanf(line, "start state %199s frame %llu", name, &begin) == 2 || std::sscanf(line, "start power-on frame %llu", &begin) == 1) {
             r.began = begin;
+        } else if (std::sscanf(line, "pace %u", &a0) == 1 && a0 >= 1 && a0 <= 8) {
+            pace_every = a0;
         } else if (std::sscanf(line, "rtc %llu", &begin) == 1) {
             if (!g_options.rtc_epoch) g_options.rtc_epoch = begin;  // the clock the game read when this was recorded (--rtc wins)
         } else if (std::sscanf(line, "check-every %u slices %u", &a0, &a1) == 2 && a0 == quick::kCheckEvery && a1 >= 1 && a1 <= 4096 && kRamSize % a1 == 0) {
@@ -1055,6 +1058,7 @@ bool replay_begin() {
         return false;
     }
     r.active = true;
+    if (static_cast<int>(pace_every) != kernel::pace_every()) kernel::pace_setup(static_cast<int>(pace_every), "as the recording was made");
     std::fprintf(stderr, "[replay] %s: frames %llu to %llu, %zu checkpoints\n", g_options.replay_path.c_str(), static_cast<unsigned long long>(r.began),
                  static_cast<unsigned long long>(r.end), r.checks.size());
     return true;

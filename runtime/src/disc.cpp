@@ -1,6 +1,8 @@
 #include "ps2/disc.hpp"
+#include "ps2/disc_bundle.hpp"
 #include "ps2/hitch.hpp"
 #include "ps2/os.hpp"
+#include "disc_folder.hpp"
 #include "load_stats.hpp"
 
 #include <algorithm>
@@ -8,6 +10,8 @@
 #include <cstdio>
 #include <cstring>
 #include <map>
+#include <set>
+#include <string_view>
 
 namespace ps2::disc {
 
@@ -19,6 +23,13 @@ Probe g_probe;
 std::uint64_t g_size = 0;
 std::uint32_t g_layer1 = 0;
 std::map<std::string, Entry> g_index;
+// A two-layer disc has a file system on each layer, often with the same paths in both. The plain search (cdvdman's sceCdSearchFile,
+// fileio's cdrom0:) reads layer 0's only, so g_index keeps layer 0's entry when both have a path; g_index1 holds layer 1's entries for
+// sceCdLayerSearchFile with layer 1 (ps2sdk cdvdman.c, AFL-2.0: sceCdSearchFile is sceCdLayerSearchFile(..., 0), and only layer 1 adds
+// the layer's start). Before 2026-11-10 layer 1's entry replaced layer 0's, and Champions of Norrath (public issue 57) got the layer 1
+// copy of \BG\DATA, read its directory (whose sectors count from layer 1's start) and loaded its data from the wrong layer.
+std::map<std::string, Entry> g_index1;
+bool g_walking_layer1 = false;
 bool g_indexed = false;  // the reads while the file system is being read are not the game's
 
 std::uint32_t u32(const std::uint8_t *p) {
@@ -32,8 +43,20 @@ std::string upper(std::string s) {
     return s;
 }
 
-void walk(std::uint32_t base, std::uint32_t lba, std::uint32_t size, const std::string &prefix, int depth) {
+// The image is untrusted (a damaged rip, or a crafted file): a directory that cannot be right is left out with one line, never
+// read past its buffer. No real directory is near this size (a record is at least 34 bytes: 16 MiB is half a million names).
+constexpr std::uint32_t kMaxDirectory = 16u << 20;
+
+void damaged(const std::string &prefix, std::uint32_t sector, const char *why) {
+    static int lines = 0;
+    if (lines++ < 20) std::fprintf(stderr, "[disc] damaged directory '%s' at sector %u: %s (left out)\n", prefix.c_str(), sector, why);
+}
+
+void walk(std::uint32_t base, std::uint32_t lba, std::uint32_t size, const std::string &prefix, int depth, std::set<std::uint64_t> &seen) {
     if (depth > 16) return;
+    // A directory that points back at itself or at a parent would be walked again and again: each extent is walked once.
+    if (!seen.insert(std::uint64_t{base} + lba).second) return;
+    if (size > kMaxDirectory) return damaged(prefix, base + lba, "too large");
     std::vector<std::uint8_t> data((size + kSector - 1) / kSector * kSector);
     if (!read(base + lba, static_cast<std::uint32_t>(data.size() / kSector), data.data())) return;
     std::size_t off = 0;
@@ -43,9 +66,15 @@ void walk(std::uint32_t base, std::uint32_t lba, std::uint32_t size, const std::
             off = (off / kSector + 1) * kSector;
             continue;
         }
+        // ISO 9660 (ECMA-119 9.1): a directory record is 33 bytes plus the name (at least one byte), all inside the directory.
+        if (length < 34 || off + length > data.size()) return damaged(prefix, base + lba, "a record runs past its end");
         const std::uint8_t *rec = &data[off];
         off += length;
         const std::uint8_t name_len = rec[32];
+        if (33u + name_len > length) {
+            damaged(prefix, base + lba, "a name runs past its record");
+            continue;
+        }
         std::string name(reinterpret_cast<const char *>(rec + 33), name_len);
         if (name_len == 1 && (name[0] == 0 || name[0] == 1)) continue;
         const auto semi = name.find(';');
@@ -53,15 +82,28 @@ void walk(std::uint32_t base, std::uint32_t lba, std::uint32_t size, const std::
         const std::string path = prefix + upper(name);
         const bool dir = rec[25] & 2;
         const Entry entry{base + u32(rec + 2), u32(rec + 10), dir};
-        g_index[path] = entry;
-        if (dir) walk(base, u32(rec + 2), u32(rec + 10), path + "/", depth + 1);
+        if (g_walking_layer1) {
+            g_index1[path] = entry;
+            g_index.emplace(path, entry);  // layer 0's entry wins
+        } else {
+            g_index[path] = entry;
+        }
+        if (dir) walk(base, u32(rec + 2), u32(rec + 10), path + "/", depth + 1, seen);
     }
 }
 
 void index_layer(std::uint32_t pvd_sector, std::uint32_t base) {
     std::uint8_t pvd[kSector];
     if (!read(pvd_sector, 1, pvd) || std::memcmp(pvd, "\x01" "CD001", 6) != 0) return;
-    walk(base, u32(pvd + 158), u32(pvd + 166), "", 0);
+    const std::uint32_t root_lba = u32(pvd + 158);
+    std::uint32_t root_size = u32(pvd + 166);
+    if (root_size < 34) {
+        std::uint8_t sec[kSector];
+        if (read(base + root_lba, 1, sec) && sec[0] >= 34 && u32(sec + 2) == root_lba)
+            root_size = u32(sec + 10);
+    }
+    std::set<std::uint64_t> seen;
+    walk(base, root_lba, root_size, "", 0, seen);
 }
 
 void self_check();
@@ -69,31 +111,49 @@ void self_check();
 }
 
 bool open(const std::string &path) {
-    g_file = os::open(path, "rb");
-    if (!g_file) return false;
+    if ((path == kBundleSentinel && open_bundle(path)) || open_folder(path) || open_bundle(path)) {
+        if (g_file) {
+            std::fclose(g_file);
+            g_file = nullptr;
+        }
+        return true;
+    }
+    std::FILE *file = os::open(path, "rb");
+    if (!file) return false;
 #if defined(_WIN32)
-    _fseeki64(g_file, 0, SEEK_END);
-    const std::uint64_t size = static_cast<std::uint64_t>(_ftelli64(g_file));
+    const long long end = _fseeki64(file, 0, SEEK_END) == 0 ? _ftelli64(file) : -1;
 #else
-    fseeko(g_file, 0, SEEK_END);
-    const std::uint64_t size = static_cast<std::uint64_t>(ftello(g_file));
+    const long long end = fseeko(file, 0, SEEK_END) == 0 ? static_cast<long long>(ftello(file)) : -1;
 #endif
-    std::FILE *file = g_file;
-    return open(path, size, [file](std::uint64_t offset, void *out, std::size_t bytes) {
+    if (end < 0) {
+        std::fprintf(stderr, "[disc] %s: cannot find the size of the image\n", path.c_str());
+        std::fclose(file);
+        return false;
+    }
+    // A second image (a disc swap) replaces the first: its file is closed once the reader no longer uses it, so it is neither
+    // leaked nor kept locked.
+    std::FILE *previous = g_file;
+    g_file = file;
+    const bool opened = open(path, static_cast<std::uint64_t>(end), [file](std::uint64_t offset, void *out, std::size_t bytes) -> std::size_t {
+        // A failed seek reads nothing (read() then says "short read") instead of the sectors at the old position.
 #if defined(_WIN32)
-        _fseeki64(file, static_cast<long long>(offset), SEEK_SET);
+        if (_fseeki64(file, static_cast<long long>(offset), SEEK_SET) != 0) return 0;
 #else
-        fseeko(file, static_cast<off_t>(offset), SEEK_SET);
+        if (fseeko(file, static_cast<off_t>(offset), SEEK_SET) != 0) return 0;
 #endif
         return std::fread(out, 1, bytes, file);
     });
+    if (previous) std::fclose(previous);
+    return opened;
 }
 
 bool open(const std::string &name, std::uint64_t size, Reader reader, Probe probe) {
     g_reader = std::move(reader);
     g_probe = std::move(probe);
     g_size = size;
+    g_layer1 = 0;  // a second image without a second layer must not keep the first one's
     g_index.clear();
+    g_index1.clear();
     g_indexed = false;
     index_layer(16, 0);
     std::uint8_t pvd[kSector];
@@ -103,7 +163,9 @@ bool open(const std::string &name, std::uint64_t size, Reader reader, Probe prob
         std::uint8_t probe[kSector];
         if (read(s, 1, probe) && std::memcmp(probe, "\x01" "CD001", 6) == 0) {
             g_layer1 = s - 16;
+            g_walking_layer1 = true;
             index_layer(s, g_layer1);
+            g_walking_layer1 = false;
             break;
         }
     }
@@ -171,7 +233,8 @@ bool ready(std::uint32_t sector, std::uint32_t count) {
     return !g_probe || g_probe(static_cast<std::uint64_t>(sector) * kSector, static_cast<std::size_t>(count) * kSector);
 }
 
-std::optional<Entry> find(const std::string &raw) {
+namespace {
+std::string index_key(const std::string &raw) {
     std::string path = raw;
     const auto colon = path.find(':');
     if (colon != std::string::npos) path = path.substr(colon + 1);
@@ -179,9 +242,95 @@ std::optional<Entry> find(const std::string &raw) {
     const auto semi = path.find(';');
     if (semi != std::string::npos) path = path.substr(0, semi);
     while (!path.empty() && path.front() == '/') path.erase(path.begin());
-    auto it = g_index.find(upper(path));
+    return upper(path);
+}
+}
+
+std::optional<Entry> find(const std::string &raw) {
+    auto it = g_index.find(index_key(raw));
     if (it == g_index.end()) return std::nullopt;
     return it->second;
+}
+
+std::optional<Entry> find(const std::string &raw, int layer) {
+    if (layer != 0) {
+        const auto it = g_index1.find(index_key(raw));
+        if (it != g_index1.end()) return it->second;
+    }
+    return find(raw);  // layer 0, a one-layer disc, or a path only layer 0 has (as before)
+}
+
+namespace {
+
+bool read_boot_file(const std::string &path, std::size_t limit, std::vector<std::uint8_t> &out, std::string &why) {
+    const auto entry = find(path);
+    if (!entry || entry->directory) {
+        why = path + ": file not found in the disc image";
+        return false;
+    }
+    const std::uint64_t offset = std::uint64_t{entry->sector} * kSector;
+    if (!entry->size || entry->size > limit || offset > g_size || entry->size > g_size - offset) {
+        why = path + ": empty, too large or outside the disc image";
+        return false;
+    }
+    out.resize(entry->size);
+    // Boot is host I/O. Guest read() pads short sector reads with zeroes; here every file byte must be present.
+    if (g_reader(offset, out.data(), out.size()) != out.size()) {
+        out.clear();
+        why = path + ": short read from the disc image";
+        return false;
+    }
+    return true;
+}
+
+std::string_view trim_boot_value(std::string_view text) {
+    const auto begin = text.find_first_not_of(" \t\r\n");
+    return begin == std::string_view::npos ? std::string_view{} : text.substr(begin, text.find_last_not_of(" \t\r\n") - begin + 1);
+}
+
+}
+
+bool read_boot_elf(std::string &program, std::vector<std::uint8_t> &elf, std::string &why) {
+    program.clear();
+    elf.clear();
+    why.clear();
+    if (!is_open()) {
+        why = "no disc image is open";
+        return false;
+    }
+    // These are host allocation limits for untrusted file metadata, not PS2 hardware limits.
+    std::vector<std::uint8_t> cnf;
+    if (!read_boot_file("SYSTEM.CNF", 64u << 10, cnf, why)) return false;
+    std::string_view text(reinterpret_cast<const char *>(cnf.data()), cnf.size());
+    if (text.starts_with("\xEF\xBB\xBF")) text.remove_prefix(3);
+    text = text.substr(0, text.find('\0'));  // tolerate a padded configuration file
+    while (!text.empty()) {
+        const auto end = text.find('\n');
+        const auto line = text.substr(0, end);
+        text = end == std::string_view::npos ? std::string_view{} : text.substr(end + 1);
+        const auto equal = line.find('=');
+        if (equal == std::string_view::npos || upper(std::string(trim_boot_value(line.substr(0, equal)))) != "BOOT2") continue;
+        const auto value = trim_boot_value(line.substr(equal + 1));
+        const auto colon = value.find(':');
+        if (value.empty() || (colon != std::string_view::npos && upper(std::string(value.substr(0, colon))) != "CDROM0")) {
+            why = "SYSTEM.CNF: BOOT2 must name a file on cdrom0";
+            return false;
+        }
+        const std::string path(value);
+        std::vector<std::uint8_t> bytes;
+        if (!read_boot_file(path, 128u << 20, bytes, why)) return false;
+        if (bytes.size() < 52 || std::memcmp(bytes.data(), "\x7F" "ELF\x01\x01", 6) != 0) {
+            why = path + ": not a little endian ELF32 file";
+            return false;
+        }
+        program = path;
+        if (colon == std::string_view::npos)
+            program = std::string("cdrom0:") + ((path.front() == '\\' || path.front() == '/') ? "" : "\\") + path;
+        elf = std::move(bytes);
+        return true;
+    }
+    why = "SYSTEM.CNF does not name a BOOT2 program";
+    return false;
 }
 
 std::uint32_t layer1_start() { return g_layer1; }

@@ -58,27 +58,45 @@ std::vector<std::pair<std::uint32_t, std::uint32_t>> checks_for_window(const Snr
     return checks;
 }
 
-std::vector<std::pair<std::uint32_t, std::uint32_t>> entry_head_checks(const Snr2Module &o, const Program &program) {
-    std::set<std::uint32_t> offsets;
-    for (const std::uint32_t entry : program.entries) {
-        if (!program.is_code(entry) || entry < o.base || entry - o.base >= o.size) continue;
+HeadChecks entry_head_checks(const Snr2Module &o, const Program &program) {
+    const auto word_at = [&](std::uint32_t at) {
+        std::uint32_t word = 0;
+        std::memcpy(&word, o.bytes.data() + at, 4);
+        return word;
+    };
+    // The words that belong to the first words of an entry (up to its return and the delay slot of that, at most 16).
+    const auto head = [&](std::uint32_t entry) {
+        std::vector<std::uint32_t> offsets;
         bool after_return = false;
         for (std::uint32_t k = 0; k < 16; ++k) {
             const std::uint32_t at = entry - o.base + 4 * k;
             if (at + 4 > o.size || !program.is_code(o.base + at)) break;
-            offsets.insert(at);
-            std::uint32_t word = 0;
-            std::memcpy(&word, o.bytes.data() + at, 4);
+            offsets.push_back(at);
             if (after_return) break;                  // the delay slot of the return
-            after_return = word == 0x03E00008u;       // jr ra
+            after_return = word_at(at) == 0x03E00008u;       // jr ra
         }
-    }
-    std::vector<std::pair<std::uint32_t, std::uint32_t>> checks;
-    checks.reserve(offsets.size());
-    for (const std::uint32_t at : offsets) {
-        std::uint32_t word = 0;
-        std::memcpy(&word, o.bytes.data() + at, 4);
-        checks.emplace_back(at, word);
+        return offsets;
+    };
+    const auto inside = [&](std::uint32_t entry) { return program.is_code(entry) && entry >= o.base && entry - o.base < o.size; };
+    std::set<std::uint32_t> offsets;
+    for (const std::uint32_t entry : program.entries)
+        if (inside(entry) && !program.weak.count(entry))
+            for (const std::uint32_t at : head(entry)) offsets.insert(at);
+    HeadChecks checks;
+    checks.hard.reserve(offsets.size());
+    for (const std::uint32_t at : offsets) checks.hard.emplace_back(at, word_at(at));
+    for (const std::uint32_t entry : program.weak) {
+        if (!inside(entry)) continue;
+        std::vector<std::uint32_t> mine;
+        for (const std::uint32_t at : head(entry))
+            if (!offsets.count(at)) mine.push_back(at);   // words a hard entry checks anyway are proven there
+        if (mine.empty()) continue;
+        checks.soft.push_back(entry - o.base);
+        checks.soft.push_back(static_cast<std::uint32_t>(mine.size()));
+        for (const std::uint32_t at : mine) {
+            checks.soft.push_back(at);
+            checks.soft.push_back(word_at(at));
+        }
     }
     return checks;
 }
@@ -197,13 +215,30 @@ std::string window_name(std::uint32_t base, const std::uint8_t *image, std::size
 
 // ---------------------------------------------------------------------------------------------------------------- live
 
-StaticProgram::StaticProgram(const std::string &elf_path, const std::vector<std::uint32_t> &entries) : image_(Image::load(elf_path)) {
+StaticProgram::StaticProgram(const std::string &elf_path, const std::vector<std::uint32_t> &entries)
+    : StaticProgram(Image::load(elf_path), entries) {}
+
+StaticProgram::StaticProgram(Image image, const std::vector<std::uint32_t> &entries) : image_(std::move(image)) {
     const Links imports = snr2_imports(image_);
     program_ = analyse(image_, entries, dynamic_sites(imports));
 }
 
 std::vector<std::uint32_t> StaticProgram::calls_into(std::uint32_t base, std::uint32_t size) const {
     return window_entries(image_, program_, base, size);
+}
+
+std::pair<std::uint32_t, std::uint32_t> StaticProgram::code_range() const {
+    std::uint32_t first = program_.end, last = program_.base;
+    for (std::uint32_t pc = program_.base; pc < program_.end; pc += 4)
+        if (program_.is_code(pc)) {
+            first = std::min(first, pc);
+            last = pc + 4;
+        }
+    if (image_.text().second > image_.text().first) {
+        first = std::min(first, image_.text().first);
+        last = std::max(last, image_.text().second);
+    }
+    return first < last ? std::pair<std::uint32_t, std::uint32_t>{first, last} : std::pair<std::uint32_t, std::uint32_t>{0, 0};
 }
 
 LiveResult generate_live(const LiveRequest &request, const std::filesystem::path &out_dir) {
@@ -218,13 +253,16 @@ LiveResult generate_live(const LiveRequest &request, const std::filesystem::path
         // code, translate it as a module that sits at a fixed base.
         // The text range is the whole window: with {0, size}, which is right for a module that sits at address 0, the search for function
         // starts stopped at the last place the entries reached, and a window's other functions were each found by a pause of their own.
-        const Image image = Image::raw(request.base, request.image, {request.base, request.base + size});
+        const bool code_only = request.text_end > request.text_begin;
+        const Image image = Image::raw(request.base, request.image, code_only ? std::pair{request.text_begin, request.text_end} : std::pair{request.base, request.base + size});
         // The first translation of an image looks through all of it (and takes every place after a return as a function start, so that the
         // short functions that only pointer tables name are there too: each missed one used to cost a pause of its own). A later one for an
         // image that is already in place translates just what the missed entry reaches, which is a fraction of the compile time.
         Search search;
         search.whole_image = !request.focused;
         search.after_return = !request.focused;
+        search.candidates = request.candidates;
+        search.served.insert(request.served.begin(), request.served.end());
         const auto began = std::chrono::steady_clock::now();
         Program program = analyse(image, request.entries, {}, search);
         result.analyse_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - began).count();
@@ -247,7 +285,16 @@ LiveResult generate_live(const LiveRequest &request, const std::filesystem::path
         o.size = size;
         o.base = request.base;
         o.name = request.name;
-        const std::vector<Translation> translations{{&image, &program, nullptr, request.prefix, false, request.name, size, request.sparse_checks ? entry_head_checks(o, program) : checks_for_window(o, program), true, request.base}};
+        std::vector<std::pair<std::uint32_t, std::uint32_t>> checks;
+        std::vector<std::uint32_t> soft;
+        if (request.sparse_checks) {
+            HeadChecks heads = entry_head_checks(o, program);
+            checks = std::move(heads.hard);
+            soft = std::move(heads.soft);
+        } else {
+            checks = checks_for_window(o, program);
+        }
+        const std::vector<Translation> translations{{&image, &program, nullptr, request.prefix, false, request.name, size, std::move(checks), true, request.base, std::move(soft)}};
         for (std::uint32_t pc = program.base; pc < program.end; pc += 4) result.code += program.is_code(pc);
         CodegenOptions options;
         options.output = ps2::os::utf8(out_dir);

@@ -1,4 +1,5 @@
 #include "hw.hpp"
+#include "ipu/ipu.hpp"
 #include "vu_micro.hpp"
 #include "ps2/memory.hpp"
 #include "ps2/system.hpp"
@@ -35,6 +36,7 @@ void init_watch() {
             g_watch_base = base & (kRamSize - 1);
             g_watch_end = g_watch_base + len;
             g_watch_on = true;
+            g_store_ram_end = 0;  // every guest store takes st*_other, which checks the watch
             std::fprintf(stderr, "[watch] writes to 0x%08X..0x%08X will print\n", g_watch_base, g_watch_end);
         }
     }
@@ -54,6 +56,76 @@ void watch_hit(std::uint32_t a, std::uint32_t v, const char *via) {
         for (int i = 16; i < 24; ++i) std::fprintf(stderr, " %08X", g_cpu.r[i].w[0]);
         std::fprintf(stderr, " sp %08X\n", g_cpu.r[29].w[0]);
     }
+}
+
+// The stores that are not a plain write to main memory (memory.hpp). While the watch is on, every store takes st*_watched: the
+// watch check, then main memory or scratchpad, then the slow path, as every store did before g_store_ram_end. With the watch
+// off an address here is at or above the end of main memory, so what is left of that is the scratchpad test and the slow path.
+namespace {
+
+inline bool scratchpad(std::uint32_t a) { return (a >> 14) == (kScratchpadBase >> 14); }
+inline std::uint8_t *spr_at(std::uint32_t a) { return g_spr + (a & (kScratchpadSize - 1)); }
+
+[[gnu::noinline]] void st8_watched(std::uint32_t a, std::uint8_t v) {
+    watched<std::uint8_t>(a, v);
+    if (auto *p = fast<std::uint8_t>(a)) { *p = v; return; }
+    slow_st8(a, v);
+}
+
+[[gnu::noinline]] void st16_watched(std::uint32_t a, std::uint16_t v) {
+    watched<std::uint16_t>(a, v);
+    if (auto *p = fast<std::uint8_t>(a)) { store(p, v); return; }
+    slow_st16(a, v);
+}
+
+[[gnu::noinline]] void st32_watched(std::uint32_t a, std::uint32_t v) {
+    watched<std::uint32_t>(a, v);
+    if (auto *p = fast<std::uint8_t>(a)) { store(p, v); return; }
+    slow_st32(a, v);
+}
+
+[[gnu::noinline]] void st64_watched(std::uint32_t a, std::uint64_t v) {
+    watched<std::uint32_t>(a, static_cast<std::uint32_t>(v));
+    if (auto *p = fast<std::uint8_t>(a)) { store(p, v); return; }
+    slow_st64(a, v);
+}
+
+[[gnu::noinline]] void st128_watched(std::uint32_t a, const Reg128 &v) {
+    watched<std::uint32_t>(a, v.w[0]);
+    if (auto *p = fast<std::uint8_t>(a)) { std::memcpy(p, &v, 16); return; }
+    slow_st128(a, v);
+}
+
+}  // namespace
+
+void st8_other(std::uint32_t a, std::uint8_t v) {
+    if (g_watch_on) [[unlikely]] return st8_watched(a, v);
+    if (scratchpad(a)) { *spr_at(a) = v; return; }
+    slow_st8(a, v);
+}
+
+void st16_other(std::uint32_t a, std::uint16_t v) {
+    if (g_watch_on) [[unlikely]] return st16_watched(a, v);
+    if (scratchpad(a)) { store(spr_at(a), v); return; }
+    slow_st16(a, v);
+}
+
+void st32_other(std::uint32_t a, std::uint32_t v) {
+    if (g_watch_on) [[unlikely]] return st32_watched(a, v);
+    if (scratchpad(a)) { store(spr_at(a), v); return; }
+    slow_st32(a, v);
+}
+
+void st64_other(std::uint32_t a, std::uint64_t v) {
+    if (g_watch_on) [[unlikely]] return st64_watched(a, v);
+    if (scratchpad(a)) { store(spr_at(a), v); return; }
+    slow_st64(a, v);
+}
+
+void st128_other(std::uint32_t a, const Reg128 &v) {
+    if (g_watch_on) [[unlikely]] return st128_watched(a, v);
+    if (scratchpad(a)) { std::memcpy(spr_at(a), &v, 16); return; }
+    slow_st128(a, v);
 }
 
 void watch_span(std::uint32_t a, std::uint32_t n, const char *via) {
@@ -187,28 +259,123 @@ std::uint32_t physical(std::uint32_t a) {
     return a;
 }
 
-std::uint8_t slow_ld8(std::uint32_t a) { return read_slow<std::uint8_t>(a); }
-std::uint16_t slow_ld16(std::uint32_t a) { return read_slow<std::uint16_t>(a); }
+namespace {
+
+constexpr std::uint32_t kIpuBase = 0x10002000u;  // the IPU registers, 0x10002000..0x1000203F
+
+// Short ways for the two kinds of access a film player makes by the million (God of War II's opening film: 26 million accesses to the
+// RAM mirrors and 16 million to the IPU registers in a 2,600 frame run). They give what the long way through resolve() and hw::read32 /
+// hw::write32 gives, bit for bit; the access counter for the waiting-loop skip (hw::g_slow_seq) is still moved once per access.
+//  - RAM through a mirror: the inline path in memory.hpp only takes the first 32 MB at their own address; the same memory seen at
+//    0x20000000 / 0x30000000 (uncached), 0x80000000 / 0xA0000000 and so on comes here.
+//  - IPU registers, 32 and 64 bits: hw.cpp hands them to ipu::read32 / ipu::write32 after checks that no IPU address passes.
+inline std::uint8_t *ram_mirror(std::uint32_t p) { return p < 0x10000000u ? g_ram + (p & (kRamSize - 1)) : nullptr; }
+
+// The IPU registers, the same calls on both ways in: the first test in slow_ld32 / slow_ld64 / slow_st32 / slow_st64 below (the
+// address exactly as the game's code passes it, 0x10002000..0x1000203F: physical() leaves it as it is, it is no RAM mirror and not
+// INTC_STAT, so the long tests before the IPU's turn could only fall through) and load_fast / store_fast (the same registers seen
+// through a mirror such as 0xB0002000). God of War II's film makes about 20,000 of these accesses a frame.
+inline std::uint32_t ipu_load32(std::uint32_t p) {
+    ++hw::g_slow_seq;
+    return ipu::read32(p & ~3u) >> ((p & 3u) * 8u);
+}
+inline std::uint64_t ipu_load64(std::uint32_t p) {
+    ++hw::g_slow_seq;
+    return ipu::read64(p);  // read32(p), read32(p + 4); reading a register changes nothing, so their order does not matter
+}
+inline void ipu_store32(std::uint32_t p, std::uint32_t v) {
+    ++hw::g_slow_seq;
+    ipu::write32(p, v);
+}
+inline void ipu_store64(std::uint32_t p, std::uint64_t v) {
+    ++hw::g_slow_seq;
+    ipu::write32(p, static_cast<std::uint32_t>(v));
+    ipu::write32(p + 4, static_cast<std::uint32_t>(v >> 32));
+}
+
+template <typename T>
+inline T load_fast(std::uint32_t a) {
+    const std::uint32_t p = physical(a);
+    if (const std::uint8_t *host = ram_mirror(p)) {
+        ++hw::g_slow_seq;
+        return load<T>(host);
+    }
+    if constexpr (sizeof(T) >= 4) {
+        if (p - kIpuBase < (sizeof(T) == 8 ? 0x38u : 0x40u)) {
+            if constexpr (sizeof(T) == 8) return ipu_load64(p);
+            else return static_cast<T>(ipu_load32(p));
+        }
+    }
+    return read_slow<T>(a);
+}
+
+template <typename T>
+inline void store_fast(std::uint32_t a, T v) {
+    const std::uint32_t p = physical(a);
+    if (std::uint8_t *host = ram_mirror(p)) {
+        ++hw::g_slow_seq;
+        if (g_watch_on) {
+            const std::uint32_t base = p & (kRamSize - 1);
+            if (base >= g_watch_base && base < g_watch_end) watch_hit(base, static_cast<std::uint32_t>(v), "store-slow");
+        }
+        store(host, v);
+        return;
+    }
+    if constexpr (sizeof(T) >= 4) {
+        if (p - kIpuBase < (sizeof(T) == 8 ? 0x38u : 0x40u)) {
+            if constexpr (sizeof(T) == 8) ipu_store64(p, v);
+            else ipu_store32(p, static_cast<std::uint32_t>(v));
+            return;
+        }
+    }
+    write_slow(a, v);
+}
+
+}
+
+std::uint8_t slow_ld8(std::uint32_t a) { return load_fast<std::uint8_t>(a); }
+std::uint16_t slow_ld16(std::uint32_t a) { return load_fast<std::uint16_t>(a); }
 std::uint32_t slow_ld32(std::uint32_t a) {
+    if (a - kIpuBase < 0x40u) return ipu_load32(a);
     // INTC_STAT is read in a tight loop by every game that waits for the next picture (sceGsSyncV): a short way for it, same value
     if (a == 0x1000F000u || a == 0xB000F000u) return hw::read_intc_stat();
-    return read_slow<std::uint32_t>(a);
+    return load_fast<std::uint32_t>(a);
 }
-std::uint64_t slow_ld64(std::uint32_t a) { return read_slow<std::uint64_t>(a); }
+std::uint64_t slow_ld64(std::uint32_t a) {
+    if (a - kIpuBase < 0x38u) return ipu_load64(a);
+    return load_fast<std::uint64_t>(a);
+}
 
 void slow_ld128(std::uint32_t a, Reg128 &out) {
+    if (const std::uint8_t *host = ram_mirror(physical(a))) {
+        ++hw::g_slow_seq;
+        std::memcpy(&out, host, 16);
+        return;
+    }
     const Target t = resolve(a);
     if (t.host) std::memcpy(&out, t.host, 16);
     else if (t.region == Region::Io) hw::read128(t.address, out);
     else std::memset(&out, 0, 16);
 }
 
-void slow_st8(std::uint32_t a, std::uint8_t v) { write_slow(a, v); }
-void slow_st16(std::uint32_t a, std::uint16_t v) { write_slow(a, v); }
-void slow_st32(std::uint32_t a, std::uint32_t v) { write_slow(a, v); }
-void slow_st64(std::uint32_t a, std::uint64_t v) { write_slow(a, v); }
+// Out of line (as when only memory.hpp called them), so that st*_other above stays a leaf with no stack frame.
+[[gnu::noinline]] void slow_st8(std::uint32_t a, std::uint8_t v) { store_fast(a, v); }
+[[gnu::noinline]] void slow_st16(std::uint32_t a, std::uint16_t v) { store_fast(a, v); }
+[[gnu::noinline]] void slow_st32(std::uint32_t a, std::uint32_t v) {
+    if (a - kIpuBase < 0x40u) return ipu_store32(a, v);
+    store_fast(a, v);
+}
+[[gnu::noinline]] void slow_st64(std::uint32_t a, std::uint64_t v) {
+    if (a - kIpuBase < 0x38u) return ipu_store64(a, v);
+    store_fast(a, v);
+}
 
-void slow_st128(std::uint32_t a, const Reg128 &v) {
+[[gnu::noinline]] void slow_st128(std::uint32_t a, const Reg128 &v) {
+    if (std::uint8_t *host = ram_mirror(physical(a))) {
+        ++hw::g_slow_seq;
+        std::memcpy(host, &v, 16);
+        return;
+    }
     const Target t = resolve(a);
     if (t.host) std::memcpy(t.host, &v, 16);
     else if (t.region == Region::Io) hw::write128(t.address, v);
